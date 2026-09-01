@@ -17,6 +17,12 @@ add_compile_options(-Wall -pthread)
 # configure step when missing; anything else is skipped silently, which is why
 # the packages below are listed explicitly.
 find_package(ament_cmake_auto REQUIRED)
+
+# PCL pulls in VTK, whose Resolute export references JsonCpp::JsonCpp without
+# loading jsoncpp's package config first. Define the imported target before any
+# ROS dependency can transitively discover PCL/VTK.
+find_package(jsoncpp CONFIG REQUIRED)
+
 ament_auto_find_build_dependencies(REQUIRED
   rclcpp
   std_msgs
@@ -30,7 +36,6 @@ ament_auto_find_build_dependencies(REQUIRED
   tf2_geometry_msgs
   pcl_conversions
   cv_bridge
-  libnabo
   rosidl_default_generators
 )
 
@@ -50,13 +55,22 @@ if(TARGET GeographicLib::GeographicLib)
   set(GeographicLib_LIBRARIES GeographicLib::GeographicLib)
 endif()
 
-# nabo exports the imported target ``libnabo::nabo`` since 1.1; older releases
-# only set the plain ``nabo`` library name.
-if(TARGET libnabo::nabo)
-  set(NABO_LIBRARIES libnabo::nabo)
-else()
-  set(NABO_LIBRARIES ${libnabo_LIBRARIES})
+# Lyrical does not currently publish a libnabo binary. Keep the dependency
+# pinned with the package and build only its C++ library. A clear error here is
+# more useful than a later find_package or missing-header failure when someone
+# cloned without --recursive.
+set(LIBNABO_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/libnabo")
+if(NOT EXISTS "${LIBNABO_SOURCE_DIR}/CMakeLists.txt")
+  message(FATAL_ERROR
+    "The libnabo submodule is missing. Run: git submodule update --init --recursive")
 endif()
+set(LIBNABO_BUILD_DOXYGEN OFF CACHE BOOL "" FORCE)
+set(LIBNABO_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(LIBNABO_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(LIBNABO_BUILD_PYTHON OFF CACHE BOOL "" FORCE)
+set(SHARED_LIBS OFF CACHE BOOL "" FORCE)
+add_subdirectory("${LIBNABO_SOURCE_DIR}" third_party/libnabo EXCLUDE_FROM_ALL)
+set(NABO_LIBRARIES libnabo::nabo)
 
 ###############
 ## Interfaces #

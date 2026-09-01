@@ -43,23 +43,27 @@ sudo apt install \
   ros-$ROS_DISTRO-pcl-conversions ros-$ROS_DISTRO-pcl-ros \
   ros-$ROS_DISTRO-tf2 ros-$ROS_DISTRO-tf2-ros ros-$ROS_DISTRO-tf2-eigen \
   ros-$ROS_DISTRO-tf2-geometry-msgs ros-$ROS_DISTRO-cv-bridge \
-  ros-$ROS_DISTRO-gtsam ros-$ROS_DISTRO-libnabo ros-$ROS_DISTRO-rviz2 \
-  libgeographiclib-dev libpcl-dev libopencv-dev libeigen3-dev
+  ros-$ROS_DISTRO-gtsam ros-$ROS_DISTRO-rviz2 \
+  libgeographiclib-dev libjsoncpp-dev libpcl-dev libopencv-dev libeigen3-dev
 ```
 
-GTSAM and libnabo are pulled from the ROS 2 package index (`ros-$ROS_DISTRO-gtsam`,
-`ros-$ROS_DISTRO-libnabo`); building them from source is no longer required.
+GTSAM is pulled from the ROS 2 package index (`ros-$ROS_DISTRO-gtsam`). libnabo
+is pinned as a nested submodule because Lyrical does not currently publish its
+binary package.
 
 ## :hammer: Build
 
 ```bash
 mkdir -p ~/ros2_ws/src && cd ~/ros2_ws/src
-git clone <this repository> liorf
+git clone --recursive <this repository> liorf
 cd ~/ros2_ws
 rosdep install --from-paths src --ignore-src -r -y
 colcon build --cmake-args -DCMAKE_BUILD_TYPE=Release
 source install/setup.bash
 ```
+
+For an existing checkout, initialize the pinned dependency with
+`git submodule update --init --recursive` before building.
 
 `mapOptmization.cpp` is template-heavy (GTSAM + PCL); on a machine with less
 than ~4 GB of RAM per core, build with `MAKEFLAGS=-j2 colcon build ...` to avoid
@@ -109,8 +113,8 @@ the compiler being OOM-killed.
 * The build uses `ament_cmake_auto`, so ROS dependencies are declared once in
   `package.xml` and wired into the targets automatically. Dependencies whose
   CMake package name differs from the rosdep key (GTSAM, Eigen3, PCL, OpenCV,
-  GeographicLib, Boost) cannot be resolved that way and are still found and
-  linked explicitly in `CMakeLists.txt`. Note that
+  JsonCpp, GeographicLib, Boost) are still found and linked explicitly in
+  `CMakeLists.txt`; the pinned libnabo submodule is built in-tree. Note that
   `ament_auto_find_build_dependencies()` skips anything it fails to find, so
   the ROS packages are passed as `REQUIRED` to turn a missing one into a
   configure error rather than a confusing compile failure.
