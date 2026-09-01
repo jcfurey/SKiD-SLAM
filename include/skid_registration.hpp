@@ -11,6 +11,7 @@
 namespace liorf::registration {
 
 using PointCloud = std::vector<Eigen::Vector3f>;
+using Matrix6d = Eigen::Matrix<double, 6, 6>;
 
 enum class Status {
   kSuccess,
@@ -29,6 +30,7 @@ enum class Status {
   kInsufficientMetricInliers,
   kInsufficientOverlap,
   kTruncatedMseTooLarge,
+  kInvalidUncertainty,
 };
 
 const char* toString(Status status) noexcept;
@@ -63,6 +65,16 @@ struct Config {
   double max_truncated_mse_m2 = 3.0;
   std::size_t min_metric_inliers = 20;
   double min_overlap_ratio = 0.10;
+
+  // Small-GICP's Hessian describes directional geometry, but its absolute
+  // scale comes from normalized surface covariances rather than a calibrated
+  // sensor model. These values give that shape explicit physical units and
+  // conservative lower bounds. Tangent order is [rx, ry, rz, tx, ty, tz].
+  double nominal_rotation_stddev_rad = 0.05;
+  double nominal_translation_stddev_m = 0.20;
+  double uncertainty_reference_mse_m2 = 0.04;
+  double uncertainty_min_information_ratio = 0.01;
+  double uncertainty_max_variance_scale = 100.0;
 };
 
 struct TruncatedMse {
@@ -70,6 +82,18 @@ struct TruncatedMse {
   std::size_t correspondence_count = 0;
   std::size_t evaluated_source_count = 0;
   double overlap_ratio = 0.0;
+
+  bool valid() const noexcept;
+};
+
+struct PoseUncertainty {
+  Matrix6d covariance = Matrix6d::Constant(
+    std::numeric_limits<double>::quiet_NaN());
+  Matrix6d information = Matrix6d::Constant(
+    std::numeric_limits<double>::quiet_NaN());
+  double variance_scale = std::numeric_limits<double>::quiet_NaN();
+  double condition_number = std::numeric_limits<double>::infinity();
+  std::size_t clamped_modes = 0;
 
   bool valid() const noexcept;
 };
@@ -89,6 +113,7 @@ struct Result {
   std::size_t fine_iterations = 0;
   double fine_error = std::numeric_limits<double>::infinity();
   TruncatedMse metric;
+  PoseUncertainty uncertainty;
 
   double coarse_seconds = 0.0;
   double fine_seconds = 0.0;
@@ -108,6 +133,15 @@ TruncatedMse computeTruncatedMse(
   const PointCloud& target,
   const Eigen::Isometry3d& T_target_source,
   double max_correspondence_distance_m);
+
+// Converts Small-GICP's final Hessian into a full, physically dimensioned
+// covariance. The Hessian supplies relative directional observability; the
+// nominal standard deviations set its absolute scale. Weak modes and
+// low-quality/partial-overlap matches are conservatively inflated.
+PoseUncertainty estimatePoseUncertainty(
+  const Matrix6d& raw_information,
+  const TruncatedMse& metric,
+  const Config& config = Config());
 
 // Coarse global registration with KISS-Matcher followed by Small-GICP fine
 // alignment. Both transforms use the explicit target <- source convention.

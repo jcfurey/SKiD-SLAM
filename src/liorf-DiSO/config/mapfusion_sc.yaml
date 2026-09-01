@@ -27,3 +27,10 @@
 
             robot_initial: jackal0
             use_position_search: false #use position search may introduce more global loop closure, but spend more time for candidate checking
+
+        registration:
+            # Legacy Scan Context/PCL factors use a diagonal fallback. The
+            # paper-parity SOLiD pipeline instead derives a full Hessian shape.
+            nominal_rotation_stddev_rad: 0.05
+            nominal_translation_stddev_m: 0.20
+            uncertainty_reference_mse_m2: 0.04

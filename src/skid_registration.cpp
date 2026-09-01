@@ -6,6 +6,8 @@
 #include <exception>
 #include <utility>
 
+#include <Eigen/Eigenvalues>
+
 #include <kiss_matcher/KISSMatcher.hpp>
 #include <small_gicp/ann/kdtree.hpp>
 #include <small_gicp/points/point_cloud.hpp>
@@ -86,6 +88,8 @@ const char* toString(Status status) noexcept {
       return "insufficient_overlap";
     case Status::kTruncatedMseTooLarge:
       return "truncated_mse_too_large";
+    case Status::kInvalidUncertainty:
+      return "invalid_uncertainty";
   }
   return "unknown";
 }
@@ -93,6 +97,20 @@ const char* toString(Status status) noexcept {
 bool TruncatedMse::valid() const noexcept {
   return std::isfinite(value_m2) && correspondence_count > 0 &&
          evaluated_source_count > 0 && std::isfinite(overlap_ratio);
+}
+
+bool PoseUncertainty::valid() const noexcept {
+  if (!covariance.allFinite() || !information.allFinite() ||
+      !std::isfinite(variance_scale) || variance_scale < 1.0 ||
+      !std::isfinite(condition_number) || condition_number < 1.0) {
+    return false;
+  }
+  Eigen::SelfAdjointEigenSolver<Matrix6d> covariance_solver(covariance);
+  Eigen::SelfAdjointEigenSolver<Matrix6d> information_solver(information);
+  return covariance_solver.info() == Eigen::Success &&
+         information_solver.info() == Eigen::Success &&
+         covariance_solver.eigenvalues().minCoeff() > 0.0 &&
+         information_solver.eigenvalues().minCoeff() > 0.0;
 }
 
 std::string validate(const Config& config) {
@@ -139,6 +157,15 @@ std::string validate(const Config& config) {
       !positive(config.max_truncated_mse_m2) || config.min_metric_inliers < 1 ||
       !unitInterval(config.min_overlap_ratio)) {
     return "truncated-MSE gate values are invalid";
+  }
+  if (!positive(config.nominal_rotation_stddev_rad) ||
+      !positive(config.nominal_translation_stddev_m) ||
+      !positive(config.uncertainty_reference_mse_m2) ||
+      !positive(config.uncertainty_min_information_ratio) ||
+      config.uncertainty_min_information_ratio > 1.0 ||
+      !std::isfinite(config.uncertainty_max_variance_scale) ||
+      config.uncertainty_max_variance_scale < 1.0) {
+    return "registration uncertainty values are invalid";
   }
   return {};
 }
@@ -193,6 +220,92 @@ TruncatedMse computeTruncatedMse(
                       static_cast<double>(metric.correspondence_count);
   }
   return metric;
+}
+
+PoseUncertainty estimatePoseUncertainty(
+  const Matrix6d& raw_information,
+  const TruncatedMse& metric,
+  const Config& config) {
+  PoseUncertainty uncertainty;
+  if (!validate(config).empty() || !raw_information.allFinite() ||
+      !metric.valid()) {
+    return uncertainty;
+  }
+
+  Eigen::Matrix<double, 6, 1> nominal_stddev;
+  nominal_stddev <<
+    config.nominal_rotation_stddev_rad,
+    config.nominal_rotation_stddev_rad,
+    config.nominal_rotation_stddev_rad,
+    config.nominal_translation_stddev_m,
+    config.nominal_translation_stddev_m,
+    config.nominal_translation_stddev_m;
+  const Matrix6d scale = nominal_stddev.asDiagonal();
+  const Matrix6d symmetric_information =
+    0.5 * (raw_information + raw_information.transpose());
+  const Matrix6d dimensionless_information =
+    scale * symmetric_information * scale;
+
+  Eigen::SelfAdjointEigenSolver<Matrix6d> solver(dimensionless_information);
+  if (solver.info() != Eigen::Success || !solver.eigenvalues().allFinite() ||
+      !solver.eigenvectors().allFinite()) {
+    return uncertainty;
+  }
+
+  const double strongest_information = solver.eigenvalues().maxCoeff();
+  if (!std::isfinite(strongest_information) || strongest_information <= 0.0) {
+    return uncertainty;
+  }
+  if (solver.eigenvalues().minCoeff() < -1.0e-9 * strongest_information) {
+    return uncertainty;
+  }
+
+  Eigen::Matrix<double, 6, 1> normalized_information =
+    solver.eigenvalues() / strongest_information;
+  const double weakest_information = normalized_information.minCoeff();
+  uncertainty.condition_number = weakest_information > 0.0
+    ? 1.0 / weakest_information
+    : 1.0 / config.uncertainty_min_information_ratio;
+  uncertainty.condition_number = std::min(
+    uncertainty.condition_number,
+    1.0 / config.uncertainty_min_information_ratio);
+
+  for (Eigen::Index index = 0; index < normalized_information.size(); ++index) {
+    if (normalized_information(index) <
+        config.uncertainty_min_information_ratio) {
+      normalized_information(index) =
+        config.uncertainty_min_information_ratio;
+      ++uncertainty.clamped_modes;
+    }
+  }
+
+  const double residual_scale = std::max(
+    1.0, metric.value_m2 / config.uncertainty_reference_mse_m2);
+  const double overlap_scale = 1.0 / std::max(
+    metric.overlap_ratio, std::numeric_limits<double>::epsilon());
+  uncertainty.variance_scale = std::clamp(
+    residual_scale * overlap_scale,
+    1.0,
+    config.uncertainty_max_variance_scale);
+
+  const Matrix6d normalized_covariance =
+    solver.eigenvectors() * normalized_information.cwiseInverse().asDiagonal() *
+    solver.eigenvectors().transpose();
+  const Matrix6d normalized_precision =
+    solver.eigenvectors() * normalized_information.asDiagonal() *
+    solver.eigenvectors().transpose();
+  const Matrix6d inverse_scale = nominal_stddev.cwiseInverse().asDiagonal();
+
+  uncertainty.covariance = uncertainty.variance_scale *
+    scale * normalized_covariance * scale;
+  uncertainty.information =
+    (1.0 / uncertainty.variance_scale) *
+    inverse_scale * normalized_precision * inverse_scale;
+  uncertainty.covariance =
+    0.5 * (uncertainty.covariance + uncertainty.covariance.transpose());
+  uncertainty.information =
+    0.5 * (uncertainty.information + uncertainty.information.transpose());
+  return uncertainty;
 }
 
 Result registerClouds(
@@ -365,6 +478,14 @@ Result registerClouds(
   if (result.metric.value_m2 > config.max_truncated_mse_m2) {
     result.status = Status::kTruncatedMseTooLarge;
     result.detail = "truncated MSE exceeds the configured threshold";
+    return result;
+  }
+
+  result.uncertainty = estimatePoseUncertainty(
+    fine_result.H, result.metric, config);
+  if (!result.uncertainty.valid()) {
+    result.status = Status::kInvalidUncertainty;
+    result.detail = "Small-GICP Hessian could not produce a valid pose covariance";
     return result;
   }
 

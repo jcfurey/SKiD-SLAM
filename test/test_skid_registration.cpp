@@ -73,6 +73,51 @@ TEST(RegistrationConfig, RejectsDimensionallyInvalidValues) {
   config = liorf::registration::Config();
   config.coarse_voxel_size_m = 0.001F;
   EXPECT_FALSE(liorf::registration::validate(config).empty());
+
+  config = liorf::registration::Config();
+  config.nominal_translation_stddev_m = 0.0;
+  EXPECT_FALSE(liorf::registration::validate(config).empty());
+}
+
+TEST(RegistrationUncertainty, GivesIsotropicHessianConfiguredPhysicalUnits) {
+  liorf::registration::Config config;
+  config.nominal_rotation_stddev_rad = 0.1;
+  config.nominal_translation_stddev_m = 0.5;
+  config.uncertainty_reference_mse_m2 = 0.04;
+
+  Eigen::Matrix<double, 6, 1> inverse_variances;
+  inverse_variances << 100.0, 100.0, 100.0, 4.0, 4.0, 4.0;
+  const liorf::registration::TruncatedMse metric{0.04, 100, 100, 1.0};
+  const auto uncertainty = liorf::registration::estimatePoseUncertainty(
+    inverse_variances.asDiagonal(), metric, config);
+
+  ASSERT_TRUE(uncertainty.valid());
+  EXPECT_NEAR(uncertainty.variance_scale, 1.0, 1.0e-12);
+  EXPECT_NEAR(uncertainty.covariance(0, 0), 0.01, 1.0e-12);
+  EXPECT_NEAR(uncertainty.covariance(3, 3), 0.25, 1.0e-12);
+  EXPECT_TRUE((uncertainty.covariance * uncertainty.information)
+    .isApprox(liorf::registration::Matrix6d::Identity(), 1.0e-10));
+}
+
+TEST(RegistrationUncertainty, InflatesWeakModesAndPartialOverlap) {
+  liorf::registration::Config config;
+  config.nominal_rotation_stddev_rad = 0.1;
+  config.nominal_translation_stddev_m = 0.5;
+  config.uncertainty_reference_mse_m2 = 0.04;
+  config.uncertainty_min_information_ratio = 0.01;
+
+  Eigen::Matrix<double, 6, 1> information_diagonal;
+  information_diagonal << 1.0, 100.0, 100.0, 4.0, 4.0, 4.0;
+  const liorf::registration::TruncatedMse metric{0.08, 50, 100, 0.5};
+  const auto uncertainty = liorf::registration::estimatePoseUncertainty(
+    information_diagonal.asDiagonal(), metric, config);
+
+  ASSERT_TRUE(uncertainty.valid());
+  EXPECT_NEAR(uncertainty.variance_scale, 4.0, 1.0e-12);
+  EXPECT_NEAR(uncertainty.covariance(0, 0), 4.0, 1.0e-10);
+  EXPECT_NEAR(uncertainty.covariance(1, 1), 0.04, 1.0e-12);
+  EXPECT_EQ(uncertainty.clamped_modes, 0U);
+  EXPECT_NEAR(uncertainty.condition_number, 100.0, 1.0e-10);
 }
 
 TEST(Registration, RejectsEmptyCloudBeforeInvokingSolvers) {
@@ -146,6 +191,9 @@ TEST(Registration, RecoversLargeRigidTransformWithCoarseToFinePipeline) {
   EXPECT_LT(translation_error, 0.05);
   EXPECT_LT(angle_error, 0.01);
   EXPECT_LT(result.metric.value_m2, 1.0e-4);
+  EXPECT_TRUE(result.uncertainty.valid());
+  EXPECT_TRUE((result.uncertainty.covariance * result.uncertainty.information)
+    .isApprox(liorf::registration::Matrix6d::Identity(), 1.0e-8));
 }
 
 }  // namespace

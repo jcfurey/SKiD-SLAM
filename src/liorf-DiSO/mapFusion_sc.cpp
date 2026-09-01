@@ -5,6 +5,8 @@
 //msg
 #include "liorf/msg/cloud_info.hpp"
 #include "liorf/msg/context_info.hpp"
+#include "liorf/msg/loop_constraint.hpp"
+#include "loop_constraint_utils.hpp"
 
 //third party
 #include "scanContext/scanContext.h"
@@ -45,6 +47,10 @@
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/filters/crop_box.h>
 
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <limits>
 #include <unordered_map>
 #include <thread>
 #include <mutex>
@@ -60,7 +66,7 @@ private:
     rclcpp::Subscription<liorf::msg::CloudInfo>::SharedPtr _sub_laser_cloud_info;
     rclcpp::Subscription<liorf::msg::ContextInfo>::SharedPtr _sub_scan_context_info;
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr _sub_odom_trans;
-    rclcpp::Subscription<liorf::msg::ContextInfo>::SharedPtr _sub_loop_info_global;
+    rclcpp::Subscription<liorf::msg::LoopConstraint>::SharedPtr _sub_loop_info_global;
 
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr _sub_communication_signal;
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr _sub_signal_1;
@@ -73,13 +79,13 @@ private:
     std::string _signal_id_2;
 
     rclcpp::Publisher<liorf::msg::ContextInfo>::SharedPtr _pub_context_info;
-    rclcpp::Publisher<liorf::msg::ContextInfo>::SharedPtr _pub_loop_info;
+    rclcpp::Publisher<liorf::msg::LoopConstraint>::SharedPtr _pub_loop_info;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr _pub_cloud;
 
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr _pub_trans_odom2map;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr _pub_trans_odom2odom;
 
-    rclcpp::Publisher<liorf::msg::ContextInfo>::SharedPtr _pub_loop_info_global;
+    rclcpp::Publisher<liorf::msg::LoopConstraint>::SharedPtr _pub_loop_info_global;
 
     //parameters
     std::string _robot_id;
@@ -112,6 +118,9 @@ private:
     float _pcm_thres;
     float _icp_thres;
     int _loop_frame_thres;
+    double _loop_rotation_stddev_rad;
+    double _loop_translation_stddev_m;
+    double _uncertainty_reference_mse_m2;
 
     std::mutex mtx_publish_1;
     std::mutex mtx_publish_2;
@@ -140,7 +149,7 @@ private:
     std::pair<int, int> _initial_loop;
     int _id_bin_last;
 
-    liorf::msg::ContextInfo _loop_info;
+    liorf::msg::LoopConstraint _loop_info;
     std_msgs::msg::Header _cloud_header;
 
     pcl::PointCloud<PointType>::Ptr _laser_cloud_sum;
@@ -204,7 +213,7 @@ public:
                 prefixTopic(_robot_id, _local_topic), rclcpp::QoS(1),
                 std::bind(&MapFusion::laserCloudInfoHandler, this, std::placeholders::_1), subOpt);
 
-        _sub_loop_info_global = create_subscription<liorf::msg::ContextInfo>(
+        _sub_loop_info_global = create_subscription<liorf::msg::LoopConstraint>(
                 _sc_topic + "/loop_info_global", rclcpp::QoS(100),
                 std::bind(&MapFusion::globalLoopInfoHandler, this, std::placeholders::_1), subOpt);
 
@@ -222,12 +231,13 @@ public:
 
 
         _pub_context_info = create_publisher<liorf::msg::ContextInfo>(_sc_topic + "/context_info", 1);
-        _pub_loop_info = create_publisher<liorf::msg::ContextInfo>(
+        _pub_loop_info = create_publisher<liorf::msg::LoopConstraint>(
                 prefixTopic(_robot_id, _loop_topic), 1);
         _pub_cloud = create_publisher<sensor_msgs::msg::PointCloud2>(_robot_id + "/" + _sc_topic + "/cloud", 1);
         _pub_trans_odom2map = create_publisher<nav_msgs::msg::Odometry>(_robot_id + "/" + _sc_topic + "/trans_map", 1);
         _pub_trans_odom2odom = create_publisher<nav_msgs::msg::Odometry>(_sc_topic + "/trans_odom", 1);
-        _pub_loop_info_global = create_publisher<liorf::msg::ContextInfo>(_sc_topic + "/loop_info_global", 1);
+        _pub_loop_info_global = create_publisher<liorf::msg::LoopConstraint>(
+            _sc_topic + "/loop_info_global", 1);
 
     }
 
@@ -288,6 +298,12 @@ private:
         _loop_thres = declare_and_get<double>("mapfusion.interRobot.loop_threshold", 0.2);
         _pcm_thres = declare_and_get<double>("mapfusion.interRobot.pcm_threshold", 20.0);
         _icp_thres = declare_and_get<double>("mapfusion.interRobot.icp_threshold", 3.0);
+        _loop_rotation_stddev_rad = declare_and_get<double>(
+            "mapfusion.registration.nominal_rotation_stddev_rad", 0.05);
+        _loop_translation_stddev_m = declare_and_get<double>(
+            "mapfusion.registration.nominal_translation_stddev_m", 0.20);
+        _uncertainty_reference_mse_m2 = declare_and_get<double>(
+            "mapfusion.registration.uncertainty_reference_mse_m2", 0.04);
         _robot_initial = declare_and_get<std::string>("mapfusion.interRobot.robot_initial", "jackal0");
         _loop_frame_thres = declare_and_get<int>("mapfusion.interRobot.loop_frame_threshold", 10);
 
@@ -298,6 +314,16 @@ private:
         _local_topic = declare_and_get<std::string>("mapfusion.interRobot.local_topic", "liorf/mapping/cloud_info");
         _pcm_start_threshold = declare_and_get<int>("mapfusion.interRobot.pcm_start_threshold", 5);
         _use_position_search = declare_and_get<bool>("mapfusion.interRobot.use_position_search", false);
+
+        if (!std::isfinite(_loop_rotation_stddev_rad) ||
+            _loop_rotation_stddev_rad <= 0.0 ||
+            !std::isfinite(_loop_translation_stddev_m) ||
+            _loop_translation_stddev_m <= 0.0 ||
+            !std::isfinite(_uncertainty_reference_mse_m2) ||
+            _uncertainty_reference_mse_m2 <= 0.0) {
+            throw std::invalid_argument(
+                "mapfusion registration uncertainty values must be finite and positive");
+        }
 
     }
 
@@ -466,7 +492,7 @@ private:
 
     }
 
-    void globalLoopInfoHandler(const liorf::msg::ContextInfo::ConstSharedPtr& msgIn){
+    void globalLoopInfoHandler(const liorf::msg::LoopConstraint::ConstSharedPtr& msgIn){
 //        return;
         if (msgIn->robot_id != _robot_id)
             return;
@@ -1330,8 +1356,6 @@ private:
 
         int tmp_robot_id_th =  _initial_loop.first;
         int tmp_len_loop_list = _initial_loop.second;
-        auto loop_that = _loop_queue[tmp_robot_id_th][tmp_len_loop_list];
-        int id_bin_that = std::get<1>(loop_that);
         sendLoopThis(_robot_this_th, tmp_robot_id_th, len_loop_list, tmp_len_loop_list);
         sendLoopThat(_robot_this_th, tmp_robot_id_th, len_loop_list, tmp_len_loop_list);
 
@@ -1419,17 +1443,33 @@ private:
     void update_loop_info(int id_bin_last, int id_bin_this, gtsam::Pose3 pose_to_last, gtsam::Pose3 pose_to_this, float intensity){
         //relative translation btwn 2 poses
         auto dpose = pose_to_last.between(pose_to_this);
-        _loop_info.robot_id = _bin_with_id[id_bin_last].robotname;
-        _loop_info.num_ring   = _bin_with_id[id_bin_last].pose.intensity;//from
-        _loop_info.num_sector = _bin_with_id[id_bin_this].pose.intensity;//to
-
-        _loop_info.pose_x = dpose.translation().x();
-        _loop_info.pose_y = dpose.translation().y();
-        _loop_info.pose_z = dpose.translation().z();
-        _loop_info.pose_roll  = dpose.rotation().roll();
-        _loop_info.pose_pitch = dpose.rotation().pitch();
-        _loop_info.pose_yaw   = dpose.rotation().yaw();
-        _loop_info.pose_intensity = intensity;
+        const double variance_scale = std::clamp(
+            std::max(1.0, static_cast<double>(intensity) /
+                _uncertainty_reference_mse_m2),
+            1.0, 100.0);
+        Eigen::Matrix<double, 6, 1> variances;
+        // The delivered relative factor is formed from two independent
+        // registration poses, so their equal diagonal variances add.
+        const double relative_variance_scale = 2.0 * variance_scale;
+        variances <<
+            relative_variance_scale * _loop_rotation_stddev_rad * _loop_rotation_stddev_rad,
+            relative_variance_scale * _loop_rotation_stddev_rad * _loop_rotation_stddev_rad,
+            relative_variance_scale * _loop_rotation_stddev_rad * _loop_rotation_stddev_rad,
+            relative_variance_scale * _loop_translation_stddev_m * _loop_translation_stddev_m,
+            relative_variance_scale * _loop_translation_stddev_m * _loop_translation_stddev_m,
+            relative_variance_scale * _loop_translation_stddev_m * _loop_translation_stddev_m;
+        const liorf::uncertainty::PoseWithCovariance measurement{
+            dpose, variances.asDiagonal()};
+        _loop_info.header = _cloud_header;
+        liorf::loop_constraint::populate(
+            _loop_info,
+            _bin_with_id[id_bin_last].robotname,
+            static_cast<std::int64_t>(_bin_with_id[id_bin_last].pose.intensity),
+            static_cast<std::int64_t>(_bin_with_id[id_bin_this].pose.intensity),
+            measurement,
+            intensity,
+            std::numeric_limits<double>::quiet_NaN(),
+            0);
 
     }
 

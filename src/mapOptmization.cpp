@@ -2,6 +2,8 @@
 #include "liorf/msg/cloud_info.hpp"
 #include "liorf/srv/save_map.hpp"
 #include "liorf/msg/context_info.hpp"
+#include "liorf/msg/loop_constraint.hpp"
+#include "loop_constraint_utils.hpp"
 #include "observable_scan_match.hpp"
 // <!-- liorf_yjz_lucky_boy -->
 #include <sensor_msgs/msg/nav_sat_fix.hpp>
@@ -23,6 +25,8 @@
 #include <gtsam/nonlinear/ISAM2.h>
 
 #include <Eigen/QR>
+
+#include <limits>
 
 #include <GeographicLib/Geocentric.hpp>
 #include <GeographicLib/LocalCartesian.hpp>
@@ -99,7 +103,7 @@ public:
     rclcpp::Publisher<liorf::msg::CloudInfo>::SharedPtr pubLaserCloudInfo;
 
     //publish to fusion node
-    rclcpp::Subscription<liorf::msg::ContextInfo>::SharedPtr subGlobalLoop;
+    rclcpp::Subscription<liorf::msg::LoopConstraint>::SharedPtr subGlobalLoop;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubFeatureCloud;
     pcl::PointCloud<PointType>::Ptr laserCloudSurfLastFeature; //
     pcl::PointCloud<PointType>::Ptr laserCloudCornerLastFeature; //
@@ -219,7 +223,7 @@ public:
 
         //for fusion node
         pubFeatureCloud = create_publisher<sensor_msgs::msg::PointCloud2>(robot_id + "/liorf/mapping/feature_cloud_global", 1);
-        subGlobalLoop = create_subscription<liorf::msg::ContextInfo>(
+        subGlobalLoop = create_subscription<liorf::msg::LoopConstraint>(
             prefixTopic(robot_id, mapFusionLoopTopic), rclcpp::QoS(100),
             std::bind(&mapOptimization::contextLoopInfoHandler, this, std::placeholders::_1), subOpt);
         //
@@ -319,23 +323,41 @@ public:
 
     }
 
-    void contextLoopInfoHandler(const liorf::msg::ContextInfo::ConstSharedPtr& msgIn){
+    void contextLoopInfoHandler(const liorf::msg::LoopConstraint::ConstSharedPtr& msgIn){
         //close global loop by do nothing
         //        return;
 
         if(msgIn->robot_id != robot_id)
             return;
 
-        int indexFrom = msgIn->num_ring;
-        int indexTo = msgIn->num_sector;
+        if (msgIn->index_from < 0 || msgIn->index_to < 0 ||
+            msgIn->index_from > std::numeric_limits<int>::max() ||
+            msgIn->index_to > std::numeric_limits<int>::max()) {
+            RCLCPP_WARN(get_logger(),
+                "Rejected loop constraint with out-of-range keyframe indices");
+            return;
+        }
+        const int indexFrom = static_cast<int>(msgIn->index_from);
+        const int indexTo = static_cast<int>(msgIn->index_to);
 
-        gtsam::Pose3 poseBetween = gtsam::Pose3( gtsam::Rot3::RzRyRx(msgIn->pose_roll, msgIn->pose_pitch, msgIn->pose_yaw),
-                                         gtsam::Point3(msgIn->pose_x, msgIn->pose_y, msgIn->pose_z) );
-        float noiseScore = msgIn->pose_intensity;
-        gtsam::Vector Vector6(6);
-        Vector6 << noiseScore, noiseScore, noiseScore, noiseScore, noiseScore,
-            noiseScore;
-        auto noiseBetween = gtsam::noiseModel::Diagonal::Variances(Vector6);
+        if (!liorf::loop_constraint::validPoseMessage(
+                msgIn->relative_pose.pose)) {
+            RCLCPP_WARN(get_logger(),
+                "Rejected loop constraint (%d, %d) with invalid pose",
+                indexFrom, indexTo);
+            return;
+        }
+        const gtsam::Pose3 poseBetween = liorf::loop_constraint::poseFromMessage(
+            msgIn->relative_pose.pose);
+        const auto covariance = liorf::loop_constraint::covarianceFromMessage(
+            msgIn->relative_pose.covariance);
+        if (!liorf::uncertainty::positiveDefiniteCovariance(covariance)) {
+            RCLCPP_WARN(get_logger(),
+                "Rejected loop constraint (%d, %d) with invalid covariance",
+                indexFrom, indexTo);
+            return;
+        }
+        auto noiseBetween = gtsam::noiseModel::Gaussian::Covariance(covariance);
 
         gtSAMgraph.add(BetweenFactor<Pose3>(indexFrom, indexTo, poseBetween, noiseBetween));
         isam->update(gtSAMgraph);
@@ -347,6 +369,12 @@ public:
         isamCurrentEstimate = isam->calculateEstimate();
 
         aLoopIsClosed = true;
+
+        RCLCPP_INFO(get_logger(),
+            "Accepted loop factor %d -> %d: error=%.6f m^2 overlap=%.3f inliers=%zu",
+            indexFrom, indexTo, msgIn->registration_error_m2,
+            msgIn->overlap_ratio,
+            static_cast<std::size_t>(msgIn->registration_inliers));
 
         correctPoses();
 

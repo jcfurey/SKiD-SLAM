@@ -7,12 +7,15 @@
 //msg
 #include "liorf/msg/cloud_info.hpp"
 #include "liorf/msg/context_info.hpp"
+#include "liorf/msg/loop_constraint.hpp"
 
 //third party
 #include "SOLiD/solid.h"
 #include "fast_max-clique_finder/src/findClique.h"
 
 #include "nabo/nabo.h"
+#include "loop_constraint_utils.hpp"
+#include "skid_pose_uncertainty.hpp"
 #include "skid_registration.hpp"
 
 //ros
@@ -49,6 +52,10 @@
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/filters/crop_box.h>
 
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <limits>
 #include <unordered_map>
 #include <thread>
 #include <mutex>
@@ -64,7 +71,7 @@ private:
     rclcpp::Subscription<liorf::msg::CloudInfo>::SharedPtr _sub_laser_cloud_info;
     rclcpp::Subscription<liorf::msg::ContextInfo>::SharedPtr _sub_solid_info;
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr _sub_odom_trans;
-    rclcpp::Subscription<liorf::msg::ContextInfo>::SharedPtr _sub_loop_info_global;
+    rclcpp::Subscription<liorf::msg::LoopConstraint>::SharedPtr _sub_loop_info_global;
 
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr _sub_communication_signal;
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr _sub_signal_1;
@@ -77,13 +84,13 @@ private:
     std::string _signal_id_2;
 
     rclcpp::Publisher<liorf::msg::ContextInfo>::SharedPtr _pub_context_info;
-    rclcpp::Publisher<liorf::msg::ContextInfo>::SharedPtr _pub_loop_info;
+    rclcpp::Publisher<liorf::msg::LoopConstraint>::SharedPtr _pub_loop_info;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr _pub_cloud;
 
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr _pub_trans_odom2map;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr _pub_trans_odom2odom;
 
-    rclcpp::Publisher<liorf::msg::ContextInfo>::SharedPtr _pub_loop_info_global;
+    rclcpp::Publisher<liorf::msg::LoopConstraint>::SharedPtr _pub_loop_info_global;
 
     //parameters
     std::string _robot_id;
@@ -121,6 +128,8 @@ private:
     float _loop_thres;
     float _pcm_thres;
     int _loop_frame_thres;
+    double _pcm_local_rotation_stddev_rad;
+    double _pcm_local_translation_stddev_m;
 
     liorf::registration::Config _registration_config;
 
@@ -149,7 +158,7 @@ private:
     std::pair<int, int> _initial_loop;
     int _id_bin_last;
 
-    liorf::msg::ContextInfo _loop_info;
+    liorf::msg::LoopConstraint _loop_info;
     std_msgs::msg::Header _cloud_header;
 
     pcl::PointCloud<PointType>::Ptr _laser_cloud_sum;
@@ -166,11 +175,37 @@ private:
     std::vector<std::pair<int, int>> _idx_nearest_list;
     std::unordered_map<int, SOLiDBin> _bin_with_id;
 
-    //for pcm & graph
-    //first: source pose; second: source pose in target; third: truncated MSE;
-    std::unordered_map< int, std::vector< std::tuple<gtsam::Pose3, gtsam::Pose3, float> > >  _pose_queue;
-    //first: target, second: source, third: relative transform;
-    std::unordered_map< int, std::vector< std::tuple<int, int, gtsam::Pose3> > > _loop_queue;
+    struct RegisteredPose {
+        gtsam::Pose3 source_pose;
+        gtsam::Pose3 aligned_source_pose;
+        liorf::uncertainty::Matrix6d covariance =
+            liorf::uncertainty::Matrix6d::Zero();
+        double truncated_mse_m2 = std::numeric_limits<double>::infinity();
+        double overlap_ratio = 0.0;
+        std::size_t inliers = 0;
+    };
+
+    struct LoopCandidate {
+        int target_bin = -1;
+        int source_bin = -1;
+        gtsam::Pose3 relative_pose;
+        liorf::uncertainty::Matrix6d covariance =
+            liorf::uncertainty::Matrix6d::Zero();
+    };
+
+    struct RegistrationOutput {
+        bool valid = false;
+        gtsam::Pose3 aligned_source_pose;
+        liorf::uncertainty::Matrix6d covariance =
+            liorf::uncertainty::Matrix6d::Zero();
+        double truncated_mse_m2 = std::numeric_limits<double>::infinity();
+        double overlap_ratio = 0.0;
+        std::size_t inliers = 0;
+    };
+
+    // Registration measurements and corresponding cross-trajectory loops.
+    std::unordered_map<int, std::vector<RegisteredPose>> _pose_queue;
+    std::unordered_map<int, std::vector<LoopCandidate>> _loop_queue;
 
     std::unordered_map< std::string, std::vector<PointTypePose> > _global_odom_trans;
 
@@ -216,7 +251,7 @@ public:
                 prefixTopic(_robot_id, _local_topic), rclcpp::QoS(1),
                 std::bind(&MapFusion::laserCloudInfoHandler, this, std::placeholders::_1), subOpt);
 
-        _sub_loop_info_global = create_subscription<liorf::msg::ContextInfo>(
+        _sub_loop_info_global = create_subscription<liorf::msg::LoopConstraint>(
                 _solid_topic + "/loop_info_global", rclcpp::QoS(100),
                 std::bind(&MapFusion::globalLoopInfoHandler, this, std::placeholders::_1), subOpt);
 
@@ -234,12 +269,13 @@ public:
 
 
         _pub_context_info = create_publisher<liorf::msg::ContextInfo>(_solid_topic + "/context_info", 1);
-        _pub_loop_info = create_publisher<liorf::msg::ContextInfo>(
+        _pub_loop_info = create_publisher<liorf::msg::LoopConstraint>(
                 prefixTopic(_robot_id, _loop_topic), 1);
         _pub_cloud = create_publisher<sensor_msgs::msg::PointCloud2>(_robot_id + "/" + _solid_topic + "/cloud", 1);
         _pub_trans_odom2map = create_publisher<nav_msgs::msg::Odometry>(_robot_id + "/" + _solid_topic + "/trans_map", 1);
         _pub_trans_odom2odom = create_publisher<nav_msgs::msg::Odometry>(_solid_topic + "/trans_odom", 1);
-        _pub_loop_info_global = create_publisher<liorf::msg::ContextInfo>(_solid_topic + "/loop_info_global", 1);
+        _pub_loop_info_global = create_publisher<liorf::msg::LoopConstraint>(
+                _solid_topic + "/loop_info_global", 1);
 
     }
 
@@ -304,7 +340,11 @@ private:
         _fov_down = declare_and_get<double>("mapfusion.solid.fov_down", -24.8);
 
         _loop_thres = declare_and_get<double>("mapfusion.interRobot.loop_threshold", 0.2);
-        _pcm_thres = declare_and_get<double>("mapfusion.interRobot.pcm_threshold", 20.0);
+        _pcm_thres = declare_and_get<double>("mapfusion.interRobot.pcm_threshold", 4.0);
+        _pcm_local_rotation_stddev_rad = declare_and_get<double>(
+            "mapfusion.interRobot.pcm_local_rotation_stddev_rad", 0.05);
+        _pcm_local_translation_stddev_m = declare_and_get<double>(
+            "mapfusion.interRobot.pcm_local_translation_stddev_m", 0.20);
         const double legacy_icp_threshold =
             declare_and_get<double>("mapfusion.interRobot.icp_threshold", 3.0);
         _robot_initial = declare_and_get<std::string>("mapfusion.interRobot.robot_initial", "jackal0");
@@ -387,6 +427,26 @@ private:
             "mapfusion.registration.max_truncated_mse_m2", legacy_icp_threshold);
         _registration_config.min_overlap_ratio = declare_and_get<double>(
             "mapfusion.registration.min_overlap_ratio", 0.10);
+        _registration_config.nominal_rotation_stddev_rad = declare_and_get<double>(
+            "mapfusion.registration.nominal_rotation_stddev_rad", 0.05);
+        _registration_config.nominal_translation_stddev_m = declare_and_get<double>(
+            "mapfusion.registration.nominal_translation_stddev_m", 0.20);
+        _registration_config.uncertainty_reference_mse_m2 = declare_and_get<double>(
+            "mapfusion.registration.uncertainty_reference_mse_m2", 0.04);
+        _registration_config.uncertainty_min_information_ratio = declare_and_get<double>(
+            "mapfusion.registration.uncertainty_min_information_ratio", 0.01);
+        _registration_config.uncertainty_max_variance_scale = declare_and_get<double>(
+            "mapfusion.registration.uncertainty_max_variance_scale", 100.0);
+
+        if (!std::isfinite(_pcm_thres) || _pcm_thres <= 0.0 ||
+            _pcm_start_threshold < 2 ||
+            !std::isfinite(_pcm_local_rotation_stddev_rad) ||
+            _pcm_local_rotation_stddev_rad <= 0.0 ||
+            !std::isfinite(_pcm_local_translation_stddev_m) ||
+            _pcm_local_translation_stddev_m <= 0.0) {
+            throw std::invalid_argument(
+                "mapfusion PCM threshold/uncertainty values are invalid");
+        }
 
         const std::string registration_error =
             liorf::registration::validate(_registration_config);
@@ -572,7 +632,7 @@ private:
 
     }
 
-    void globalLoopInfoHandler(const liorf::msg::ContextInfo::ConstSharedPtr& msgIn){
+    void globalLoopInfoHandler(const liorf::msg::LoopConstraint::ConstSharedPtr& msgIn){
 //        return;
         if (msgIn->robot_id != _robot_id)
             return;
@@ -1049,12 +1109,12 @@ private:
             source_pose_initial.z =  target_pose.z;
         }
 
-        PointTypePose pose_source_lidar = registerRelativeMotion(
+        const RegistrationOutput registered = registerRelativeMotion(
             transformPointCloud(bin.cloud, &source_pose_initial),
             transformPointCloud(bin_nearest.cloud, &target_pose),
             source_pose_initial);
 
-        if (pose_source_lidar.intensity < 0.0F)
+        if (!registered.valid)
             return false;
 
         //1: jackal0, 2: jackal1
@@ -1062,25 +1122,28 @@ private:
             gtsam::Pose3(gtsam::Rot3::RzRyRx(bin.pose.roll, bin.pose.pitch, bin.pose.yaw),
                   gtsam::Point3(bin.pose.x, bin.pose.y, bin.pose.z));
 
-        gtsam::Pose3 pose_to =
-            gtsam::Pose3(gtsam::Rot3::RzRyRx(pose_source_lidar.roll, pose_source_lidar.pitch, pose_source_lidar.yaw),
-                  gtsam::Point3(pose_source_lidar.x, pose_source_lidar.y, pose_source_lidar.z));
-
         gtsam::Pose3 pose_target =
             gtsam::Pose3(gtsam::Rot3::RzRyRx(target_pose.roll, target_pose.pitch, target_pose.yaw),
                   gtsam::Point3(target_pose.x, target_pose.y, target_pose.z));
 
-        auto ite = _pose_queue.find(_robot_this_th);
-        if(ite == _pose_queue.end()){
-            std::vector< std::tuple<gtsam::Pose3, gtsam::Pose3, float> > new_pose_queue;
-            std::vector< std::tuple<int, int, gtsam::Pose3> > new_loop_queue;
-            _pose_queue.emplace( std::make_pair(_robot_this_th, new_pose_queue) );
-            _loop_queue.emplace( std::make_pair(_robot_this_th, new_loop_queue) );
+        const auto relative_to_target = liorf::uncertainty::between(
+            registered.aligned_source_pose, registered.covariance,
+            pose_target, liorf::uncertainty::Matrix6d::Zero());
+        if (!liorf::uncertainty::validCovariance(relative_to_target.covariance)) {
+            RCLCPP_WARN(get_logger(),
+                "SKiD registration covariance failed relative-pose propagation");
+            return false;
         }
 
-
-        _pose_queue[_robot_this_th].emplace_back(std::make_tuple(pose_from, pose_to, pose_source_lidar.intensity));
-        _loop_queue[_robot_this_th].emplace_back(std::make_tuple(id0, id1, pose_to.between(pose_target)));
+        _pose_queue[_robot_this_th].push_back(RegisteredPose{
+            pose_from,
+            registered.aligned_source_pose,
+            registered.covariance,
+            registered.truncated_mse_m2,
+            registered.overlap_ratio,
+            registered.inliers});
+        _loop_queue[_robot_this_th].push_back(LoopCandidate{
+            id0, id1, relative_to_target.pose, relative_to_target.covariance});
 
         return true;
     }
@@ -1139,12 +1202,12 @@ private:
         return cloudOut;
     }
 
-    PointTypePose registerRelativeMotion(pcl::PointCloud<PointType>::Ptr source,
+    RegistrationOutput registerRelativeMotion(
+                                         pcl::PointCloud<PointType>::Ptr source,
                                          pcl::PointCloud<PointType>::Ptr target,
-                                         PointTypePose pose_source)
+                                         const PointTypePose& pose_source)
     {
-        PointTypePose pose_from;
-        pose_from.intensity = -1.0F;
+        RegistrationOutput output;
 
         liorf::registration::PointCloud source_points;
         liorf::registration::PointCloud target_points;
@@ -1172,53 +1235,60 @@ private:
                 registration.fine_inliers,
                 registration.metric.overlap_ratio,
                 registration.metric.value_m2);
-            pose_from.intensity = -1;
-            return pose_from;
+            return output;
         }
 
-        const Eigen::Affine3f correction_target_from_source(
-            registration.T_target_source.matrix().cast<float>());
-        const Eigen::Affine3f initial_world_from_lidar = pcl::getTransformation(
-            pose_source.x, pose_source.y, pose_source.z,
-            pose_source.roll, pose_source.pitch, pose_source.yaw);
-        const Eigen::Affine3f corrected_world_from_lidar =
-            correction_target_from_source * initial_world_from_lidar;
+        const gtsam::Pose3 correction_target_from_source(
+            gtsam::Rot3(registration.T_target_source.linear()),
+            gtsam::Point3(registration.T_target_source.translation()));
+        const gtsam::Pose3 initial_world_from_lidar(
+            gtsam::Rot3::RzRyRx(
+                pose_source.roll, pose_source.pitch, pose_source.yaw),
+            gtsam::Point3(pose_source.x, pose_source.y, pose_source.z));
+        const auto aligned = liorf::uncertainty::compose(
+            correction_target_from_source,
+            registration.uncertainty.covariance,
+            initial_world_from_lidar,
+            liorf::uncertainty::Matrix6d::Zero());
+        if (!liorf::uncertainty::validCovariance(aligned.covariance)) {
+            RCLCPP_WARN(get_logger(),
+                "SKiD registration covariance failed pose-composition propagation");
+            return output;
+        }
 
-        float x, y, z, roll, pitch, yaw;
-        pcl::getTranslationAndEulerAngles(
-            corrected_world_from_lidar, x, y, z, roll, pitch, yaw);
-
-        pose_from.x = x;
-        pose_from.y = y;
-        pose_from.z = z;
-
-        pose_from.yaw = yaw;
-        pose_from.roll = roll;
-        pose_from.pitch = pitch;
-
-        pose_from.intensity = static_cast<float>(registration.metric.value_m2);
+        output.valid = true;
+        output.aligned_source_pose = aligned.pose;
+        output.covariance = aligned.covariance;
+        output.truncated_mse_m2 = registration.metric.value_m2;
+        output.overlap_ratio = registration.metric.overlap_ratio;
+        output.inliers = registration.metric.correspondence_count;
 
         RCLCPP_INFO(
             get_logger(),
             "SKiD registration accepted: corr=%zu coarse_inliers=%zu "
             "fine_inliers=%zu overlap=%.3f tMSE=%.6f m^2 "
+            "uncertainty_scale=%.2f condition=%.1f clamped_modes=%zu "
             "time=%.1f ms (coarse %.1f, fine %.1f)",
             registration.coarse_correspondences,
             registration.coarse_translation_inliers,
             registration.fine_inliers,
             registration.metric.overlap_ratio,
             registration.metric.value_m2,
+            registration.uncertainty.variance_scale,
+            registration.uncertainty.condition_number,
+            registration.uncertainty.clamped_modes,
             1000.0 * (registration.coarse_seconds + registration.fine_seconds +
                       registration.metric_seconds),
             1000.0 * registration.coarse_seconds,
             1000.0 * registration.fine_seconds);
 
-        return pose_from;
+        return output;
 
     }
 
     bool incrementalPCM() {
-        if (_pose_queue[_robot_this_th].size() < _pcm_start_threshold)
+        if (_pose_queue[_robot_this_th].size() <
+            static_cast<std::size_t>(_pcm_start_threshold))
             return false;
 
         //perform pcm for all robot matches
@@ -1229,10 +1299,9 @@ private:
         // Compute maximum clique
         FMC::CGraphIO gio;
         gio.readGraph(consistency_matrix_file);
-        int max_clique_size = 0;
         std::vector<int> max_clique_data;
 
-        max_clique_size = FMC::maxCliqueHeu(gio, max_clique_data);
+        FMC::maxCliqueHeu(gio, max_clique_data);
 
         std::sort(max_clique_data.begin(), max_clique_data.end());
 
@@ -1250,54 +1319,45 @@ private:
         return true;
     }
 
-    Eigen::MatrixXi computePCMMatrix( std::vector< std::tuple<int, int, gtsam::Pose3> > loop_queue_this){
+    Eigen::MatrixXi computePCMMatrix(const std::vector<LoopCandidate>& loop_queue_this){
         Eigen::MatrixXi PCMMat;
         PCMMat.setZero(loop_queue_this.size(), loop_queue_this.size());
-        int id_0, id_1;
-        gtsam::Pose3 z_aj_bk, z_ai_bl;
         gtsam::Pose3 z_ai_aj, z_bk_bl;
         gtsam::Pose3 t_ai, t_aj, t_bk, t_bl;
 
         for (unsigned int i = 0; i < loop_queue_this.size(); i++){
-            std::tie(id_0, id_1, z_aj_bk) = loop_queue_this[i];
-            PointTypePose tmp_pose_0 = _bin_with_id.at(id_0).pose;
-            PointTypePose tmp_pose_1 = _bin_with_id.at(id_1).pose;
+            const auto& first_loop = loop_queue_this[i];
+            PointTypePose tmp_pose_0 = _bin_with_id.at(first_loop.target_bin).pose;
+            PointTypePose tmp_pose_1 = _bin_with_id.at(first_loop.source_bin).pose;
             t_aj = gtsam::Pose3(gtsam::Rot3::RzRyRx(tmp_pose_0.roll, tmp_pose_0.pitch, tmp_pose_0.yaw),
                                 gtsam::Point3(tmp_pose_0.x, tmp_pose_0.y, tmp_pose_0.z));
             t_bk = gtsam::Pose3(gtsam::Rot3::RzRyRx(tmp_pose_1.roll, tmp_pose_1.pitch, tmp_pose_1.yaw),
                                 gtsam::Point3(tmp_pose_1.x, tmp_pose_1.y, tmp_pose_1.z));
 
             for (unsigned int j = i + 1; j < loop_queue_this.size(); j++){
-                std::tie(id_0, id_1, z_ai_bl) = loop_queue_this[j];
-                PointTypePose tmp_pose_0 = _bin_with_id.at(id_0).pose;
-                PointTypePose tmp_pose_1 = _bin_with_id.at(id_1).pose;
+                const auto& second_loop = loop_queue_this[j];
+                PointTypePose tmp_pose_0 = _bin_with_id.at(second_loop.target_bin).pose;
+                PointTypePose tmp_pose_1 = _bin_with_id.at(second_loop.source_bin).pose;
                 t_ai = gtsam::Pose3(gtsam::Rot3::RzRyRx(tmp_pose_0.roll, tmp_pose_0.pitch, tmp_pose_0.yaw),
                                     gtsam::Point3(tmp_pose_0.x, tmp_pose_0.y, tmp_pose_0.z));
                 t_bl = gtsam::Pose3(gtsam::Rot3::RzRyRx(tmp_pose_1.roll, tmp_pose_1.pitch, tmp_pose_1.yaw),
                                     gtsam::Point3(tmp_pose_1.x, tmp_pose_1.y, tmp_pose_1.z));
                 z_ai_aj = t_ai.between(t_aj);
                 z_bk_bl = t_bk.between(t_bl);
-                float resi = residualPCM(z_aj_bk, z_ai_bl, z_ai_aj, z_bk_bl, 1);
-                if (resi < _pcm_thres)
+                const auto residual = liorf::uncertainty::pcmResidual(
+                    first_loop.relative_pose, first_loop.covariance,
+                    second_loop.relative_pose, second_loop.covariance,
+                    z_ai_aj, z_bk_bl,
+                    _pcm_local_rotation_stddev_rad,
+                    _pcm_local_translation_stddev_m);
+                if (residual.valid &&
+                    residual.mahalanobis_distance < _pcm_thres)
                     PCMMat(i,j) = 1;
                 else
                     PCMMat(i,j) = 0;
             }
         }
         return PCMMat;
-    }
-
-    float residualPCM(gtsam::Pose3 inter_jk, gtsam::Pose3 inter_il, gtsam::Pose3 inner_ij, gtsam::Pose3 inner_kl, float intensity){
-        gtsam::Pose3 inter_il_inv = inter_il.inverse();
-        gtsam::Pose3 res_pose = inner_ij * inter_jk * inner_kl * inter_il_inv;
-        gtsam::Vector6 res_vec = gtsam::Pose3::Logmap(res_pose);
-
-        Eigen::Matrix< double, 6, 1> v ;
-        v << intensity, intensity, intensity,
-            intensity, intensity, intensity;
-        Eigen::Matrix< double, 6, 6> m_cov = v.array().matrix().asDiagonal();
-
-        return sqrt(res_vec.transpose()* m_cov * res_vec);
     }
 
     void printPCMGraph(Eigen::MatrixXi pcm_matrix, std::string file_name) {
@@ -1328,11 +1388,11 @@ private:
         if (_loop_accept_queue[_robot_this_th].size()<2)
             return;
 
-        gtsam::Vector Vector6(6);
-
         gtsam::Pose3 initial_pose_0, initial_pose_1;
-        initial_pose_0 = std::get<0>(_pose_queue[_robot_this_th][ _loop_accept_queue[_robot_this_th][_loop_accept_queue[_robot_this_th].size() -1] ]);
-        initial_pose_1 = std::get<1>(_pose_queue[_robot_this_th][ _loop_accept_queue[_robot_this_th][_loop_accept_queue[_robot_this_th].size() -1] ]);
+        const auto& latest = _pose_queue[_robot_this_th][
+            _loop_accept_queue[_robot_this_th].back()];
+        initial_pose_0 = latest.source_pose;
+        initial_pose_1 = latest.aligned_source_pose;
 
         gtsam::Values initial;
         gtsam::ExpressionFactorGraph graph;
@@ -1342,23 +1402,18 @@ private:
         initial.insert(0, initial_pose_1 * initial_pose_0.inverse());
         //initial.print();
 
-        gtsam::Pose3 p, measurement;
-        float noiseScore;
-
         for (auto i:_loop_accept_queue[_robot_this_th]){
-            std::tie(measurement, p, noiseScore) = _pose_queue[_robot_this_th][i];
+            const auto& registration = _pose_queue[_robot_this_th][i];
 
-            if(noiseScore == 0)// 0 indicates a inter robot outlier
-                continue;
+            gtsam::Pose3_ predicted = transformTo(
+                trans, registration.aligned_source_pose);
 
-            gtsam::Pose3_ predicted = transformTo(trans,p);
-
-            Vector6 << noiseScore, noiseScore, noiseScore, noiseScore, noiseScore,
-                noiseScore;
-            auto measurementNoise = gtsam::noiseModel::Diagonal::Variances(Vector6);
+            auto measurementNoise = gtsam::noiseModel::Gaussian::Covariance(
+                registration.covariance);
 
             // Add the Pose3 expression variable, an initial estimate, and the measurement noise.
-            graph.addExpressionFactor(predicted, measurement, measurementNoise);
+            graph.addExpressionFactor(
+                predicted, registration.source_pose, measurementNoise);
         }
         gtsam::Values result = gtsam::LevenbergMarquardtOptimizer(graph, initial).optimize();
 
@@ -1431,7 +1486,7 @@ private:
         auto loop_list = _loop_queue[_robot_this_th];
         int len_loop_list = loop_list.size() - 1;
         auto loop_this = loop_list[len_loop_list];
-        int id_bin_this = std::get<1>(loop_this);
+        int id_bin_this = loop_this.source_bin;
 
         if (_initial_loop.first == -1){
             //if not enough time distance
@@ -1450,7 +1505,6 @@ private:
         int tmp_robot_id_th =  _initial_loop.first;
         int tmp_len_loop_list = _initial_loop.second;
         auto loop_that = _loop_queue[tmp_robot_id_th][tmp_len_loop_list];
-        int id_bin_that = std::get<1>(loop_that);
         sendLoopThis(_robot_this_th, tmp_robot_id_th, len_loop_list, tmp_len_loop_list);
         sendLoopThat(_robot_this_th, tmp_robot_id_th, len_loop_list, tmp_len_loop_list);
 
@@ -1472,16 +1526,17 @@ private:
         auto loop_this = loop_list_this[id_loop_this];
         auto loop_that = loop_list_that[id_loop_that];
 
-        int id_bin_this = std::get<1>(loop_this);
-        int id_bin_last = std::get<1>(loop_that);
+        int id_bin_this = loop_this.source_bin;
+        int id_bin_last = loop_that.source_bin;
 
         auto pose_this = _pose_queue[robot_id_this][id_loop_this];
         auto pose_that = _pose_queue[robot_id_that][id_loop_that];
 
-        gtsam::Pose3 pose_to_this, pose_to_that;
+        liorf::uncertainty::PoseWithCovariance pose_to_this;
+        liorf::uncertainty::PoseWithCovariance pose_to_that;
         if(robot_id_this == robot_id_that){
-            pose_to_this = std::get<1>(pose_this);
-            pose_to_that = std::get<1>(pose_that);
+            pose_to_this = {pose_this.aligned_source_pose, pose_this.covariance};
+            pose_to_that = {pose_that.aligned_source_pose, pose_that.covariance};
         }
         else{
             if (_global_map_trans_optimized.find(robot_id_this) == _global_map_trans_optimized.end() ||
@@ -1495,22 +1550,22 @@ private:
             gtsam::Pose3 trans_that3 = gtsam::Pose3( gtsam::Rot3::RzRyRx(trans_that.roll, trans_that.pitch, trans_that.yaw),
                                                      gtsam::Point3(trans_that.x, trans_that.y, trans_that.z) );
 
-            pose_to_this =  trans_this3.inverse() * std::get<1>(pose_this);
-            pose_to_that =  trans_that3.inverse() * std::get<1>(pose_that);
+            pose_to_this = {
+                trans_this3.inverse() * pose_this.aligned_source_pose,
+                pose_this.covariance};
+            pose_to_that = {
+                trans_that3.inverse() * pose_that.aligned_source_pose,
+                pose_that.covariance};
         }
 
-        float tmp_intensity = (std::get<2>(pose_this) + std::get<2>(pose_that) ) / 2.0;
-
-        auto dpose = pose_to_that.between(pose_to_this);
-        auto thisp = _bin_with_id[id_bin_this].pose;
-        auto thatp = _bin_with_id[id_bin_last].pose;
-        auto pose_to_this1 = gtsam::Pose3( gtsam::Rot3::RzRyRx(thisp.roll, thisp.pitch, thisp.yaw),
-                                     gtsam::Point3(thisp.x, thisp.y, thisp.z) );
-        auto pose_to_that1 = gtsam::Pose3( gtsam::Rot3::RzRyRx(thatp.roll, thatp.pitch, thatp.yaw),
-                                     gtsam::Point3(thatp.x, thatp.y, thatp.z) );
-        auto dpose1 = pose_to_that1.between(pose_to_this1);
-
-        update_loop_info(id_bin_last, id_bin_this, pose_to_that, pose_to_this, tmp_intensity);
+        const auto measurement = liorf::uncertainty::between(
+            pose_to_that.pose, pose_to_that.covariance,
+            pose_to_this.pose, pose_to_this.covariance);
+        update_loop_info(
+            id_bin_last, id_bin_this, measurement,
+            0.5 * (pose_this.truncated_mse_m2 + pose_that.truncated_mse_m2),
+            std::min(pose_this.overlap_ratio, pose_that.overlap_ratio),
+            std::min(pose_this.inliers, pose_that.inliers));
 
         _pub_loop_info->publish(_loop_info);
     }
@@ -1522,34 +1577,46 @@ private:
         auto loop_this = loop_list[id_loop_this];
         auto loop_that = loop_list[id_loop_that];
 
-        int id_bin_this = std::get<0>(loop_this);
-        int id_bin_last = std::get<0>(loop_that);
+        int id_bin_this = loop_this.target_bin;
+        int id_bin_last = loop_that.target_bin;
 
         auto pose_this = _pose_queue[robot_id_this][id_loop_this];
         auto pose_that = _pose_queue[robot_id_this][id_loop_that];
-        auto pose_to_this = std::get<0>(pose_this) * std::get<2>(loop_this) ;
-        auto pose_to_that = std::get<0>(pose_that) * std::get<2>(loop_that) ;
-        float tmp_intensity = (std::get<2>(pose_this) + std::get<2>(pose_that) ) / 2.0;
-        update_loop_info(id_bin_last, id_bin_this, pose_to_that, pose_to_this, tmp_intensity);
+        const auto pose_to_this = liorf::uncertainty::compose(
+            pose_this.source_pose, liorf::uncertainty::Matrix6d::Zero(),
+            loop_this.relative_pose, loop_this.covariance);
+        const auto pose_to_that = liorf::uncertainty::compose(
+            pose_that.source_pose, liorf::uncertainty::Matrix6d::Zero(),
+            loop_that.relative_pose, loop_that.covariance);
+        const auto measurement = liorf::uncertainty::between(
+            pose_to_that.pose, pose_to_that.covariance,
+            pose_to_this.pose, pose_to_this.covariance);
+        update_loop_info(
+            id_bin_last, id_bin_this, measurement,
+            0.5 * (pose_this.truncated_mse_m2 + pose_that.truncated_mse_m2),
+            std::min(pose_this.overlap_ratio, pose_that.overlap_ratio),
+            std::min(pose_this.inliers, pose_that.inliers));
 
         _pub_loop_info_global->publish(_loop_info);
     }
 
-    void update_loop_info(int id_bin_last, int id_bin_this, gtsam::Pose3 pose_to_last, gtsam::Pose3 pose_to_this, float intensity){
-        //relative translation btwn 2 poses
-        auto dpose = pose_to_last.between(pose_to_this);
-        _loop_info.robot_id = _bin_with_id[id_bin_last].robotname;
-        _loop_info.num_ring   = _bin_with_id[id_bin_last].pose.intensity;//from
-        _loop_info.num_sector = _bin_with_id[id_bin_this].pose.intensity;//to
-
-        _loop_info.pose_x = dpose.translation().x();
-        _loop_info.pose_y = dpose.translation().y();
-        _loop_info.pose_z = dpose.translation().z();
-        _loop_info.pose_roll  = dpose.rotation().roll();
-        _loop_info.pose_pitch = dpose.rotation().pitch();
-        _loop_info.pose_yaw   = dpose.rotation().yaw();
-        _loop_info.pose_intensity = intensity;
-
+    void update_loop_info(
+            int id_bin_last,
+            int id_bin_this,
+            const liorf::uncertainty::PoseWithCovariance& measurement,
+            double registration_error_m2,
+            double overlap_ratio,
+            std::size_t registration_inliers){
+        _loop_info.header = _cloud_header;
+        liorf::loop_constraint::populate(
+            _loop_info,
+            _bin_with_id[id_bin_last].robotname,
+            static_cast<std::int64_t>(_bin_with_id[id_bin_last].pose.intensity),
+            static_cast<std::int64_t>(_bin_with_id[id_bin_this].pose.intensity),
+            measurement,
+            registration_error_m2,
+            overlap_ratio,
+            registration_inliers);
     }
 
     void sendOdomOutputMessage(){

@@ -162,6 +162,7 @@ target_compile_options(small_gicp PRIVATE -w)
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/CloudInfo.msg"
   "msg/ContextInfo.msg"
+  "msg/LoopConstraint.msg"
   "srv/SaveMap.srv"
   DEPENDENCIES std_msgs geometry_msgs nav_msgs sensor_msgs
 )
@@ -220,6 +221,12 @@ target_link_libraries(skid_registration
   PRIVATE kiss_matcher::kiss_matcher_core small_gicp
 )
 
+add_library(skid_pose_uncertainty STATIC src/skid_pose_uncertainty.cpp)
+target_include_directories(skid_pose_uncertainty PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+)
+target_link_libraries(skid_pose_uncertainty PUBLIC Eigen3::Eigen gtsam)
+
 # <!-- liorf_yjz_lucky_boy -->
 # Range Image Projection
 ament_auto_add_executable(${PROJECT_NAME}_imageProjection src/imageProjection.cpp ${common_lib})
@@ -230,7 +237,7 @@ target_link_libraries(${PROJECT_NAME}_imageProjection
 ament_auto_add_executable(${PROJECT_NAME}_mapOptmization src/mapOptmization.cpp ${common_lib} include/Scancontext.cpp)
 target_link_libraries(${PROJECT_NAME}_mapOptmization
   ${cpp_typesupport_target} ${PCL_LIBRARIES} ${OpenCV_LIBRARIES} OpenMP::OpenMP_CXX
-  ${GeographicLib_LIBRARIES} gtsam)
+  ${GeographicLib_LIBRARIES} gtsam skid_pose_uncertainty)
 
 # IMU Preintegration
 ament_auto_add_executable(${PROJECT_NAME}_imuPreintegration src/imuPreintegration.cpp ${common_lib})
@@ -242,13 +249,13 @@ target_link_libraries(${PROJECT_NAME}_imuPreintegration
 ament_auto_add_executable(${PROJECT_NAME}_mapFusion src/liorf-DiSO/mapFusion_so.cpp)
 target_link_libraries(${PROJECT_NAME}_mapFusion
   ${cpp_typesupport_target} ${PCL_LIBRARIES} ${NABO_LIBRARIES}
-  gtsam fast_max-clique_finder solid skid_registration)
+  gtsam fast_max-clique_finder solid skid_registration skid_pose_uncertainty)
 
 # Map Fusion (Scan Context)
 ament_auto_add_executable(${PROJECT_NAME}_mapFusionSC src/liorf-DiSO/mapFusion_sc.cpp)
 target_link_libraries(${PROJECT_NAME}_mapFusionSC
   ${cpp_typesupport_target} ${PCL_LIBRARIES} ${NABO_LIBRARIES}
-  gtsam fast_max-clique_finder scan_context)
+  gtsam fast_max-clique_finder scan_context skid_pose_uncertainty)
 
 #########
 ## Test #
@@ -270,6 +277,15 @@ if(BUILD_TESTING)
   ament_add_gtest(test_skid_registration
     test/test_skid_registration.cpp)
   target_link_libraries(test_skid_registration skid_registration)
+
+  ament_add_gtest(test_skid_pose_uncertainty
+    test/test_skid_pose_uncertainty.cpp)
+  target_link_libraries(test_skid_pose_uncertainty skid_pose_uncertainty)
+
+  ament_add_gtest(test_loop_constraint_utils
+    test/test_loop_constraint_utils.cpp)
+  target_link_libraries(test_loop_constraint_utils
+    ${cpp_typesupport_target} skid_pose_uncertainty)
 endif()
 
 #############

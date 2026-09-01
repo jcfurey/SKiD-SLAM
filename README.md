@@ -172,6 +172,10 @@ DiSO FEATURES
 ---------------------------------------------------------------------------------------------------------------------------------------------------
 - Uses KISS-Matcher coarse registration followed by Small-GICP fine
   registration and a truncated-MSE/overlap gate in the SOLiD map-fusion node.
+- Propagates a physically dimensioned, Hessian-shaped 6-DoF covariance through
+  Mahalanobis PCM and a typed loop-constraint message into GTSAM. The
+  derivation, calibration boundary, and remaining paper gaps are recorded in
+  [`doc/PAPER_V3_GAP_AUDIT.md`](doc/PAPER_V3_GAP_AUDIT.md).
 
 - republish of map topics for 3rd-party application requiring map application
 
