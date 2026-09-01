@@ -2,7 +2,7 @@
   <h1>Liorf + Distributed SOLiD </h1>
   <a href=""><img src="https://img.shields.io/badge/-C++-blue?logo=cplusplus" /></a>
   <a href=""><img src="https://img.shields.io/badge/Python-3670A0?logo=python&logoColor=ffdd54" /></a>
-  <a href=""><img src="https://img.shields.io/badge/ROS-Noetic-blue" /></a>
+  <a href=""><img src="https://img.shields.io/badge/ROS%202-Jazzy%20%7C%20Lyrical-blue" /></a>
   <a href=""><img src="https://img.shields.io/badge/Linux-FCC624?logo=linux&logoColor=black" /></a>
   <a href=""><img src="https://badges.aleen42.com/src/docker.svg" /></a>
   <br />
@@ -20,23 +20,77 @@
 * SOLiD, which is a lightweight descriptor enables fast communication between robots.
 
 ## :package: Dependencies
-* Ubuntu 20.04
-* [GTSAM (Develop version)](https://github.com/borglab/gtsam.git)
-* [libnabo 1.0.7](https://github.com/norlab-ulaval/libnabo/tree/1.0.7)
 
+This package targets **ROS 2 Jazzy** (Ubuntu 24.04) and **ROS 2 Lyrical** (Ubuntu 26.04).
+
+```bash
+sudo apt install \
+  ros-$ROS_DISTRO-pcl-conversions ros-$ROS_DISTRO-pcl-ros \
+  ros-$ROS_DISTRO-tf2 ros-$ROS_DISTRO-tf2-ros ros-$ROS_DISTRO-tf2-eigen \
+  ros-$ROS_DISTRO-tf2-geometry-msgs ros-$ROS_DISTRO-cv-bridge \
+  ros-$ROS_DISTRO-gtsam ros-$ROS_DISTRO-libnabo ros-$ROS_DISTRO-rviz2 \
+  libgeographiclib-dev libpcl-dev libopencv-dev libeigen3-dev
+```
+
+GTSAM and libnabo are pulled from the ROS 2 package index (`ros-$ROS_DISTRO-gtsam`,
+`ros-$ROS_DISTRO-libnabo`); building them from source is no longer required.
+
+## :hammer: Build
+
+```bash
+mkdir -p ~/ros2_ws/src && cd ~/ros2_ws/src
+git clone <this repository> liorf
+cd ~/ros2_ws
+rosdep install --from-paths src --ignore-src -r -y
+colcon build --cmake-args -DCMAKE_BUILD_TYPE=Release
+source install/setup.bash
+```
+
+`mapOptmization.cpp` is template-heavy (GTSAM + PCL); on a machine with less
+than ~4 GB of RAM per core, build with `MAKEFLAGS=-j2 colcon build ...` to avoid
+the compiler being OOM-killed.
 
 ## HOW to run the package
-0. follow the setup required for liorf package and DiSCO-SLAM (mostly implemented)
-   
-1. Run the launch file:
+
+1. Run the launch file (multi-robot):
   ```
-    roslaunch liorf run_liorf_multi.launch
+    ros2 launch liorf run_liorf_multi.launch.py
   ```
+  Single-robot dataset launches are also available:
+  `run_kitti.launch.py`, `run_mulran.launch.py`, `run_M2DGR.launch.py`,
+  `run_lio_sam_default.launch.py`, `run_lio_sam_ouster.launch.py`,
+  `run_lio_sam_livox.launch.py`. Each accepts `rviz:=false` to skip RViz, and
+  `robot:=<id>` to change the robot namespace prefix.
 
 2. Play existing bag files:
   ```
-    rosbag play your_bag.bag
+    ros2 bag play your_bag       # ROS 2 bag
   ```
+  ROS 1 bags need converting first, e.g. with
+  [rosbags](https://gitlab.com/ternaris/rosbags): `rosbags-convert your_bag.bag`.
+
+3. Save the map (per robot):
+  ```
+    ros2 service call /jackal0/liorf/save_map liorf/srv/SaveMap \
+      "{resolution: 0.2, destination: /Downloads/LOAM}"
+  ```
+
+## :arrows_counterclockwise: ROS 2 port notes
+
+* Interfaces were renamed to ROS 2 conventions: `liorf/CloudInfo`,
+  `liorf/ContextInfo`, `liorf/SaveMap`. ROS 2 IDL forbids camelCase fields, so
+  message fields are now snake_case (`imuRollInit` &rightarrow; `imu_roll_init`,
+  `robotID` &rightarrow; `robot_id`, and so on).
+* Parameter files live under the `/**: ros__parameters:` wildcard so every node
+  picks up the same configuration regardless of the node name the launch file
+  assigns. The `liorf:` / `mapfusion:` nesting is unchanged.
+* A topic name that starts with `/` is treated as absolute and is no longer
+  prefixed with the robot id (ROS 2 rejects the `robot//topic` that blind
+  concatenation produced). This is what makes `mulran.yaml` work.
+* `save_map` is now advertised per robot as `<robot_id>/liorf/save_map`;
+  previously both robots advertised the same name in a multi-robot session.
+* `imuPreintegration` hosts two nodes in one process, so the launch file remaps
+  their names individually rather than with a process-wide `name=`.
 
  <p align='center'>
       <img src="./demo/multi-2023-11-01_21.15.36.gif" alt="drawing" width="800" height = "400"/>
@@ -74,16 +128,9 @@ for outlier detection.
 - [The Park Dataset](https://drive.google.com/file/d/1-2zsRSB_9ORQ9WQdtUbGdoS4YXU3cBQt/view?usp=sharing)
 - [KITTI 08 Dataset](https://drive.google.com/file/d/1U6z_1VHlPJa_DJ2i8VwxkKLjf5JxMo0f/view?usp=sharing)
 
-To run the KITTI08 dataset, change line 9 & 10 in launch/run.launch from
-  ```
-<rosparam file="$(find lio_sam)/config/params.yaml" command="load" />
-<rosparam file="$(find lio_sam)/src/DiSCo-SLAM/config/mapfusion.yaml" command="load"/>
-  ```
-to
-  ```  
-<rosparam file="$(find lio_sam)/config/params_k.yaml" command="load" />
-<rosparam file="$(find lio_sam)/src/DiSCo-SLAM/config/mapfusion_k.yaml" command="load"/>
-  ```
+To run against a different dataset, point the launch file at the matching
+parameter file in `config/` (each `run_*.launch.py` selects one), or pass your
+own with the `params` argument of `launch/include/module_loam.launch.py`.
 DiSO FEATURES
 ---------------------------------------------------------------------------------------------------------------------------------------------------
 - Now utilizes G-ICP for mapFusion node, for better map-to-map matching
@@ -134,8 +181,10 @@ LIORF FEATURES
 
   - **Jumpping up and down**: if you start testing your bag file and the base_link starts to jump up and down immediately, it is likely your IMU extrinsics are wrong. For example, the gravity acceleration has negative value.
 
-  - **mapOptimization crash**: it is usually caused by GTSAM. Please install the GTSAM specified in the README.md. More similar issues can be found [here](https://github.com/TixiaoShan/LIO-SAM/issues).
+  - **mapOptimization crash**: it is usually caused by GTSAM. Install `ros-$ROS_DISTRO-gtsam` as described above. More similar issues can be found [here](https://github.com/TixiaoShan/LIO-SAM/issues).
 
-  - **gps odometry unavailable**: it is generally caused due to unavailable transform between message frame_ids and robot frame_id (for example: transform should be available from "imu_frame_id" and "gps_frame_id" to "base_link" frame. Please read the Robot Localization documentation found [here](http://docs.ros.org/en/melodic/api/robot_localization/html/preparing_sensor_data.html).
+  - **imuPreintegration aborts with an "Indeterminant linear system" or "dt <= 0"**: the IMU stream reaching the node has duplicate or out-of-order timestamps. Check that only one publisher is feeding `imuTopic` and that the bag's IMU timestamps increase monotonically.
+
+  - **gps odometry unavailable**: it is generally caused due to unavailable transform between message frame_ids and robot frame_id (for example: transform should be available from "imu_frame_id" and "gps_frame_id" to "base_link" frame. Please read the Robot Localization documentation found [here](https://docs.ros.org/en/ros2_packages/rolling/api/robot_localization/preparing_sensor_data.html).
 
 

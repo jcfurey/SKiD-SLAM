@@ -5,8 +5,8 @@
 //
 
 //msg
-#include "liorf/cloud_info.h"
-#include "liorf/context_info.h"
+#include "liorf/msg/cloud_info.hpp"
+#include "liorf/msg/context_info.hpp"
 
 //third party
 #include "SOLiD/solid.h"
@@ -15,13 +15,15 @@
 #include "nabo/nabo.h"
 
 //ros
-#include <tf/LinearMath/Quaternion.h>
-#include <tf/transform_listener.h>
-#include <tf/transform_datatypes.h>
-#include <tf/transform_broadcaster.h>
+#include <rclcpp/rclcpp.hpp>
+#include "ros_compat.h"
 
-#include <nav_msgs/Odometry.h>
-#include <std_msgs/Bool.h>
+
+#include <nav_msgs/msg/odometry.hpp>
+#include <std_msgs/msg/bool.hpp>
+#include <sensor_msgs/msg/point_cloud2.hpp>
+#include <pcl_conversions/pcl_conversions.h>
+#include <pcl/kdtree/kdtree_flann.h>
 
 //gtsam
 #include <gtsam/geometry/Pose3.h>
@@ -53,43 +55,33 @@ inline gtsam::Pose3_ transformTo(const gtsam::Pose3_& x, const gtsam::Pose3_& p)
     return gtsam::Pose3_(x, &gtsam::Pose3::transformPoseTo, p);
 }
 
-sensor_msgs::PointCloud2 publishCloud(ros::Publisher *thisPub, pcl::PointCloud<PointType>::Ptr thisCloud, ros::Time thisStamp, std::string thisFrame)
-{
-    sensor_msgs::PointCloud2 tempCloud;
-    pcl::toROSMsg(*thisCloud, tempCloud);
-    tempCloud.header.stamp = thisStamp;//
-    tempCloud.header.frame_id = thisFrame;
-    if (thisPub->getNumSubscribers() != 0)
-        thisPub->publish(tempCloud);
-    return tempCloud;
-}
-
-class MapFusion{
+class MapFusion : public rclcpp::Node {
 
 private:
-    ros::NodeHandle nh;//global node handler for publishing everthing
 
-    ros::Subscriber _sub_laser_cloud_info;
-    ros::Subscriber _sub_solid_info;
-    ros::Subscriber _sub_odom_trans;
-    ros::Subscriber _sub_loop_info_global;
+    rclcpp::Subscription<liorf::msg::CloudInfo>::SharedPtr _sub_laser_cloud_info;
+    rclcpp::Subscription<liorf::msg::ContextInfo>::SharedPtr _sub_solid_info;
+    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr _sub_odom_trans;
+    rclcpp::Subscription<liorf::msg::ContextInfo>::SharedPtr _sub_loop_info_global;
 
-    ros::Subscriber _sub_communication_signal;
-    ros::Subscriber _sub_signal_1;
-    ros::Subscriber _sub_signal_2;
+    rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr _sub_communication_signal;
+    rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr _sub_signal_1;
+    rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr _sub_signal_2;
+
+    rclcpp::CallbackGroup::SharedPtr _callback_group;
 
 
     std::string _signal_id_1;
     std::string _signal_id_2;
 
-    ros::Publisher _pub_context_info;
-    ros::Publisher _pub_loop_info;
-    ros::Publisher _pub_cloud;
+    rclcpp::Publisher<liorf::msg::ContextInfo>::SharedPtr _pub_context_info;
+    rclcpp::Publisher<liorf::msg::ContextInfo>::SharedPtr _pub_loop_info;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr _pub_cloud;
 
-    ros::Publisher _pub_trans_odom2map;
-    ros::Publisher _pub_trans_odom2odom;
+    rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr _pub_trans_odom2map;
+    rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr _pub_trans_odom2odom;
 
-    ros::Publisher _pub_loop_info_global;
+    rclcpp::Publisher<liorf::msg::ContextInfo>::SharedPtr _pub_loop_info_global;
 
     //parameters
     std::string _robot_id;
@@ -133,8 +125,8 @@ private:
     std::string _robot_initial;
     std::string _pcm_matrix_folder;
 
-    liorf::cloud_info   _cloud_info;
-//    liorf::context_info _context_info;
+    liorf::msg::CloudInfo   _cloud_info;
+//    liorf::msg::ContextInfo _context_info;
     std::vector<SOLiDBin> _context_list_to_publish_1;
     std::vector<SOLiDBin> _context_list_to_publish_2;
 
@@ -153,8 +145,8 @@ private:
     std::pair<int, int> _initial_loop;
     int _id_bin_last;
 
-    liorf::context_info _loop_info;
-    std_msgs::Header _cloud_header;
+    liorf::msg::ContextInfo _loop_info;
+    std_msgs::msg::Header _cloud_header;
 
     pcl::PointCloud<PointType>::Ptr _laser_cloud_sum;
     pcl::PointCloud<PointType>::Ptr _laser_cloud_feature;
@@ -185,54 +177,68 @@ private:
     std::unordered_map< int, PointTypePose> _global_map_trans_optimized;
 
     int number_print;
+    int _num_cores = 4;
 
     PointTypePose _trans_to_publish;
 
     std::vector<std::pair<string, double>> _processing_time_list;
 public:
 
-    MapFusion(){
+    explicit MapFusion(const rclcpp::NodeOptions & options)
+    : Node("liorf_mapFusion", options) {
         ParamLoader();
         initialization();
 
-        _sub_communication_signal = nh.subscribe<std_msgs::Bool>(_robot_id + "/liorf/signal",
-                 100, &MapFusion::communicationSignalHandler, this, ros::TransportHints().tcpNoDelay());
+        // ROS 1 spun this node single-threaded; keep callbacks serialised.
+        _callback_group = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+        auto subOpt = rclcpp::SubscriptionOptions();
+        subOpt.callback_group = _callback_group;
 
-        _sub_signal_1 = nh.subscribe<std_msgs::Bool>(_signal_id_1 + "/liorf/signal",
-                 100, &MapFusion::signalHandler1, this, ros::TransportHints().tcpNoDelay());
-        _sub_signal_2 = nh.subscribe<std_msgs::Bool>(_signal_id_2 + "/liorf/signal",
-                 100, &MapFusion::signalHandler2, this, ros::TransportHints().tcpNoDelay());
+        _sub_communication_signal = create_subscription<std_msgs::msg::Bool>(
+                _robot_id + "/liorf/signal", rclcpp::QoS(100),
+                std::bind(&MapFusion::communicationSignalHandler, this, std::placeholders::_1), subOpt);
 
-        _sub_laser_cloud_info = nh.subscribe<liorf::cloud_info>(_robot_id + "/" + _local_topic,
-                1, &MapFusion::laserCloudInfoHandler, this, ros::TransportHints().tcpNoDelay());
+        _sub_signal_1 = create_subscription<std_msgs::msg::Bool>(
+                _signal_id_1 + "/liorf/signal", rclcpp::QoS(100),
+                std::bind(&MapFusion::signalHandler1, this, std::placeholders::_1), subOpt);
+        _sub_signal_2 = create_subscription<std_msgs::msg::Bool>(
+                _signal_id_2 + "/liorf/signal", rclcpp::QoS(100),
+                std::bind(&MapFusion::signalHandler2, this, std::placeholders::_1), subOpt);
 
-        _sub_loop_info_global = nh.subscribe<liorf::context_info>(_solid_topic + "/loop_info_global",
-                            100, &MapFusion::globalLoopInfoHandler, this, ros::TransportHints().tcpNoDelay());
+        _sub_laser_cloud_info = create_subscription<liorf::msg::CloudInfo>(
+                prefixTopic(_robot_id, _local_topic), rclcpp::QoS(1),
+                std::bind(&MapFusion::laserCloudInfoHandler, this, std::placeholders::_1), subOpt);
+
+        _sub_loop_info_global = create_subscription<liorf::msg::ContextInfo>(
+                _solid_topic + "/loop_info_global", rclcpp::QoS(100),
+                std::bind(&MapFusion::globalLoopInfoHandler, this, std::placeholders::_1), subOpt);
 
 
         if(_robot_id != _robot_initial){
-            _sub_solid_info = nh.subscribe<liorf::context_info>(_solid_topic + "/context_info",
-                20, &MapFusion::solidInfoHandler, this, ros::TransportHints().tcpNoDelay());//number of buffer may differs for different robot numbers
-            _sub_odom_trans = nh.subscribe<nav_msgs::Odometry>(_solid_topic + "/trans_odom",
-                           20, &MapFusion::OdomTransHandler, this, ros::TransportHints().tcpNoDelay());
+            _sub_solid_info = create_subscription<liorf::msg::ContextInfo>(
+                _solid_topic + "/context_info", rclcpp::QoS(20),
+                std::bind(&MapFusion::solidInfoHandler, this, std::placeholders::_1), subOpt);//number of buffer may differs for different robot numbers
+            _sub_odom_trans = create_subscription<nav_msgs::msg::Odometry>(
+                _solid_topic + "/trans_odom", rclcpp::QoS(20),
+                std::bind(&MapFusion::OdomTransHandler, this, std::placeholders::_1), subOpt);
 
         }
 
 
 
-        _pub_context_info     = nh.advertise<liorf::context_info> (_solid_topic + "/context_info", 1);
-        _pub_loop_info        = nh.advertise<liorf::context_info> (_robot_id + "/" + _solid_topic + "/loop_info", 1);
-        _pub_cloud            = nh.advertise<sensor_msgs::PointCloud2> (_robot_id + "/" + _solid_topic + "/cloud", 1);
-        _pub_trans_odom2map   = nh.advertise<nav_msgs::Odometry> ( _robot_id + "/" + _solid_topic + "/trans_map", 1);
-        _pub_trans_odom2odom  = nh.advertise<nav_msgs::Odometry> ( _solid_topic + "/trans_odom", 1);
-        _pub_loop_info_global = nh.advertise<liorf::context_info>(_solid_topic + "/loop_info_global", 1);
+        _pub_context_info = create_publisher<liorf::msg::ContextInfo>(_solid_topic + "/context_info", 1);
+        _pub_loop_info = create_publisher<liorf::msg::ContextInfo>(_robot_id + "/" + _solid_topic + "/loop_info", 1);
+        _pub_cloud = create_publisher<sensor_msgs::msg::PointCloud2>(_robot_id + "/" + _solid_topic + "/cloud", 1);
+        _pub_trans_odom2map = create_publisher<nav_msgs::msg::Odometry>(_robot_id + "/" + _solid_topic + "/trans_map", 1);
+        _pub_trans_odom2odom = create_publisher<nav_msgs::msg::Odometry>(_solid_topic + "/trans_odom", 1);
+        _pub_loop_info_global = create_publisher<liorf::msg::ContextInfo>(_solid_topic + "/loop_info_global", 1);
 
     }
 
     void publishContextInfoThread(){
         int signal_id_th_1 = robotID2Number(_signal_id_1);
         int signal_id_th_2 = robotID2Number(_signal_id_2);
-        while (ros::ok())
+        while (rclcpp::ok())
         {
             if (_communication_signal && _signal_1 && _robot_id_th < signal_id_th_1){
                 if (_context_list_to_publish_1.empty())
@@ -259,35 +265,45 @@ public:
     }
 
 private:
+    // Declares a parameter (if not already declared) and returns its value.
+    template<typename T>
+    T declare_and_get(const std::string & name, const T & default_value)
+    {
+        if (!this->has_parameter(name))
+            this->declare_parameter<T>(name, default_value);
+        T value{};
+        this->get_parameter(name, value);
+        return value;
+    }
+
     void ParamLoader(){
-        ros::NodeHandle n("~");//local node handler
-        n.param<std::string>("robot_id", _robot_id, "jackal0");
-        n.param<std::string>("id_1",  _signal_id_1, "jackal1");
-        n.param<std::string>("id_2",  _signal_id_2, "jackal2");
-        n.param<int>("no", number_print, 100);
-        n.param<std::string>("pcm_matrix_folder",  _pcm_matrix_folder, "aaa");
+        _robot_id          = declare_and_get<std::string>("robot_id", "jackal0");
+        _signal_id_1       = declare_and_get<std::string>("id_1", "jackal1");
+        _signal_id_2       = declare_and_get<std::string>("id_2", "jackal2");
+        number_print       = declare_and_get<int>("no", 100);
+        _pcm_matrix_folder = declare_and_get<std::string>("pcm_matrix_folder", "aaa");
 
-        nh.getParam("/mapfusion/solid/knn_feature_dim", _knn_feature_dim);
-        nh.getParam("/mapfusion/solid/max_range", _max_range);
-        nh.getParam("/mapfusion/solid/num_sector", _num_sectors);
-        nh.getParam("/mapfusion/solid/num_height", _num_heights);
-        nh.getParam("/mapfusion/solid/num_nearest_matches", _num_nearest_matches);
-        nh.getParam("/mapfusion/solid/num_match_candidates", _num_match_candidates);
+        _knn_feature_dim = declare_and_get<int>("mapfusion.solid.knn_feature_dim", 40);
+        _max_range = declare_and_get<int>("mapfusion.solid.max_range", 80);
+        _num_sectors = declare_and_get<int>("mapfusion.solid.num_sector", 60);
+        _num_heights = declare_and_get<int>("mapfusion.solid.num_height", 64);
+        _num_nearest_matches = declare_and_get<int>("mapfusion.solid.num_nearest_matches", 50);
+        _num_match_candidates = declare_and_get<int>("mapfusion.solid.num_match_candidates", 1);
         
-        nh.getParam("/mapfusion/solid/fov_up", _fov_up);
-        nh.getParam("/mapfusion/solid/fov_down", _fov_down);
+        _fov_up = declare_and_get<double>("mapfusion.solid.fov_up", 2.0);
+        _fov_down = declare_and_get<double>("mapfusion.solid.fov_down", -24.8);
 
-        nh.getParam("/mapfusion/interRobot/loop_threshold", _loop_thres);
-        nh.getParam("/mapfusion/interRobot/pcm_threshold",_pcm_thres);
-        nh.getParam("/mapfusion/interRobot/icp_threshold",_icp_thres);
-        nh.getParam("/mapfusion/interRobot/robot_initial",_robot_initial);
-        nh.getParam("/mapfusion/interRobot/loop_frame_threshold", _loop_frame_thres);
+        _loop_thres = declare_and_get<double>("mapfusion.interRobot.loop_threshold", 0.2);
+        _pcm_thres = declare_and_get<double>("mapfusion.interRobot.pcm_threshold", 20.0);
+        _icp_thres = declare_and_get<double>("mapfusion.interRobot.icp_threshold", 3.0);
+        _robot_initial = declare_and_get<std::string>("mapfusion.interRobot.robot_initial", "jackal0");
+        _loop_frame_thres = declare_and_get<int>("mapfusion.interRobot.loop_frame_threshold", 10);
 
-        nh.getParam("/mapfusion/interRobot/solid_topic", _solid_topic);
-        nh.getParam("/mapfusion/interRobot/solid_frame", _solid_frame);
-        nh.getParam("/mapfusion/interRobot/local_topic", _local_topic);
-        nh.getParam("/mapfusion/interRobot/pcm_start_threshold", _pcm_start_threshold);
-        nh.getParam("/mapfusion/interRobot/use_position_search", _use_position_search);
+        _solid_topic = declare_and_get<std::string>("mapfusion.interRobot.solid_topic", "solid");
+        _solid_frame = declare_and_get<std::string>("mapfusion.interRobot.solid_frame", "base_link");
+        _local_topic = declare_and_get<std::string>("mapfusion.interRobot.local_topic", "liorf/mapping/cloud_info");
+        _pcm_start_threshold = declare_and_get<int>("mapfusion.interRobot.pcm_start_threshold", 5);
+        _use_position_search = declare_and_get<bool>("mapfusion.interRobot.use_position_search", false);
 
     }
 
@@ -330,7 +346,7 @@ private:
         return robo.back() - '0';
     }
 
-    void laserCloudInfoHandler(const liorf::cloud_infoConstPtr& msgIn)
+    void laserCloudInfoHandler(const liorf::msg::CloudInfo::ConstSharedPtr& msgIn)
     {
         _laser_cloud_sum->clear();
         _laser_cloud_feature->clear();
@@ -355,14 +371,14 @@ private:
                                                    _fov_down,
                                                    _max_range);
         bin.robotname = _robot_id;
-        bin.time = _cloud_header.stamp.toSec();
-        bin.pose.x = _cloud_info.initialGuessX;
-        bin.pose.y = _cloud_info.initialGuessY;
-        bin.pose.z = _cloud_info.initialGuessZ;
-        bin.pose.roll  =  _cloud_info.initialGuessRoll;
-        bin.pose.pitch =  _cloud_info.initialGuessPitch;
-        bin.pose.yaw   =  _cloud_info.initialGuessYaw;
-        bin.pose.intensity = _cloud_info.imuAvailable;
+        bin.time = stamp2Sec(_cloud_header.stamp);
+        bin.pose.x = _cloud_info.initial_guess_x;
+        bin.pose.y = _cloud_info.initial_guess_y;
+        bin.pose.z = _cloud_info.initial_guess_z;
+        bin.pose.roll  =  _cloud_info.initial_guess_roll;
+        bin.pose.pitch =  _cloud_info.initial_guess_pitch;
+        bin.pose.yaw   =  _cloud_info.initial_guess_yaw;
+        bin.pose.intensity = _cloud_info.imu_available;
 
         bin.cloud->clear();
         pcl::copyPointCloud(*_laser_cloud_feature,  *bin.cloud);
@@ -380,25 +396,25 @@ private:
 
     }
 
-    void communicationSignalHandler(const std_msgs::Bool::ConstPtr& msg){
+    void communicationSignalHandler(const std_msgs::msg::Bool::ConstSharedPtr& msg){
         _communication_signal = msg->data;
     }
 
-    void signalHandler1(const std_msgs::Bool::ConstPtr& msg){
+    void signalHandler1(const std_msgs::msg::Bool::ConstSharedPtr& msg){
         _signal_1 = msg->data;
     }
 
-    void signalHandler2(const std_msgs::Bool::ConstPtr& msg){
+    void signalHandler2(const std_msgs::msg::Bool::ConstSharedPtr& msg){
         _signal_2 = msg->data;
     }
 
     void publishContextInfo( SOLiDBin bin , std::string robot_to){
-        liorf::context_info context_info;
-        context_info.robotID = _robot_id;
+        liorf::msg::ContextInfo context_info;
+        context_info.robot_id = _robot_id;
 
-        context_info.numRing = _knn_feature_dim;
-        context_info.numSector = _num_sectors;
-        context_info.numHeight = _num_heights;
+        context_info.num_ring = _knn_feature_dim;
+        context_info.num_sector = _num_sectors;
+        context_info.num_height = _num_heights;
 
         context_info.asolid.assign(_num_sectors, 0);
         context_info.rsolid.assign(_knn_feature_dim, 0);
@@ -414,23 +430,23 @@ private:
             context_info.rsolid[i] = bin.rsolid(i);
         }
 
-        context_info.robotIDReceive = robot_to;
-        context_info.poseX = bin.pose.x;
-        context_info.poseY = bin.pose.y;
-        context_info.poseZ = bin.pose.z;
-        context_info.poseRoll  =  bin.pose.roll;
-        context_info.posePitch =  bin.pose.pitch;
-        context_info.poseYaw   =  bin.pose.yaw;
-        context_info.poseIntensity = bin.pose.intensity;
+        context_info.robot_id_receive = robot_to;
+        context_info.pose_x = bin.pose.x;
+        context_info.pose_y = bin.pose.y;
+        context_info.pose_z = bin.pose.z;
+        context_info.pose_roll  =  bin.pose.roll;
+        context_info.pose_pitch =  bin.pose.pitch;
+        context_info.pose_yaw   =  bin.pose.yaw;
+        context_info.pose_intensity = bin.pose.intensity;
 
-        context_info.scanCloud =  publishCloud(&_pub_cloud, bin.cloud, ros::Time(bin.time), _robot_id + "/" + _solid_frame);
+        context_info.scan_cloud =  publishCloud(_pub_cloud, bin.cloud, sec2Stamp(bin.time), _robot_id + "/" + _solid_frame);
         mtx.lock();
-        _pub_context_info.publish(context_info);
+        _pub_context_info->publish(context_info);
         mtx.unlock();
 //        context_info.SOLiDBin.
     }
 
-    void OdomTransHandler(const nav_msgs::Odometry::ConstPtr& odomMsg){
+    void OdomTransHandler(const nav_msgs::msg::Odometry::ConstSharedPtr& odomMsg){
         std::string robot_publish = odomMsg->header.frame_id;
         if( robot_publish == _robot_id)
             return;//skip info publish by the node itself
@@ -440,10 +456,10 @@ private:
         pose.x = odomMsg->pose.pose.position.x;
         pose.y = odomMsg->pose.pose.position.y;
         pose.z = odomMsg->pose.pose.position.z;
-        tf::Quaternion orientation;
-        tf::quaternionMsgToTF(odomMsg->pose.pose.orientation, orientation);
+        tf2::Quaternion orientation;
+        quaternionMsgToTF2(odomMsg->pose.pose.orientation, orientation);
         double roll, pitch, yaw;
-        tf::Matrix3x3(orientation).getRPY(roll, pitch, yaw);
+        tf2::Matrix3x3(orientation).getRPY(roll, pitch, yaw);
         pose.roll = roll; pose.pitch = pitch; pose.yaw = yaw;
 
         //intensity also serves as a index
@@ -464,11 +480,11 @@ private:
 
     }
 
-    void globalLoopInfoHandler(const liorf::context_infoConstPtr& msgIn){
+    void globalLoopInfoHandler(const liorf::msg::ContextInfo::ConstSharedPtr& msgIn){
 //        return;
-        if (msgIn->robotID != _robot_id)
+        if (msgIn->robot_id != _robot_id)
             return;
-        _pub_loop_info.publish(*msgIn);
+        _pub_loop_info->publish(*msgIn);
         sendMapOutputMessage();
 
     }
@@ -637,37 +653,37 @@ private:
         }
     }
 
-    void solidInfoHandler(const liorf::context_infoConstPtr& msgIn){
-        liorf::context_info context_info_input = *msgIn;
+    void solidInfoHandler(const liorf::msg::ContextInfo::ConstSharedPtr& msgIn){
+        liorf::msg::ContextInfo context_info_input = *msgIn;
         //load the data received
         if (!_communication_signal)
             return;
-        if (msgIn->robotIDReceive != _robot_id)
+        if (msgIn->robot_id_receive != _robot_id)
             return;
 
         SOLiDBin bin;
-        bin.robotname = msgIn->robotID;
-        bin.time = msgIn->header.stamp.toSec();
+        bin.robotname = msgIn->robot_id;
+        bin.time = stamp2Sec(msgIn->header.stamp);
 
-        bin.pose.x = msgIn->poseX;
-        bin.pose.y = msgIn->poseY;
-        bin.pose.z = msgIn->poseZ;
-        bin.pose.roll  = msgIn->poseRoll;
-        bin.pose.pitch = msgIn->posePitch;
-        bin.pose.yaw   = msgIn->poseYaw;
-        bin.pose.intensity = msgIn->poseIntensity;
+        bin.pose.x = msgIn->pose_x;
+        bin.pose.y = msgIn->pose_y;
+        bin.pose.z = msgIn->pose_z;
+        bin.pose.roll  = msgIn->pose_roll;
+        bin.pose.pitch = msgIn->pose_pitch;
+        bin.pose.yaw   = msgIn->pose_yaw;
+        bin.pose.intensity = msgIn->pose_intensity;
 
         bin.cloud.reset(new pcl::PointCloud<PointType>());
-        pcl::fromROSMsg(msgIn->scanCloud, *bin.cloud);
+        pcl::fromROSMsg(msgIn->scan_cloud, *bin.cloud);
 
         // SOLiD
         bin.asolid = Eigen::VectorXf::Zero(_num_sectors);
         bin.rsolid = Eigen::VectorXf::Zero(_knn_feature_dim);
         int cnt = 0;
-        for (int i=0; i<msgIn->numSector; i++){
+        for (int i=0; i<msgIn->num_sector; i++){
             bin.asolid(i) = msgIn->asolid[i];
         }
-        for (int i=0; i<msgIn->numRing; i++){
+        for (int i=0; i<msgIn->num_ring; i++){
             bin.rsolid(i) = msgIn->rsolid[i];
         }
 
@@ -1017,7 +1033,7 @@ private:
 
         Eigen::Affine3f transCur = pcl::getTransformation(transformIn->x, transformIn->y, transformIn->z, transformIn->roll, transformIn->pitch, transformIn->yaw);
 
-#pragma omp parallel for num_threads(numberOfCores)
+#pragma omp parallel for num_threads(_num_cores)
         for (int i = 0; i < cloudSize; ++i)
         {
             pointFrom = &cloudIn->points[i];
@@ -1071,11 +1087,11 @@ private:
         pcl::getTranslationAndEulerAngles(correctionLidarFrame, x, y, z, roll, pitch,yaw);
 
 //        if(std::min(_robot_id_th, _robot_this_th) == 1 && std::max(_robot_id_th, _robot_this_th) == 2){
-//            publishCloud(&_pub_target_cloud, target, _cloud_header.stamp, "/jackal1/odom");
+//            publishCloud(_pub_target_cloud, target, _cloud_header.stamp, "/jackal1/odom");
 //
 //            PointTypePose ptp;
 //            ptp.x = x; ptp.y = y; ptp.z = z; ptp.roll = roll; ptp.yaw = yaw; ptp.pitch = pitch;
-//            publishCloud(&_pub_match_cloud, transformPointCloud(source, &ptp), _cloud_header.stamp, "/jackal1/odom");
+//            publishCloud(_pub_match_cloud, transformPointCloud(source, &ptp), _cloud_header.stamp, "/jackal1/odom");
 //        }
 
 
@@ -1295,16 +1311,16 @@ private:
             return;
 
         //publish transformation to the SLAM node
-        nav_msgs::Odometry odom2map;
+        nav_msgs::msg::Odometry odom2map;
         odom2map.header.stamp = _cloud_header.stamp;
         odom2map.header.frame_id = _robot_id + "/" + _solid_frame;
         odom2map.child_frame_id = _robot_id + "/" + _solid_frame + "/odom2map";
         odom2map.pose.pose.position.x = _trans_to_publish.x;
         odom2map.pose.pose.position.y = _trans_to_publish.y;
         odom2map.pose.pose.position.z = _trans_to_publish.z;
-        odom2map.pose.pose.orientation = tf::createQuaternionMsgFromRollPitchYaw
+        odom2map.pose.pose.orientation = createQuaternionMsgFromRollPitchYaw
             (_trans_to_publish.roll, _trans_to_publish.pitch, _trans_to_publish.yaw);
-        _pub_trans_odom2map.publish(odom2map);
+        _pub_trans_odom2map->publish(odom2map);
     }
 
     void sendGlobalLoopMessageKDTree(){
@@ -1393,7 +1409,7 @@ private:
 
         update_loop_info(id_bin_last, id_bin_this, pose_to_that, pose_to_this, tmp_intensity);
 
-        _pub_loop_info.publish(_loop_info);
+        _pub_loop_info->publish(_loop_info);
     }
 
     void sendLoopThat(int robot_id_this,int robot_id_that, int id_loop_this, int id_loop_that){
@@ -1413,23 +1429,23 @@ private:
         float tmp_intensity = (std::get<2>(pose_this) + std::get<2>(pose_that) ) / 2.0;
         update_loop_info(id_bin_last, id_bin_this, pose_to_that, pose_to_this, tmp_intensity);
 
-        _pub_loop_info_global.publish(_loop_info);
+        _pub_loop_info_global->publish(_loop_info);
     }
 
     void update_loop_info(int id_bin_last, int id_bin_this, gtsam::Pose3 pose_to_last, gtsam::Pose3 pose_to_this, float intensity){
         //relative translation btwn 2 poses
         auto dpose = pose_to_last.between(pose_to_this);
-        _loop_info.robotID = _bin_with_id[id_bin_last].robotname;
-        _loop_info.numRing   = _bin_with_id[id_bin_last].pose.intensity;//from
-        _loop_info.numSector = _bin_with_id[id_bin_this].pose.intensity;//to
+        _loop_info.robot_id = _bin_with_id[id_bin_last].robotname;
+        _loop_info.num_ring   = _bin_with_id[id_bin_last].pose.intensity;//from
+        _loop_info.num_sector = _bin_with_id[id_bin_this].pose.intensity;//to
 
-        _loop_info.poseX = dpose.translation().x();
-        _loop_info.poseY = dpose.translation().y();
-        _loop_info.poseZ = dpose.translation().z();
-        _loop_info.poseRoll  = dpose.rotation().roll();
-        _loop_info.posePitch = dpose.rotation().pitch();
-        _loop_info.poseYaw   = dpose.rotation().yaw();
-        _loop_info.poseIntensity = intensity;
+        _loop_info.pose_x = dpose.translation().x();
+        _loop_info.pose_y = dpose.translation().y();
+        _loop_info.pose_z = dpose.translation().z();
+        _loop_info.pose_roll  = dpose.rotation().roll();
+        _loop_info.pose_pitch = dpose.rotation().pitch();
+        _loop_info.pose_yaw   = dpose.rotation().yaw();
+        _loop_info.pose_intensity = intensity;
 
     }
 
@@ -1438,18 +1454,18 @@ private:
         sendMapOutputMessage();
 
         //publish relative transformation to other robots
-        nav_msgs::Odometry odom2odom;
+        nav_msgs::msg::Odometry odom2odom;
         odom2odom.header.stamp = _cloud_header.stamp;
         odom2odom.header.frame_id = _robot_id;
         odom2odom.child_frame_id = _robot_this;
         odom2odom.pose.pose.position.x = _global_map_trans_optimized[_robot_this_th].x;
         odom2odom.pose.pose.position.y = _global_map_trans_optimized[_robot_this_th].y;
         odom2odom.pose.pose.position.z = _global_map_trans_optimized[_robot_this_th].z;
-        odom2odom.pose.pose.orientation = tf::createQuaternionMsgFromRollPitchYaw
+        odom2odom.pose.pose.orientation = createQuaternionMsgFromRollPitchYaw
             (_global_map_trans_optimized[_robot_this_th].roll,
              _global_map_trans_optimized[_robot_this_th].pitch,
              _global_map_trans_optimized[_robot_this_th].yaw);
-        _pub_trans_odom2odom.publish(odom2odom);
+        _pub_trans_odom2odom->publish(odom2odom);
 
         sendGlobalLoopMessageKDTree();
 
@@ -1459,14 +1475,18 @@ private:
 
 int main(int argc, char** argv)
 {
-    ros::init(argc, argv, "fusion");
-    MapFusion MapF;
+    rclcpp::init(argc, argv);
 
-    ROS_INFO("\033[1;32m----> Map Fusion Started.\033[0m");
+    rclcpp::NodeOptions options;
+    auto MapF = std::make_shared<MapFusion>(options);
 
-    std::thread publishThread(&MapFusion::publishContextInfoThread, &MapF);
+    RCLCPP_INFO(MapF->get_logger(), "\033[1;32m----> Map Fusion Started.\033[0m");
 
-    ros::spin();
+    std::thread publishThread(&MapFusion::publishContextInfoThread, MapF);
+
+    rclcpp::spin(MapF);
+
+    rclcpp::shutdown();
 
     publishThread.join();
 
