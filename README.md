@@ -157,7 +157,9 @@ the compiler being OOM-killed.
 ## Distributed SLAM example
 - Here we provide a distributed multi-robot SLAM example for 3 robots, intended for use with the two datasets provided below.
 - Place description uses [SOLiD](https://github.com/sparolab/solid.git). Scan
-  Context remains only in the `liorf_mapFusionSC` comparison node.
+  Context is now built only into the `liorf_mapFusionSC` comparison node; the
+  local mapping node's copy under `include/` is kept for reference but is no
+  longer compiled.
 - We use code from [PCM](https://github.com/lajoiepy/robust_distributed_mapper/tree/d609f59658956e1b7fe06c786ed7d07776ecb426/cpp/src/pairwise_consistency_maximization)
 for outlier detection.
 

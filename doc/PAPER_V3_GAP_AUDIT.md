@@ -149,6 +149,10 @@ sensor statistics.
 
 ### Intra-robot loop closure
 
+A file-by-file record of this change, with the decisions behind it and the
+exact verification boundary, is in
+[`UNIFIED_LOOP_CLOSURE_CHANGE_RECORD.md`](UNIFIED_LOOP_CLOSURE_CHANGE_RECORD.md).
+
 The paper describes one place-recognition and registration pipeline, not one
 per loop type. The local mapping node previously ran a different one: Scan
 Context retrieval, PCL ICP or GICP alignment, a scalar PCL fitness gate, and
@@ -195,6 +199,12 @@ Two behavioral notes:
   helper uses `shift` sector widths. The value is only a pre-rotation for an
   initial-guess-free global registration, so the correction is small in
   effect, but it is now correct and tested.
+- `include/Scancontext.{h,cpp}` and the three vendored headers only that
+  detector used (`nanoflann.hpp`, `KDTreeVectorOfVectorsAdaptor.h`,
+  `tictoc.h`) are retained in the tree for reference but are no longer
+  compiled into any target. The Scan Context baseline itself is unaffected:
+  `liorf_mapFusionSC` builds from its own copy under
+  `src/liorf-DiSO/third_parties/scanContext`.
 
 The truncated-MSE gate for intra-robot loops defaults to
 `historyKeyframeFitnessScore`. Both are mean squared nearest-neighbor
