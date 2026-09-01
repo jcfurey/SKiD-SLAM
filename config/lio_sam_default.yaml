@@ -15,6 +15,23 @@
       baselinkFrame: "base_link"
       odometryFrame: "odom"
       mapFrame: "map"
+      earthFrame: "earth"
+
+      # Geographic/global parentage is explicit. In local_only mode no
+      # earth -> map transform is fabricated. For an anchored deployment set
+      # ecef_anchored and provide the platform/site map datum below.
+      geographicFrameMode: "local_only"            # local_only | ecef_anchored
+      mapDatumConfigured: false                     # must be true for ecef_anchored
+      mapDatumLatitude: 0.0                         # WGS-84 degrees
+      mapDatumLongitude: 0.0                        # WGS-84 degrees
+      mapDatumAltitude: 0.0                         # ellipsoid height, metres
+      mapDatumYaw: 0.0                              # map x from east toward north, radians
+
+      # Optional parent used only by descriptor/ICP map fusion. Multi-robot
+      # launch overrides this and mapFrame per platform. It must stay empty
+      # when geographicFrameMode is ecef_anchored.
+      mapFusionFrame: ""
+      mapFusionAnchor: false
 
       # GPS Settings
       useImuHeadingInitialization: true           # if using GPS data, set to "true"

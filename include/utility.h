@@ -5,6 +5,7 @@
 // <!-- liorf_yjz_lucky_boy -->
 #include <rclcpp/rclcpp.hpp>
 #include "ros_compat.h"
+#include "geographic_frames.hpp"
 
 #include <std_msgs/msg/header.hpp>
 #include <std_msgs/msg/float64_multi_array.hpp>
@@ -86,6 +87,19 @@ public:
     string baselinkFrame;
     string odometryFrame;
     string mapFrame;
+    string earthFrame;
+    string mapFusionFrame;
+    string lidarFrameId;
+    string baselinkFrameId;
+    string odometryFrameId;
+    string mapFrameId;
+    string earthFrameId;
+    string mapFusionFrameId;
+
+    liorf::frames::GeographicFrameMode geographicFrameMode;
+    liorf::frames::MapDatum mapDatum;
+    bool mapDatumConfigured;
+    bool mapFusionAnchor;
 
     // GPS Settings
     bool useImuHeadingInitialization;
@@ -184,6 +198,51 @@ public:
         baselinkFrame = declare_and_get<std::string>("liorf.baselinkFrame", "base_link");
         odometryFrame = declare_and_get<std::string>("liorf.odometryFrame", "odom");
         mapFrame      = declare_and_get<std::string>("liorf.mapFrame", "map");
+        earthFrame    = declare_and_get<std::string>("liorf.earthFrame", "earth");
+        mapFusionFrame = declare_and_get<std::string>("liorf.mapFusionFrame", "");
+        mapFusionAnchor = declare_and_get<bool>("liorf.mapFusionAnchor", false);
+
+        lidarFrameId = liorf::frames::resolveRobotFrame(robot_id, lidarFrame);
+        baselinkFrameId = liorf::frames::resolveRobotFrame(robot_id, baselinkFrame);
+        odometryFrameId = liorf::frames::resolveRobotFrame(robot_id, odometryFrame);
+        mapFrameId = liorf::frames::normalizeFrameId(mapFrame);
+        earthFrameId = liorf::frames::normalizeFrameId(earthFrame);
+        mapFusionFrameId = liorf::frames::normalizeFrameId(mapFusionFrame);
+        if (mapFrameId.empty() || earthFrameId.empty())
+            throw std::invalid_argument("liorf.mapFrame and liorf.earthFrame must not be empty");
+        if (mapFrameId == odometryFrameId || odometryFrameId == baselinkFrameId)
+            throw std::invalid_argument("map, odom, and base_link frame IDs must be distinct");
+        if (!mapFusionFrameId.empty() && mapFusionFrameId == mapFrameId)
+            throw std::invalid_argument("liorf.mapFusionFrame must differ from liorf.mapFrame");
+        if (mapFusionAnchor && mapFusionFrameId.empty())
+            throw std::invalid_argument(
+                "liorf.mapFusionAnchor requires a non-empty liorf.mapFusionFrame");
+
+        geographicFrameMode = liorf::frames::parseGeographicFrameMode(
+            declare_and_get<std::string>(
+                "liorf.geographicFrameMode", "local_only"));
+        mapDatum.latitude_deg = declare_and_get<double>(
+            "liorf.mapDatumLatitude", 0.0);
+        mapDatum.longitude_deg = declare_and_get<double>(
+            "liorf.mapDatumLongitude", 0.0);
+        mapDatum.ellipsoid_height_m = declare_and_get<double>(
+            "liorf.mapDatumAltitude", 0.0);
+        mapDatum.map_yaw_rad = declare_and_get<double>(
+            "liorf.mapDatumYaw", 0.0);
+        mapDatumConfigured = declare_and_get<bool>(
+            "liorf.mapDatumConfigured", false);
+        if (geographicFrameMode == liorf::frames::GeographicFrameMode::ECEF_ANCHORED)
+        {
+            if (!mapDatumConfigured)
+                throw std::invalid_argument(
+                    "ecef_anchored mode requires liorf.mapDatumConfigured=true");
+            liorf::frames::validateDatum(mapDatum);
+            if (!mapFusionFrameId.empty())
+                throw std::invalid_argument(
+                    "ecef_anchored maps cannot also have liorf.mapFusionFrame as a parent");
+            if (earthFrameId == mapFrameId)
+                throw std::invalid_argument("liorf.earthFrame must differ from liorf.mapFrame");
+        }
 
         useImuHeadingInitialization = declare_and_get<bool>("liorf.useImuHeadingInitialization", false);
         useGpsElevation             = declare_and_get<bool>("liorf.useGpsElevation", false);

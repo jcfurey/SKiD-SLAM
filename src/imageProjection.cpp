@@ -773,7 +773,7 @@ public:
     void publishClouds()
     {
         cloudInfo.header = cloudHeader;
-        cloudInfo.cloud_deskewed  = publishCloud(pubExtractedCloud, fullCloud, cloudHeader.stamp, robot_id + "/" + lidarFrame);
+        cloudInfo.cloud_deskewed  = publishCloud(pubExtractedCloud, fullCloud, cloudHeader.stamp, lidarFrameId);
         pubLaserCloudInfo->publish(cloudInfo);
     }
 };

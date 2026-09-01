@@ -71,12 +71,13 @@ the compiler being OOM-killed.
 
 ## HOW to run the package
 
-> **Geographic multi-platform limitation:** the current implementation does
-> not publish a REP-105 `earth` frame and must not be assumed to place robots
-> from distant sites into one geographic map. See
+> **Geographic multi-platform frames:** local SLAM now publishes the REP-105
+> `map -> odom -> base_link` split. The multi-robot launch supports detached,
+> descriptor-fused, and explicit WGS-84 ECEF-anchored maps; it never treats an
+> unknown relationship as identity. See
 > [Geographic and Multi-Platform Frame Architecture](doc/MULTI_PLATFORM_FRAME_ARCHITECTURE.md)
-> for the source audit, UTM boundary, required TF tree, and implementation
-> acceptance tests.
+> for datum parameters, launch examples, the zone-qualified UTM output, and
+> the remaining global-factor-graph limitation.
 
 1. Run the launch file (multi-robot):
   ```

@@ -1,6 +1,6 @@
 # Geographic and Multi-Platform Frame Architecture
 
-Status: design audit and implementation proposal
+Status: core frame contract implemented; global geographic factor graph remains future work
 
 Audit date: 2026-09-01
 
@@ -8,9 +8,10 @@ Audited SKiD-SLAM revision: `99368de85ff293a92ef38fdd96835a116a191194`
 
 ## Decision
 
-SKiD-SLAM's current frame handling is sufficient for a single local replay in
-which `map` and `odom` are effectively aliases. It is not sufficient for a
-fleet whose platforms may operate at geographically separated sites.
+At the audited revision, SKiD-SLAM's frame handling was sufficient for a
+single local replay in which `map` and `odom` were effectively aliases. It was
+not sufficient for a fleet whose platforms may operate at geographically
+separated sites.
 
 There must be one canonical `earth` frame in any combined TF graph. Each
 platform, or each local operating site, may have its own `map`, `odom`, and
@@ -46,6 +47,75 @@ in that same map. Until GNSS, surveyed control, or an accepted inter-robot
 registration establishes the relationship, the map trees must remain
 detached. Publishing an identity transform is not a substitute for an unknown
 transform.
+
+## Implemented contract
+
+The core frame split described here is implemented on the `dev` branch as of
+2026-09-01:
+
+- mapping and loop/GNSS-corrected products are expressed in `mapFrame`;
+- the existing incremental mapping stream is expressed in the platform's
+  `odometryFrame`;
+- transform fusion pairs those same-timestamp streams and computes
+  `T_map_odom = T_map_base * inverse(T_odom_base)`;
+- the high-rate IMU stream publishes only the continuous
+  `odom -> base_link` edge;
+- an ECEF anchor is published only in `ecef_anchored` mode and only after an
+  explicit datum has been supplied;
+- local-only operation never fabricates an `earth -> map` identity;
+- multi-robot descriptor/ICP alignment is carried separately as
+  `fleet_map -> platform/map`, and an unaligned non-anchor map stays detached;
+- GNSS topics are platform-prefixed unless configured as absolute, and GNSS
+  covariance/status are retained for the local factor gate; and
+- every GNSS fix also has a zone-qualified UTM/UPS projection on
+  `<robot>/liorf/mapping/gps_utm`. Its frame ID is, for example, `utm_16N`,
+  `utm_56S`, or `ups_N`. No UTM transform is broadcast.
+
+The relevant geographic parameters are:
+
+| Parameter | Meaning |
+|---|---|
+| `liorf.geographicFrameMode` | `local_only` or `ecef_anchored` |
+| `liorf.earthFrame` | Canonical ECEF parent, normally `earth` |
+| `liorf.mapFrame` | Fully resolved local map, such as `jackal0/map` |
+| `liorf.mapDatumConfigured` | Must be `true` before anchored mode is accepted |
+| `liorf.mapDatumLatitude` | WGS-84 latitude in degrees |
+| `liorf.mapDatumLongitude` | WGS-84 longitude in degrees |
+| `liorf.mapDatumAltitude` | WGS-84 ellipsoid height in metres, not MSL height |
+| `liorf.mapDatumYaw` | Map x-axis rotation from east toward north, radians |
+| `liorf.mapFusionFrame` | Optional non-geographic fleet-map parent |
+| `liorf.mapFusionAnchor` | Defines the selected local map as the fleet-map gauge |
+
+Anchored multi-platform launch accepts a separate explicit datum for each
+platform. The four comma-separated fields are latitude, longitude, ellipsoid
+height, and map yaw:
+
+```bash
+ros2 launch liorf run_liorf_multi.launch.py \
+  alignment_mode:=ecef \
+  robot0_datum:='34.0,-89.0,50.0,0.0' \
+  robot1_datum:='34.0,-118.0,80.0,0.2'
+```
+
+This mode disables descriptor/ICP map fusion because geographically distant
+maps must not be aligned by perceptual similarity. For co-located platforms,
+the existing map-fusion workflow remains available with distinct local maps:
+
+```bash
+ros2 launch liorf run_liorf_multi.launch.py \
+  alignment_mode:=map_fusion fleet_frame:=map
+```
+
+The first robot defines `map -> <robot0>/map` as the explicit gauge. Other
+robot maps are absent from that tree until an accepted map-fusion estimate is
+published. `alignment_mode:=detached` starts independent local trees with
+neither relationship.
+
+The implementation deliberately does not move PCL clouds into ECEF or UTM.
+It also does not yet add ECEF variables and GNSS priors to the distributed
+GTSAM map-fusion graph; surveyed static anchors are the implemented global
+authority. A future moving/global alignment estimator must replace, rather
+than compete with, that static `earth -> map` authority.
 
 ## Can every platform have its own `earth` frame?
 
@@ -125,7 +195,10 @@ Therefore:
 - never translate the PCL map itself into raw ECEF or large UTM coordinates;
 - convert only poses and explicitly requested products at the global boundary.
 
-## Current SKiD-SLAM behavior
+## Pre-implementation audit
+
+The following section records the behavior found at audited revision
+`99368de`; it explains the defects the implemented contract above replaces.
 
 ### Published topology
 
@@ -318,6 +391,25 @@ The frame work is not complete until these cases pass automatically:
 9. **GNSS isolation:** each platform consumes only its own GNSS stream.
 10. **Replay determinism:** an explicit datum reproduces byte-stable frame
     anchors across fresh processes.
+
+## Verification performed
+
+The implementation was checked on ROS 2 Lyrical on 2026-09-01:
+
+- the complete `liorf` and `skid_slam_playback` packages built successfully;
+- all 13 `liorf` test results passed, including ECEF/ENU composition, distant
+  origins, zone-qualified UTM frames, frame-name resolution, and
+  `map -> odom` composition;
+- a live two-platform ECEF launch published only
+  `earth -> jackal0/map` and `earth -> jackal1/map`, with distinct ECEF
+  translations for Mississippi and California test datums, and started no
+  descriptor map-fusion nodes;
+- a live map-fusion launch published only the explicit
+  `map -> jackal0/map` gauge before any observation; it did not fabricate
+  `map -> jackal1/map`; and
+- a 25-second TestTrack replay produced a queryable
+  `map -> jackal0/odom -> jackal0/base_link` chain while the existing
+  observable-subspace scan matcher continued running normally.
 11. **Precision:** local map points retain centimetre-scale resolution even
     when their earth position is millions of metres from ECEF origin.
 

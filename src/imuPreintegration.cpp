@@ -16,6 +16,7 @@
 #include <gtsam/nonlinear/ISAM2.h>
 
 #include <tf2_ros/transform_broadcaster.h>
+#include <tf2_ros/static_transform_broadcaster.h>
 #include <tf2_ros/transform_listener.h>
 #include <tf2_ros/buffer.h>
 #include <geometry_msgs/msg/transform_stamped.hpp>
@@ -29,13 +30,14 @@ class TransformFusion : public ParamServer
 {
 public:
     std::mutex mtx;
-    //fusion subscriber
+    // Optional inter-robot alignment. This is a fleet-map -> local-map edge,
+    // never the local map -> odom correction.
     std::string _fusion_topic;
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr subFusionTrans;
-    double fusionTrans[6]; //x,y,z,roll,pitch,yaw
 
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr subImuOdometry;
-    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr subLaserOdometry;
+    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr subLaserOdometryGlobal;
+    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr subLaserOdometryIncremental;
 
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubImuOdometry;
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubImuPath;
@@ -43,12 +45,17 @@ public:
     rclcpp::CallbackGroup::SharedPtr callbackGroup;
 
     Eigen::Affine3f lidarOdomAffine;
-    Eigen::Affine3f imuOdomAffineFront;
-    Eigen::Affine3f imuOdomAffineBack;
+    Eigen::Affine3f mapToOdomAffine = Eigen::Affine3f::Identity();
+    Eigen::Affine3f fleetToMapAffine = Eigen::Affine3f::Identity();
+    bool mapToOdomAvailable = false;
+    bool fleetToMapAvailable = false;
+    deque<nav_msgs::msg::Odometry> mappingGlobalQueue;
+    deque<nav_msgs::msg::Odometry> mappingIncrementalQueue;
 
     std::shared_ptr<tf2_ros::Buffer> tfBuffer;
     std::shared_ptr<tf2_ros::TransformListener> tfListener;
     std::shared_ptr<tf2_ros::TransformBroadcaster> tfBroadcaster;
+    std::shared_ptr<tf2_ros::StaticTransformBroadcaster> staticTfBroadcaster;
     tf2::Transform lidar2Baselink;
 
     double lidarOdomTime = -1;
@@ -60,14 +67,16 @@ public:
         tfBuffer = std::make_shared<tf2_ros::Buffer>(get_clock());
         tfListener = std::make_shared<tf2_ros::TransformListener>(*tfBuffer);
         tfBroadcaster = std::make_shared<tf2_ros::TransformBroadcaster>(*this);
+        staticTfBroadcaster =
+            std::make_shared<tf2_ros::StaticTransformBroadcaster>(*this);
 
         lidar2Baselink.setIdentity();
-        if(lidarFrame != baselinkFrame)
+        if(lidarFrameId != baselinkFrameId)
         {
             try
             {
                 auto tf = tfBuffer->lookupTransform(
-                    robot_id + "/" + lidarFrame, robot_id + "/" + baselinkFrame,
+                    lidarFrameId, baselinkFrameId,
                     tf2::TimePointZero, tf2::durationFromSec(3.0));
                 tf2::fromMsg(tf.transform, lidar2Baselink);
             }
@@ -76,29 +85,41 @@ public:
                 RCLCPP_ERROR(get_logger(), "%s", ex.what());
             }
         }
-        fusionTrans[0] = 0; fusionTrans[1] = 0; fusionTrans[2] = 0; fusionTrans[3] = 0; fusionTrans[4] = 0; fusionTrans[5] = 0;
         _fusion_topic = declare_and_get<std::string>("mapfusion.interRobot.solid_topic", "solid");
+
+        publishConfiguredGlobalAnchor();
 
         callbackGroup = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
         auto subOpt = rclcpp::SubscriptionOptions();
         subOpt.callback_group = callbackGroup;
 
-        subFusionTrans   = create_subscription<nav_msgs::msg::Odometry>(
-            prefixTopic(robot_id, _fusion_topic + "/trans_map"), rclcpp::QoS(2000),
-            std::bind(&TransformFusion::FusionTransHandler, this, std::placeholders::_1), subOpt);
+        if (!mapFusionFrameId.empty() && !mapFusionAnchor)
+        {
+            subFusionTrans = create_subscription<nav_msgs::msg::Odometry>(
+                prefixTopic(robot_id, _fusion_topic + "/trans_map"), rclcpp::QoS(20),
+                std::bind(&TransformFusion::FusionTransHandler, this,
+                    std::placeholders::_1), subOpt);
+        }
 
-        subLaserOdometry = create_subscription<nav_msgs::msg::Odometry>(
-            robot_id + "/liorf/mapping/odometry", rclcpp::QoS(5),
-            std::bind(&TransformFusion::lidarOdometryHandler, this, std::placeholders::_1), subOpt);
+        subLaserOdometryGlobal = create_subscription<nav_msgs::msg::Odometry>(
+            prefixTopic(robot_id, "liorf/mapping/odometry"), rclcpp::QoS(5),
+            std::bind(&TransformFusion::mappingGlobalHandler, this,
+                std::placeholders::_1), subOpt);
+        subLaserOdometryIncremental =
+            create_subscription<nav_msgs::msg::Odometry>(
+                prefixTopic(robot_id, "liorf/mapping/odometry_incremental"),
+                rclcpp::QoS(5),
+                std::bind(&TransformFusion::mappingIncrementalHandler, this,
+                    std::placeholders::_1), subOpt);
         subImuOdometry   = create_subscription<nav_msgs::msg::Odometry>(
             prefixTopic(robot_id, odomTopic + "_incremental"), rclcpp::QoS(2000),
             std::bind(&TransformFusion::imuOdometryHandler, this, std::placeholders::_1), subOpt);
 
         pubImuOdometry   = create_publisher<nav_msgs::msg::Odometry>(prefixTopic(robot_id, odomTopic), 2000);
-        pubImuPath       = create_publisher<nav_msgs::msg::Path>    (robot_id + "/liorf/imu/path", 1);
+        pubImuPath       = create_publisher<nav_msgs::msg::Path>    (prefixTopic(robot_id, "liorf/imu/path"), 1);
     }
 
-    Eigen::Affine3f odom2affine(nav_msgs::msg::Odometry odom)
+    Eigen::Affine3f odom2affine(const nav_msgs::msg::Odometry & odom)
     {
         double x, y, z, roll, pitch, yaw;
         x = odom.pose.pose.position.x;
@@ -110,50 +131,196 @@ public:
         return pcl::getTransformation(x, y, z, roll, pitch, yaw);
     }
 
+    void publishConfiguredGlobalAnchor()
+    {
+        geometry_msgs::msg::TransformStamped transform;
+        transform.header.stamp = now();
+
+        if (geographicFrameMode ==
+            liorf::frames::GeographicFrameMode::ECEF_ANCHORED)
+        {
+            const liorf::frames::GeographicMapAnchor anchor(mapDatum);
+            const Eigen::Isometry3d earth_from_map = anchor.earthFromMap();
+            const Eigen::Quaterniond q(earth_from_map.rotation());
+            transform.header.frame_id = earthFrameId;
+            transform.child_frame_id = mapFrameId;
+            transform.transform.translation.x = earth_from_map.translation().x();
+            transform.transform.translation.y = earth_from_map.translation().y();
+            transform.transform.translation.z = earth_from_map.translation().z();
+            transform.transform.rotation.x = q.x();
+            transform.transform.rotation.y = q.y();
+            transform.transform.rotation.z = q.z();
+            transform.transform.rotation.w = q.w();
+            staticTfBroadcaster->sendTransform(transform);
+            RCLCPP_INFO(
+                get_logger(),
+                "Publishing WGS-84 ECEF anchor %s -> %s at "
+                "(%.9f deg, %.9f deg, %.3f m ellipsoid height).",
+                earthFrameId.c_str(), mapFrameId.c_str(),
+                mapDatum.latitude_deg, mapDatum.longitude_deg,
+                mapDatum.ellipsoid_height_m);
+        }
+        else if (mapFusionAnchor && !mapFusionFrameId.empty())
+        {
+            transform.header.frame_id = mapFusionFrameId;
+            transform.child_frame_id = mapFrameId;
+            transform.transform.rotation.w = 1.0;
+            staticTfBroadcaster->sendTransform(transform);
+            RCLCPP_INFO(
+                get_logger(), "Defining map-fusion gauge %s -> %s as identity.",
+                mapFusionFrameId.c_str(), mapFrameId.c_str());
+        }
+    }
+
     void sendMapToOdomTransform(const builtin_interfaces::msg::Time & stamp)
     {
-        tf2::Quaternion q;
-        q.setRPY(fusionTrans[3], fusionTrans[4], fusionTrans[5]);
+        if (!mapToOdomAvailable)
+            return;
+
+        const Eigen::Quaternionf q(mapToOdomAffine.rotation());
         geometry_msgs::msg::TransformStamped map_to_odom;
         map_to_odom.header.stamp = stamp;
-        map_to_odom.header.frame_id = mapFrame;
-        map_to_odom.child_frame_id = robot_id + "/" + odometryFrame;
-        map_to_odom.transform.translation.x = fusionTrans[0];
-        map_to_odom.transform.translation.y = fusionTrans[1];
-        map_to_odom.transform.translation.z = fusionTrans[2];
-        map_to_odom.transform.rotation = tf2::toMsg(q);
+        map_to_odom.header.frame_id = mapFrameId;
+        map_to_odom.child_frame_id = odometryFrameId;
+        map_to_odom.transform.translation.x = mapToOdomAffine.translation().x();
+        map_to_odom.transform.translation.y = mapToOdomAffine.translation().y();
+        map_to_odom.transform.translation.z = mapToOdomAffine.translation().z();
+        map_to_odom.transform.rotation.x = q.x();
+        map_to_odom.transform.rotation.y = q.y();
+        map_to_odom.transform.rotation.z = q.z();
+        map_to_odom.transform.rotation.w = q.w();
         tfBroadcaster->sendTransform(map_to_odom);
     }
 
-    void FusionTransHandler(const nav_msgs::msg::Odometry::SharedPtr odomMsg) {
-        //receive the odometry
-        fusionTrans[0] = odomMsg->pose.pose.position.x;
-        fusionTrans[1] = odomMsg->pose.pose.position.y;
-        fusionTrans[2] = odomMsg->pose.pose.position.z;
-        tf2::Quaternion orientation;
-        tf2::fromMsg(odomMsg->pose.pose.orientation, orientation);
-        tf2::Matrix3x3(orientation).getRPY(fusionTrans[3], fusionTrans[4], fusionTrans[5]);
+    void sendFleetToMapTransform(const builtin_interfaces::msg::Time & stamp)
+    {
+        if (!fleetToMapAvailable || mapFusionFrameId.empty())
+            return;
 
-        //tf
-        sendMapToOdomTransform(odomMsg->header.stamp);
+        const Eigen::Quaternionf q(fleetToMapAffine.rotation());
+        geometry_msgs::msg::TransformStamped fleet_to_map;
+        fleet_to_map.header.stamp = stamp;
+        fleet_to_map.header.frame_id = mapFusionFrameId;
+        fleet_to_map.child_frame_id = mapFrameId;
+        fleet_to_map.transform.translation.x = fleetToMapAffine.translation().x();
+        fleet_to_map.transform.translation.y = fleetToMapAffine.translation().y();
+        fleet_to_map.transform.translation.z = fleetToMapAffine.translation().z();
+        fleet_to_map.transform.rotation.x = q.x();
+        fleet_to_map.transform.rotation.y = q.y();
+        fleet_to_map.transform.rotation.z = q.z();
+        fleet_to_map.transform.rotation.w = q.w();
+        tfBroadcaster->sendTransform(fleet_to_map);
     }
 
-    void lidarOdometryHandler(const nav_msgs::msg::Odometry::SharedPtr odomMsg)
+    void FusionTransHandler(const nav_msgs::msg::Odometry::SharedPtr odomMsg)
     {
+        const std::string parent =
+            liorf::frames::normalizeFrameId(odomMsg->header.frame_id);
+        const std::string child =
+            liorf::frames::normalizeFrameId(odomMsg->child_frame_id);
+        if (parent != mapFusionFrameId || child != mapFrameId)
+        {
+            RCLCPP_ERROR_THROTTLE(
+                get_logger(), *get_clock(), 5000,
+                "Rejecting map-fusion transform with contract %s -> %s; "
+                "expected %s -> %s.",
+                parent.c_str(), child.c_str(), mapFusionFrameId.c_str(),
+                mapFrameId.c_str());
+            return;
+        }
+
         std::lock_guard<std::mutex> lock(mtx);
+        fleetToMapAffine = odom2affine(*odomMsg);
+        fleetToMapAvailable = true;
+        sendFleetToMapTransform(odomMsg->header.stamp);
+    }
 
+    void updateMapToOdomCorrection()
+    {
+        constexpr double stamp_tolerance = 1e-6;
+        while (!mappingGlobalQueue.empty() &&
+               !mappingIncrementalQueue.empty())
+        {
+            const double global_time =
+                stamp2Sec(mappingGlobalQueue.front().header.stamp);
+            const double incremental_time =
+                stamp2Sec(mappingIncrementalQueue.front().header.stamp);
+            const double difference = global_time - incremental_time;
+            if (std::abs(difference) <= stamp_tolerance)
+            {
+                const Eigen::Affine3f map_from_lidar =
+                    odom2affine(mappingGlobalQueue.front());
+                const Eigen::Affine3f odom_from_lidar =
+                    odom2affine(mappingIncrementalQueue.front());
+                mapToOdomAffine =
+                    map_from_lidar * odom_from_lidar.inverse();
+                mapToOdomAvailable = true;
+                const auto stamp = mappingGlobalQueue.front().header.stamp;
+                mappingGlobalQueue.pop_front();
+                mappingIncrementalQueue.pop_front();
+                sendMapToOdomTransform(stamp);
+            }
+            else if (difference < 0.0)
+            {
+                mappingGlobalQueue.pop_front();
+            }
+            else
+            {
+                mappingIncrementalQueue.pop_front();
+            }
+        }
+    }
+
+    void mappingGlobalHandler(
+        const nav_msgs::msg::Odometry::SharedPtr odomMsg)
+    {
+        if (liorf::frames::normalizeFrameId(odomMsg->header.frame_id) !=
+            mapFrameId)
+        {
+            RCLCPP_ERROR_THROTTLE(
+                get_logger(), *get_clock(), 5000,
+                "Rejecting corrected mapping odometry in frame '%s'; expected '%s'.",
+                odomMsg->header.frame_id.c_str(), mapFrameId.c_str());
+            return;
+        }
+
+        std::lock_guard<std::mutex> lock(mtx);
+        mappingGlobalQueue.push_back(*odomMsg);
+        if (mappingGlobalQueue.size() > 50)
+            mappingGlobalQueue.pop_front();
+        updateMapToOdomCorrection();
+    }
+
+    void mappingIncrementalHandler(
+        const nav_msgs::msg::Odometry::SharedPtr odomMsg)
+    {
+        if (liorf::frames::normalizeFrameId(odomMsg->header.frame_id) !=
+            odometryFrameId)
+        {
+            RCLCPP_ERROR_THROTTLE(
+                get_logger(), *get_clock(), 5000,
+                "Rejecting incremental mapping odometry in frame '%s'; expected '%s'.",
+                odomMsg->header.frame_id.c_str(), odometryFrameId.c_str());
+            return;
+        }
+
+        std::lock_guard<std::mutex> lock(mtx);
         lidarOdomAffine = odom2affine(*odomMsg);
-
         lidarOdomTime = stamp2Sec(odomMsg->header.stamp);
+        mappingIncrementalQueue.push_back(*odomMsg);
+        if (mappingIncrementalQueue.size() > 50)
+            mappingIncrementalQueue.pop_front();
+        updateMapToOdomCorrection();
     }
 
     void imuOdometryHandler(const nav_msgs::msg::Odometry::SharedPtr odomMsg)
     {
-        // the map -> odom transform has to be re-sent on every message: it
-        // changes whenever the map fusion node publishes a new estimate.
-        sendMapToOdomTransform(odomMsg->header.stamp);
-
         std::lock_guard<std::mutex> lock(mtx);
+
+        // Dynamic corrections are repeated at the high-rate odometry stamp so
+        // consumers can query a coherent live chain.
+        sendMapToOdomTransform(odomMsg->header.stamp);
+        sendFleetToMapTransform(odomMsg->header.stamp);
 
         imuOdomQueue.push_back(*odomMsg);
 
@@ -173,27 +340,36 @@ public:
         Eigen::Affine3f imuOdomAffineBack = odom2affine(imuOdomQueue.back());
         Eigen::Affine3f imuOdomAffineIncre = imuOdomAffineFront.inverse() * imuOdomAffineBack;
         Eigen::Affine3f imuOdomAffineLast = lidarOdomAffine * imuOdomAffineIncre;
-        float x, y, z, roll, pitch, yaw;
-        pcl::getTranslationAndEulerAngles(imuOdomAffineLast, x, y, z, roll, pitch, yaw);
+        // The pre-integrated state is a LiDAR pose. Convert it to the output
+        // body pose before publishing both Odometry and TF.
+        tf2::Transform odom_to_body;
+        const Eigen::Quaternionf lidar_rotation(imuOdomAffineLast.rotation());
+        odom_to_body.setOrigin(tf2::Vector3(
+            imuOdomAffineLast.translation().x(),
+            imuOdomAffineLast.translation().y(),
+            imuOdomAffineLast.translation().z()));
+        odom_to_body.setRotation(tf2::Quaternion(
+            lidar_rotation.x(), lidar_rotation.y(), lidar_rotation.z(),
+            lidar_rotation.w()));
+        if (lidarFrameId != baselinkFrameId)
+            odom_to_body = odom_to_body * lidar2Baselink;
 
-        // publish latest odometry
         nav_msgs::msg::Odometry laserOdometry = imuOdomQueue.back();
-        laserOdometry.pose.pose.position.x = x;
-        laserOdometry.pose.pose.position.y = y;
-        laserOdometry.pose.pose.position.z = z;
-        laserOdometry.pose.pose.orientation = createQuaternionMsgFromRollPitchYaw(roll, pitch, yaw);
+        laserOdometry.header.frame_id = odometryFrameId;
+        laserOdometry.child_frame_id = baselinkFrameId;
+        laserOdometry.pose.pose.position.x = odom_to_body.getOrigin().x();
+        laserOdometry.pose.pose.position.y = odom_to_body.getOrigin().y();
+        laserOdometry.pose.pose.position.z = odom_to_body.getOrigin().z();
+        laserOdometry.pose.pose.orientation =
+            tf2::toMsg(odom_to_body.getRotation());
         pubImuOdometry->publish(laserOdometry);
 
         // publish tf
-        tf2::Transform tCur;
-        tf2::fromMsg(laserOdometry.pose.pose, tCur);
-        if(lidarFrame != baselinkFrame)
-            tCur = tCur * lidar2Baselink;
         geometry_msgs::msg::TransformStamped odom_2_baselink;
         odom_2_baselink.header.stamp = odomMsg->header.stamp;
-        odom_2_baselink.header.frame_id = robot_id + "/" + odometryFrame;
-        odom_2_baselink.child_frame_id = robot_id + "/" + baselinkFrame;
-        odom_2_baselink.transform = tf2::toMsg(tCur);
+        odom_2_baselink.header.frame_id = odometryFrameId;
+        odom_2_baselink.child_frame_id = baselinkFrameId;
+        odom_2_baselink.transform = tf2::toMsg(odom_to_body);
         tfBroadcaster->sendTransform(odom_2_baselink);
 
         // publish IMU path
@@ -205,7 +381,7 @@ public:
             last_path_time = imuTime;
             geometry_msgs::msg::PoseStamped pose_stamped;
             pose_stamped.header.stamp = imuOdomQueue.back().header.stamp;
-            pose_stamped.header.frame_id = robot_id + "/" + odometryFrame;
+            pose_stamped.header.frame_id = odometryFrameId;
             pose_stamped.pose = laserOdometry.pose.pose;
             imuPath.poses.push_back(pose_stamped);
             while(!imuPath.poses.empty() && stamp2Sec(imuPath.poses.front().header.stamp) < lidarOdomTime - 0.1) //1.0 -> 0.1
@@ -213,7 +389,7 @@ public:
             if (pubImuPath->get_subscription_count() != 0)
             {
                 imuPath.header.stamp = imuOdomQueue.back().header.stamp;
-                imuPath.header.frame_id = robot_id + "/" + odometryFrame;
+                imuPath.header.frame_id = odometryFrameId;
                 pubImuPath->publish(imuPath);
             }
         }
@@ -297,7 +473,7 @@ public:
             prefixTopic(robot_id, imuTopic), rclcpp::SensorDataQoS().keep_last(2000),
             std::bind(&IMUPreintegration::imuHandler, this, std::placeholders::_1), imuOpt);
         subOdometry = create_subscription<nav_msgs::msg::Odometry>(
-            robot_id + "/liorf/mapping/odometry_incremental", rclcpp::QoS(5),
+            prefixTopic(robot_id, "liorf/mapping/odometry_incremental"), rclcpp::QoS(5),
             std::bind(&IMUPreintegration::odometryHandler, this, std::placeholders::_1), odomOpt);
 
         pubImuOdometry = create_publisher<nav_msgs::msg::Odometry>(prefixTopic(robot_id, odomTopic + "_incremental"), 2000);
@@ -616,8 +792,8 @@ public:
         // publish odometry
         nav_msgs::msg::Odometry odometry;
         odometry.header.stamp = thisImu.header.stamp;
-        odometry.header.frame_id = robot_id + "/" + odometryFrame;
-        odometry.child_frame_id = robot_id + "/" + lidarFrame + "/odom_imu";
+        odometry.header.frame_id = odometryFrameId;
+        odometry.child_frame_id = lidarFrameId;
 
         // transform imu pose to ldiar
         gtsam::Pose3 imuPose = gtsam::Pose3(currentState.quaternion(), currentState.position());

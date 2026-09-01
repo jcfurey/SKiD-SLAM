@@ -17,6 +17,7 @@
 //ros
 #include <rclcpp/rclcpp.hpp>
 #include "ros_compat.h"
+#include "geographic_frames.hpp"
 
 
 #include <nav_msgs/msg/odometry.hpp>
@@ -88,6 +89,8 @@ private:
     std::string _robot_this;//robot id which the thread is now processing
     std::string _solid_topic;
     std::string _solid_frame;
+	std::string _map_frame;
+	std::string _map_fusion_frame;
 	
 	std::string _local_topic;
 
@@ -180,6 +183,7 @@ private:
     int _num_cores = 4;
 
     PointTypePose _trans_to_publish;
+    bool _have_trans_to_publish = false;
 
     std::vector<std::pair<string, double>> _processing_time_list;
 public:
@@ -198,12 +202,14 @@ public:
                 _robot_id + "/liorf/signal", rclcpp::QoS(100),
                 std::bind(&MapFusion::communicationSignalHandler, this, std::placeholders::_1), subOpt);
 
-        _sub_signal_1 = create_subscription<std_msgs::msg::Bool>(
-                _signal_id_1 + "/liorf/signal", rclcpp::QoS(100),
-                std::bind(&MapFusion::signalHandler1, this, std::placeholders::_1), subOpt);
-        _sub_signal_2 = create_subscription<std_msgs::msg::Bool>(
-                _signal_id_2 + "/liorf/signal", rclcpp::QoS(100),
-                std::bind(&MapFusion::signalHandler2, this, std::placeholders::_1), subOpt);
+        if (!_signal_id_1.empty())
+            _sub_signal_1 = create_subscription<std_msgs::msg::Bool>(
+                    _signal_id_1 + "/liorf/signal", rclcpp::QoS(100),
+                    std::bind(&MapFusion::signalHandler1, this, std::placeholders::_1), subOpt);
+        if (!_signal_id_2.empty())
+            _sub_signal_2 = create_subscription<std_msgs::msg::Bool>(
+                    _signal_id_2 + "/liorf/signal", rclcpp::QoS(100),
+                    std::bind(&MapFusion::signalHandler2, this, std::placeholders::_1), subOpt);
 
         _sub_laser_cloud_info = create_subscription<liorf::msg::CloudInfo>(
                 prefixTopic(_robot_id, _local_topic), rclcpp::QoS(1),
@@ -236,11 +242,12 @@ public:
     }
 
     void publishContextInfoThread(){
-        int signal_id_th_1 = robotID2Number(_signal_id_1);
-        int signal_id_th_2 = robotID2Number(_signal_id_2);
+        int signal_id_th_1 = _signal_id_1.empty() ? -1 : robotID2Number(_signal_id_1);
+        int signal_id_th_2 = _signal_id_2.empty() ? -1 : robotID2Number(_signal_id_2);
         while (rclcpp::ok())
         {
-            if (_communication_signal && _signal_1 && _robot_id_th < signal_id_th_1){
+            if (!_signal_id_1.empty() && _communication_signal && _signal_1 &&
+                _robot_id_th < signal_id_th_1){
                 if (_context_list_to_publish_1.empty())
                     continue;
                 //publish solid info to other robots
@@ -250,7 +257,8 @@ public:
                 mtx_publish_1.unlock();
                 publishContextInfo(bin, _signal_id_1);
             }
-            if (_communication_signal && _signal_2 && _robot_id_th < signal_id_th_2){
+            if (!_signal_id_2.empty() && _communication_signal && _signal_2 &&
+                _robot_id_th < signal_id_th_2){
                 if (_context_list_to_publish_2.empty())
                     continue;
                 //publish solid info to other robots
@@ -302,6 +310,10 @@ private:
         _solid_topic = declare_and_get<std::string>("mapfusion.interRobot.solid_topic", "solid");
         _solid_frame = declare_and_get<std::string>("mapfusion.interRobot.solid_frame", "base_link");
         _local_topic = declare_and_get<std::string>("mapfusion.interRobot.local_topic", "liorf/mapping/cloud_info");
+        _map_frame = liorf::frames::normalizeFrameId(
+            declare_and_get<std::string>("liorf.mapFrame", "map"));
+        _map_fusion_frame = liorf::frames::normalizeFrameId(
+            declare_and_get<std::string>("liorf.mapFusionFrame", ""));
         _pcm_start_threshold = declare_and_get<int>("mapfusion.interRobot.pcm_start_threshold", 5);
         _use_position_search = declare_and_get<bool>("mapfusion.interRobot.use_position_search", false);
 
@@ -343,7 +355,11 @@ private:
     }
 
     int robotID2Number(std::string robo){
-        return robo.back() - '0';
+        const auto suffix = robo.find_last_not_of("0123456789");
+        if (suffix == std::string::npos || suffix + 1 >= robo.size())
+            throw std::invalid_argument(
+                "map-fusion robot IDs must end in a numeric suffix: " + robo);
+        return std::stoi(robo.substr(suffix + 1));
     }
 
     void laserCloudInfoHandler(const liorf::msg::CloudInfo::ConstSharedPtr& msgIn)
@@ -636,10 +652,10 @@ private:
         _trans_to_publish.roll = est.rotation().roll();
         _trans_to_publish.pitch = est.rotation().pitch();
         _trans_to_publish.yaw = est.rotation().yaw();
-        if (_trans_to_publish.x != 0 || _trans_to_publish.y != 0 || _trans_to_publish.z != 0)
-            _trans_to_publish.intensity = 1;
+        _trans_to_publish.intensity = 1;
+        _have_trans_to_publish = true;
 
-        if (_trans_to_publish.intensity == 1){
+        if (_have_trans_to_publish){
             int robot_id_initial = robotID2Number(_robot_initial);
             if (_global_map_trans_optimized.find(robot_id_initial) == _global_map_trans_optimized.end()){
                 _global_map_trans_optimized.emplace(std::make_pair(robot_id_initial, _trans_to_publish));
@@ -1291,12 +1307,13 @@ private:
         if (_global_odom_trans.size() != 0)
             gtsamFactorGraph();
 
-        if (_trans_to_publish.intensity == 0){
+        if (!_have_trans_to_publish){
             ite = _global_map_trans.find(0);
             if(ite == _global_map_trans.end())
                 return;
             _global_map_trans_optimized[0].intensity = 1;
             _trans_to_publish = _global_map_trans_optimized[0];
+            _have_trans_to_publish = true;
         }
 
         if (_global_map_trans.size() == 1  && _global_odom_trans.size() == 0)
@@ -1307,14 +1324,17 @@ private:
     }
 
     void sendMapOutputMessage(){
-        if (_trans_to_publish.intensity == 0)
+        if (!_have_trans_to_publish || _map_fusion_frame.empty() ||
+            _map_frame.empty())
             return;
 
-        //publish transformation to the SLAM node
+        // Publish the fleet-map -> per-platform-map alignment. Local
+        // map -> odom correction is owned by TransformFusion and is never
+        // carried on this transport.
         nav_msgs::msg::Odometry odom2map;
         odom2map.header.stamp = _cloud_header.stamp;
-        odom2map.header.frame_id = _robot_id + "/" + _solid_frame;
-        odom2map.child_frame_id = _robot_id + "/" + _solid_frame + "/odom2map";
+        odom2map.header.frame_id = _map_fusion_frame;
+        odom2map.child_frame_id = _map_frame;
         odom2map.pose.pose.position.x = _trans_to_publish.x;
         odom2map.pose.pose.position.y = _trans_to_publish.y;
         odom2map.pose.pose.position.z = _trans_to_publish.z;

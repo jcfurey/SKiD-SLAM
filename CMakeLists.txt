@@ -143,7 +143,8 @@ target_link_libraries(${PROJECT_NAME}_mapOptmization
 # IMU Preintegration
 ament_auto_add_executable(${PROJECT_NAME}_imuPreintegration src/imuPreintegration.cpp ${common_lib})
 target_link_libraries(${PROJECT_NAME}_imuPreintegration
-  ${cpp_typesupport_target} ${PCL_LIBRARIES} ${OpenCV_LIBRARIES} gtsam)
+  ${cpp_typesupport_target} ${PCL_LIBRARIES} ${OpenCV_LIBRARIES}
+  ${GeographicLib_LIBRARIES} gtsam)
 
 # Map Fusion (SOLiD)
 ament_auto_add_executable(${PROJECT_NAME}_mapFusion src/liorf-DiSO/mapFusion_so.cpp)
@@ -167,6 +168,12 @@ if(BUILD_TESTING)
     test/test_observable_scan_match.cpp)
   target_include_directories(test_observable_scan_match PRIVATE include)
   target_link_libraries(test_observable_scan_match Eigen3::Eigen)
+
+  ament_add_gtest(test_geographic_frames
+    test/test_geographic_frames.cpp)
+  target_include_directories(test_geographic_frames PRIVATE include)
+  target_link_libraries(test_geographic_frames
+    Eigen3::Eigen ${GeographicLib_LIBRARIES})
 endif()
 
 #############
