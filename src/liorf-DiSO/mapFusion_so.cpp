@@ -13,6 +13,7 @@
 #include "fast_max-clique_finder/src/findClique.h"
 
 #include "nabo/nabo.h"
+#include "skid_registration.hpp"
 
 //ros
 #include <rclcpp/rclcpp.hpp>
@@ -88,6 +89,7 @@ private:
     std::string _robot_id;
     std::string _robot_this;//robot id which the thread is now processing
     std::string _solid_topic;
+    std::string _loop_topic;
     std::string _solid_frame;
 	std::string _map_frame;
 	std::string _map_fusion_frame;
@@ -118,8 +120,9 @@ private:
 
     float _loop_thres;
     float _pcm_thres;
-    float _icp_thres;
     int _loop_frame_thres;
+
+    liorf::registration::Config _registration_config;
 
     std::mutex mtx_publish_1;
     std::mutex mtx_publish_2;
@@ -143,8 +146,6 @@ private:
     pcl::KdTreeFLANN<PointType>::Ptr _kdtree_loop_to_search;
     pcl::PointCloud<PointType>::Ptr _cloud_loop_to_search;
 
-    pcl::VoxelGrid<PointType> _downsize_filter_icp;
-
     std::pair<int, int> _initial_loop;
     int _id_bin_last;
 
@@ -166,7 +167,7 @@ private:
     std::unordered_map<int, SOLiDBin> _bin_with_id;
 
     //for pcm & graph
-    //first: source pose; second: source pose in target; third: icp fitness score;
+    //first: source pose; second: source pose in target; third: truncated MSE;
     std::unordered_map< int, std::vector< std::tuple<gtsam::Pose3, gtsam::Pose3, float> > >  _pose_queue;
     //first: target, second: source, third: relative transform;
     std::unordered_map< int, std::vector< std::tuple<int, int, gtsam::Pose3> > > _loop_queue;
@@ -233,7 +234,8 @@ public:
 
 
         _pub_context_info = create_publisher<liorf::msg::ContextInfo>(_solid_topic + "/context_info", 1);
-        _pub_loop_info = create_publisher<liorf::msg::ContextInfo>(_robot_id + "/" + _solid_topic + "/loop_info", 1);
+        _pub_loop_info = create_publisher<liorf::msg::ContextInfo>(
+                prefixTopic(_robot_id, _loop_topic), 1);
         _pub_cloud = create_publisher<sensor_msgs::msg::PointCloud2>(_robot_id + "/" + _solid_topic + "/cloud", 1);
         _pub_trans_odom2map = create_publisher<nav_msgs::msg::Odometry>(_robot_id + "/" + _solid_topic + "/trans_map", 1);
         _pub_trans_odom2odom = create_publisher<nav_msgs::msg::Odometry>(_solid_topic + "/trans_odom", 1);
@@ -303,11 +305,14 @@ private:
 
         _loop_thres = declare_and_get<double>("mapfusion.interRobot.loop_threshold", 0.2);
         _pcm_thres = declare_and_get<double>("mapfusion.interRobot.pcm_threshold", 20.0);
-        _icp_thres = declare_and_get<double>("mapfusion.interRobot.icp_threshold", 3.0);
+        const double legacy_icp_threshold =
+            declare_and_get<double>("mapfusion.interRobot.icp_threshold", 3.0);
         _robot_initial = declare_and_get<std::string>("mapfusion.interRobot.robot_initial", "jackal0");
         _loop_frame_thres = declare_and_get<int>("mapfusion.interRobot.loop_frame_threshold", 10);
 
         _solid_topic = declare_and_get<std::string>("mapfusion.interRobot.solid_topic", "solid");
+        _loop_topic = declare_and_get<std::string>(
+            "mapfusion.interRobot.loop_topic", "context/loop_info");
         _solid_frame = declare_and_get<std::string>("mapfusion.interRobot.solid_frame", "base_link");
         _local_topic = declare_and_get<std::string>("mapfusion.interRobot.local_topic", "liorf/mapping/cloud_info");
         _map_frame = liorf::frames::normalizeFrameId(
@@ -316,6 +321,79 @@ private:
             declare_and_get<std::string>("liorf.mapFusionFrame", ""));
         _pcm_start_threshold = declare_and_get<int>("mapfusion.interRobot.pcm_start_threshold", 5);
         _use_position_search = declare_and_get<bool>("mapfusion.interRobot.use_position_search", false);
+
+        _registration_config.coarse_voxel_size_m = declare_and_get<double>(
+            "mapfusion.registration.coarse_voxel_size_m", 2.0);
+        _registration_config.coarse_use_voxel_sampling = declare_and_get<bool>(
+            "mapfusion.registration.coarse_use_voxel_sampling", true);
+        _registration_config.coarse_use_quatro = declare_and_get<bool>(
+            "mapfusion.registration.coarse_use_quatro", false);
+        _registration_config.coarse_linearity_threshold = declare_and_get<double>(
+            "mapfusion.registration.coarse_linearity_threshold", 0.99);
+        _registration_config.coarse_max_correspondences = declare_and_get<int>(
+            "mapfusion.registration.coarse_max_correspondences", 5000);
+        _registration_config.coarse_normal_radius_gain = declare_and_get<double>(
+            "mapfusion.registration.coarse_normal_radius_gain", 3.5);
+        _registration_config.coarse_fpfh_radius_gain = declare_and_get<double>(
+            "mapfusion.registration.coarse_fpfh_radius_gain", 5.0);
+        _registration_config.coarse_robin_noise_bound_gain = declare_and_get<double>(
+            "mapfusion.registration.coarse_robin_noise_bound_gain", 1.0);
+        _registration_config.coarse_solver_noise_bound_gain = declare_and_get<double>(
+            "mapfusion.registration.coarse_solver_noise_bound_gain", 0.75);
+        _registration_config.coarse_clamp_noise_bounds = declare_and_get<bool>(
+            "mapfusion.registration.coarse_clamp_noise_bounds", true);
+
+        const int min_coarse_correspondences = declare_and_get<int>(
+            "mapfusion.registration.min_coarse_correspondences", 5);
+        const int min_coarse_inliers = declare_and_get<int>(
+            "mapfusion.registration.min_coarse_inliers", 3);
+        const int min_fine_inliers = declare_and_get<int>(
+            "mapfusion.registration.min_fine_inliers", 20);
+        const int min_metric_inliers = declare_and_get<int>(
+            "mapfusion.registration.min_metric_inliers", 20);
+        if (min_coarse_correspondences < 0 || min_coarse_inliers < 0 ||
+            min_fine_inliers < 0 || min_metric_inliers < 0) {
+            throw std::invalid_argument(
+                "mapfusion registration inlier counts cannot be negative");
+        }
+        _registration_config.min_coarse_correspondences =
+            static_cast<std::size_t>(min_coarse_correspondences);
+        _registration_config.min_coarse_inliers =
+            static_cast<std::size_t>(min_coarse_inliers);
+        _registration_config.min_fine_inliers =
+            static_cast<std::size_t>(min_fine_inliers);
+        _registration_config.min_metric_inliers =
+            static_cast<std::size_t>(min_metric_inliers);
+
+        _registration_config.fine_downsampling_resolution_m = declare_and_get<double>(
+            "mapfusion.registration.fine_downsampling_resolution_m", 0.5);
+        _registration_config.fine_max_correspondence_distance_m = declare_and_get<double>(
+            "mapfusion.registration.fine_max_correspondence_distance_m", 2.0);
+        _registration_config.fine_rotation_epsilon_rad = declare_and_get<double>(
+            "mapfusion.registration.fine_rotation_epsilon_rad", 0.0017453292519943296);
+        _registration_config.fine_translation_epsilon_m = declare_and_get<double>(
+            "mapfusion.registration.fine_translation_epsilon_m", 0.001);
+        _registration_config.fine_num_neighbors = declare_and_get<int>(
+            "mapfusion.registration.fine_num_neighbors", 10);
+        _registration_config.fine_num_threads = declare_and_get<int>(
+            "mapfusion.registration.fine_num_threads", 4);
+        _registration_config.fine_max_iterations = declare_and_get<int>(
+            "mapfusion.registration.fine_max_iterations", 30);
+
+        _registration_config.truncated_mse_max_correspondence_distance_m =
+            declare_and_get<double>(
+                "mapfusion.registration.truncated_mse_max_correspondence_distance_m", 3.0);
+        _registration_config.max_truncated_mse_m2 = declare_and_get<double>(
+            "mapfusion.registration.max_truncated_mse_m2", legacy_icp_threshold);
+        _registration_config.min_overlap_ratio = declare_and_get<double>(
+            "mapfusion.registration.min_overlap_ratio", 0.10);
+
+        const std::string registration_error =
+            liorf::registration::validate(_registration_config);
+        if (!registration_error.empty()) {
+            throw std::invalid_argument(
+                "invalid mapfusion.registration configuration: " + registration_error);
+        }
 
     }
 
@@ -337,8 +415,6 @@ private:
         _kdtree_loop_to_search.reset(new pcl::KdTreeFLANN<PointType>());
         _cloud_loop_to_search.reset(new pcl::PointCloud<PointType>());
 		
-		_downsize_filter_icp.setLeafSize(0.4, 0.4, 0.4);
-
         _initial_loop.first = -1;
 
         _robot_id_th = robotID2Number(_robot_id);
@@ -973,10 +1049,12 @@ private:
             source_pose_initial.z =  target_pose.z;
         }
 
-        PointTypePose pose_source_lidar = icpRelativeMotion(transformPointCloud(bin.cloud, &source_pose_initial),
-                                                            transformPointCloud(bin_nearest.cloud, &target_pose), source_pose_initial);
+        PointTypePose pose_source_lidar = registerRelativeMotion(
+            transformPointCloud(bin.cloud, &source_pose_initial),
+            transformPointCloud(bin_nearest.cloud, &target_pose),
+            source_pose_initial);
 
-        if (pose_source_lidar.intensity == -1 || pose_source_lidar.intensity > _icp_thres)
+        if (pose_source_lidar.intensity < 0.0F)
             return false;
 
         //1: jackal0, 2: jackal1
@@ -1061,64 +1139,54 @@ private:
         return cloudOut;
     }
 
-    PointTypePose icpRelativeMotion(pcl::PointCloud<PointType>::Ptr source,
-                                               pcl::PointCloud<PointType>::Ptr target,
-                                               PointTypePose pose_source)
+    PointTypePose registerRelativeMotion(pcl::PointCloud<PointType>::Ptr source,
+                                         pcl::PointCloud<PointType>::Ptr target,
+                                         PointTypePose pose_source)
     {
-        // ICP Settings
-        static pcl::GeneralizedIterativeClosestPoint<PointType, PointType> icp;
-        icp.setMaxCorrespondenceDistance(100);
-        icp.setMaximumIterations(100);
-        icp.setTransformationEpsilon(1e-6);
-        icp.setEuclideanFitnessEpsilon(1e-6);
-        icp.setRANSACIterations(0);
-
-        pcl::PointCloud<PointType>::Ptr cloud_temp(new pcl::PointCloud<PointType>());
-        _downsize_filter_icp.setInputCloud(source);
-        _downsize_filter_icp.filter(*cloud_temp);
-        *source = *cloud_temp;
-
-        _downsize_filter_icp.setInputCloud(target);
-        _downsize_filter_icp.filter(*cloud_temp);
-        *target = *cloud_temp;
-
-        //Align clouds
-        icp.setInputSource(source);
-        icp.setInputTarget(target);
-        pcl::PointCloud<PointType>::Ptr unused_result(
-            new pcl::PointCloud<PointType>());
-        icp.align(*unused_result);
         PointTypePose pose_from;
+        pose_from.intensity = -1.0F;
 
-        if (icp.hasConverged() == false){
+        liorf::registration::PointCloud source_points;
+        liorf::registration::PointCloud target_points;
+        source_points.reserve(source->size());
+        target_points.reserve(target->size());
+        for (const auto& point : source->points) {
+            source_points.emplace_back(point.x, point.y, point.z);
+        }
+        for (const auto& point : target->points) {
+            target_points.emplace_back(point.x, point.y, point.z);
+        }
+
+        const liorf::registration::Result registration =
+            liorf::registration::registerClouds(
+                source_points, target_points, _registration_config);
+        if (!registration.accepted()) {
+            RCLCPP_WARN(
+                get_logger(),
+                "SKiD registration rejected (%s): %s "
+                "[corr=%zu, coarse_inliers=%zu, fine_inliers=%zu, overlap=%.3f, tMSE=%.6f m^2]",
+                liorf::registration::toString(registration.status),
+                registration.detail.c_str(),
+                registration.coarse_correspondences,
+                registration.coarse_translation_inliers,
+                registration.fine_inliers,
+                registration.metric.overlap_ratio,
+                registration.metric.value_m2);
             pose_from.intensity = -1;
             return pose_from;
         }
 
+        const Eigen::Affine3f correction_target_from_source(
+            registration.T_target_source.matrix().cast<float>());
+        const Eigen::Affine3f initial_world_from_lidar = pcl::getTransformation(
+            pose_source.x, pose_source.y, pose_source.z,
+            pose_source.roll, pose_source.pitch, pose_source.yaw);
+        const Eigen::Affine3f corrected_world_from_lidar =
+            correction_target_from_source * initial_world_from_lidar;
+
         float x, y, z, roll, pitch, yaw;
-        Eigen::Affine3f correctionLidarFrame;
-
-        correctionLidarFrame = icp.getFinalTransformation();  // get transformation in camera frame
-
-        pcl::getTranslationAndEulerAngles(correctionLidarFrame, x, y, z, roll, pitch,yaw);
-
-//        if(std::min(_robot_id_th, _robot_this_th) == 1 && std::max(_robot_id_th, _robot_this_th) == 2){
-//            publishCloud(_pub_target_cloud, target, _cloud_header.stamp, "/jackal1/odom");
-//
-//            PointTypePose ptp;
-//            ptp.x = x; ptp.y = y; ptp.z = z; ptp.roll = roll; ptp.yaw = yaw; ptp.pitch = pitch;
-//            publishCloud(_pub_match_cloud, transformPointCloud(source, &ptp), _cloud_header.stamp, "/jackal1/odom");
-//        }
-
-
-        // transform from world origin to wrong pose
-        Eigen::Affine3f tWrong = pcl::getTransformation(pose_source.x, pose_source.y, pose_source.z,
-                                                        pose_source.roll, pose_source.pitch, pose_source.yaw);
-        // transform from world origin to corrected pose
-        Eigen::Affine3f tCorrect = correctionLidarFrame * tWrong;
-
-        // pre-multiplying -> successive rotation about a fixed frame
-        pcl::getTranslationAndEulerAngles(tCorrect, x, y, z, roll, pitch, yaw);
+        pcl::getTranslationAndEulerAngles(
+            corrected_world_from_lidar, x, y, z, roll, pitch, yaw);
 
         pose_from.x = x;
         pose_from.y = y;
@@ -1128,7 +1196,22 @@ private:
         pose_from.roll = roll;
         pose_from.pitch = pitch;
 
-        pose_from.intensity = icp.getFitnessScore();
+        pose_from.intensity = static_cast<float>(registration.metric.value_m2);
+
+        RCLCPP_INFO(
+            get_logger(),
+            "SKiD registration accepted: corr=%zu coarse_inliers=%zu "
+            "fine_inliers=%zu overlap=%.3f tMSE=%.6f m^2 "
+            "time=%.1f ms (coarse %.1f, fine %.1f)",
+            registration.coarse_correspondences,
+            registration.coarse_translation_inliers,
+            registration.fine_inliers,
+            registration.metric.overlap_ratio,
+            registration.metric.value_m2,
+            1000.0 * (registration.coarse_seconds + registration.fine_seconds +
+                      registration.metric_seconds),
+            1000.0 * registration.coarse_seconds,
+            1000.0 * registration.fine_seconds);
 
         return pose_from;
 

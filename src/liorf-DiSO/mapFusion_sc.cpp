@@ -85,6 +85,7 @@ private:
     std::string _robot_id;
     std::string _robot_this;//robot id which the thread is now processing
     std::string _sc_topic;
+    std::string _loop_topic;
     std::string _sc_frame;
 	
 	std::string _local_topic;
@@ -221,7 +222,8 @@ public:
 
 
         _pub_context_info = create_publisher<liorf::msg::ContextInfo>(_sc_topic + "/context_info", 1);
-        _pub_loop_info = create_publisher<liorf::msg::ContextInfo>(_robot_id + "/" + _sc_topic + "/loop_info", 1);
+        _pub_loop_info = create_publisher<liorf::msg::ContextInfo>(
+                prefixTopic(_robot_id, _loop_topic), 1);
         _pub_cloud = create_publisher<sensor_msgs::msg::PointCloud2>(_robot_id + "/" + _sc_topic + "/cloud", 1);
         _pub_trans_odom2map = create_publisher<nav_msgs::msg::Odometry>(_robot_id + "/" + _sc_topic + "/trans_map", 1);
         _pub_trans_odom2odom = create_publisher<nav_msgs::msg::Odometry>(_sc_topic + "/trans_odom", 1);
@@ -290,6 +292,8 @@ private:
         _loop_frame_thres = declare_and_get<int>("mapfusion.interRobot.loop_frame_threshold", 10);
 
         _sc_topic = declare_and_get<std::string>("mapfusion.interRobot.sc_topic", "context");
+        _loop_topic = declare_and_get<std::string>(
+            "mapfusion.interRobot.loop_topic", "context/loop_info");
         _sc_frame = declare_and_get<std::string>("mapfusion.interRobot.sc_frame", "base_link");
         _local_topic = declare_and_get<std::string>("mapfusion.interRobot.local_topic", "liorf/mapping/cloud_info");
         _pcm_start_threshold = declare_and_get<int>("mapfusion.interRobot.pcm_start_threshold", 5);

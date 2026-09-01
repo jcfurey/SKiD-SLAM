@@ -16,6 +16,9 @@
         interRobot:
             #topic
             solid_topic: "solid"
+            # Accepted loop factors use a separate, shared publisher/subscriber
+            # contract rather than being inferred from solid_topic.
+            loop_topic: "context/loop_info"
             solid_frame: "base_link"
             local_topic: "liorf/mapping/cloud_info"
 
@@ -28,3 +31,34 @@
 
             robot_initial: jackal0
             use_position_search: false #use position search may introduce more global loop closure, but spend more time for candidate checking
+
+        registration:
+            # KISS-Matcher coarse global alignment.
+            coarse_voxel_size_m: 2.0
+            coarse_use_voxel_sampling: true
+            coarse_use_quatro: false
+            coarse_linearity_threshold: 0.99
+            coarse_max_correspondences: 5000
+            coarse_normal_radius_gain: 3.5
+            coarse_fpfh_radius_gain: 5.0
+            coarse_robin_noise_bound_gain: 1.0
+            coarse_solver_noise_bound_gain: 0.75
+            coarse_clamp_noise_bounds: true
+            min_coarse_correspondences: 5
+            min_coarse_inliers: 3
+
+            # Small-GICP fine alignment.
+            fine_downsampling_resolution_m: 0.5
+            fine_max_correspondence_distance_m: 2.0
+            fine_rotation_epsilon_rad: 0.0017453292519943296
+            fine_translation_epsilon_m: 0.001
+            fine_num_neighbors: 10
+            fine_num_threads: 4
+            fine_max_iterations: 30
+            min_fine_inliers: 20
+
+            # Paper Equation (10): distance is m and score is m^2.
+            truncated_mse_max_correspondence_distance_m: 3.0
+            max_truncated_mse_m2: 3.0
+            min_metric_inliers: 20
+            min_overlap_ratio: 0.10

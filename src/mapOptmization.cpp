@@ -220,7 +220,7 @@ public:
         //for fusion node
         pubFeatureCloud = create_publisher<sensor_msgs::msg::PointCloud2>(robot_id + "/liorf/mapping/feature_cloud_global", 1);
         subGlobalLoop = create_subscription<liorf::msg::ContextInfo>(
-            robot_id + "/context/loop_info", rclcpp::QoS(100),
+            prefixTopic(robot_id, mapFusionLoopTopic), rclcpp::QoS(100),
             std::bind(&mapOptimization::contextLoopInfoHandler, this, std::placeholders::_1), subOpt);
         //
         subCloud = create_subscription<liorf::msg::CloudInfo>(

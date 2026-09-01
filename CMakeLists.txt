@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.8)
+cmake_minimum_required(VERSION 3.24)
 project(liorf)
 
 if(NOT CMAKE_BUILD_TYPE)
@@ -47,6 +47,7 @@ find_package(PCL REQUIRED QUIET)
 find_package(OpenCV REQUIRED QUIET)
 find_package(GTSAM REQUIRED QUIET)
 find_package(Eigen3 REQUIRED)
+find_package(TBB REQUIRED)
 find_package(Boost REQUIRED COMPONENTS timer)
 
 set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "/usr/share/cmake/geographiclib/")
@@ -71,6 +72,88 @@ set(LIBNABO_BUILD_PYTHON OFF CACHE BOOL "" FORCE)
 set(SHARED_LIBS OFF CACHE BOOL "" FORCE)
 add_subdirectory("${LIBNABO_SOURCE_DIR}" third_party/libnabo EXCLUDE_FROM_ALL)
 set(NABO_LIBRARIES libnabo::nabo)
+
+# The paper registration pipeline is intentionally built from pinned
+# submodules.  KISS-Matcher normally downloads ROBIN during configure, and
+# ROBIN in turn downloads PMC and xenium.  Define those targets locally first
+# so a recursive clone can be configured without network access.
+set(SKID_THIRD_PARTY_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party")
+function(skid_require_submodule relative_path marker)
+  if(NOT EXISTS "${SKID_THIRD_PARTY_DIR}/${relative_path}/${marker}")
+    message(FATAL_ERROR
+      "The ${relative_path} submodule is missing or incomplete. "
+      "Run: git submodule update --init --recursive")
+  endif()
+endfunction()
+
+skid_require_submodule(kiss_matcher cpp/kiss_matcher/CMakeLists.txt)
+skid_require_submodule(small_gicp CMakeLists.txt)
+skid_require_submodule(robin CMakeLists.txt)
+skid_require_submodule(pmc CMakeLists.txt)
+skid_require_submodule(xenium CMakeLists.txt)
+
+set(PMC_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+add_subdirectory("${SKID_THIRD_PARTY_DIR}/pmc" third_party/pmc EXCLUDE_FROM_ALL)
+set_property(TARGET pmc PROPERTY POSITION_INDEPENDENT_CODE ON)
+target_compile_options(pmc PRIVATE -w)
+
+add_library(xenium INTERFACE)
+target_include_directories(xenium SYSTEM INTERFACE
+  $<BUILD_INTERFACE:${SKID_THIRD_PARTY_DIR}/xenium>
+)
+
+add_library(skid_robin STATIC
+  third_party/robin/src/core.cpp
+  third_party/robin/src/graph.cpp
+  third_party/robin/src/graph_core.cpp
+  third_party/robin/src/graph_io.cpp
+  third_party/robin/src/graph_solvers.cpp
+  third_party/robin/src/pkc.cpp
+  third_party/robin/src/problems.cpp
+  third_party/robin/src/robin.cpp
+  third_party/robin/src/utils.cpp
+)
+add_library(robin::robin ALIAS skid_robin)
+set_property(TARGET skid_robin PROPERTY POSITION_INDEPENDENT_CODE ON)
+target_include_directories(skid_robin SYSTEM PUBLIC
+  $<BUILD_INTERFACE:${SKID_THIRD_PARTY_DIR}/robin/include>
+)
+target_link_libraries(skid_robin
+  PUBLIC Eigen3::Eigen xenium
+  PRIVATE OpenMP::OpenMP_CXX pmc
+)
+target_compile_options(skid_robin PRIVATE -w)
+
+find_library(SKID_LZ4_LIBRARY NAMES lz4 REQUIRED)
+add_library(kiss_matcher_core STATIC
+  third_party/kiss_matcher/cpp/kiss_matcher/core/kiss_matcher/ROBINMatching.cpp
+  third_party/kiss_matcher/cpp/kiss_matcher/core/kiss_matcher/FasterPFH.cpp
+  third_party/kiss_matcher/cpp/kiss_matcher/core/kiss_matcher/KISSMatcher.cpp
+  third_party/kiss_matcher/cpp/kiss_matcher/core/kiss_matcher/GncSolver.cpp
+)
+add_library(kiss_matcher::kiss_matcher_core ALIAS kiss_matcher_core)
+set_property(TARGET kiss_matcher_core PROPERTY POSITION_INDEPENDENT_CODE ON)
+target_include_directories(kiss_matcher_core SYSTEM PUBLIC
+  $<BUILD_INTERFACE:${SKID_THIRD_PARTY_DIR}/kiss_matcher/cpp/kiss_matcher/core>
+)
+target_link_libraries(kiss_matcher_core
+  PUBLIC Eigen3::Eigen robin::robin TBB::tbb OpenMP::OpenMP_CXX
+  PRIVATE ${SKID_LZ4_LIBRARY}
+)
+target_compile_options(kiss_matcher_core PRIVATE -w)
+
+add_library(small_gicp STATIC
+  third_party/small_gicp/src/small_gicp/registration/registration.cpp
+  third_party/small_gicp/src/small_gicp/registration/registration_helper.cpp
+)
+set_property(TARGET small_gicp PROPERTY POSITION_INDEPENDENT_CODE ON)
+target_include_directories(small_gicp SYSTEM PUBLIC
+  $<BUILD_INTERFACE:${SKID_THIRD_PARTY_DIR}/small_gicp/include>
+)
+target_link_libraries(small_gicp
+  PUBLIC Eigen3::Eigen OpenMP::OpenMP_CXX
+)
+target_compile_options(small_gicp PRIVATE -w)
 
 ###############
 ## Interfaces #
@@ -128,6 +211,15 @@ ament_auto_add_library(scan_context STATIC
 )
 target_link_libraries(scan_context ${PCL_LIBRARIES})
 
+add_library(skid_registration STATIC src/skid_registration.cpp)
+target_include_directories(skid_registration PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+)
+target_link_libraries(skid_registration
+  PUBLIC Eigen3::Eigen
+  PRIVATE kiss_matcher::kiss_matcher_core small_gicp
+)
+
 # <!-- liorf_yjz_lucky_boy -->
 # Range Image Projection
 ament_auto_add_executable(${PROJECT_NAME}_imageProjection src/imageProjection.cpp ${common_lib})
@@ -150,7 +242,7 @@ target_link_libraries(${PROJECT_NAME}_imuPreintegration
 ament_auto_add_executable(${PROJECT_NAME}_mapFusion src/liorf-DiSO/mapFusion_so.cpp)
 target_link_libraries(${PROJECT_NAME}_mapFusion
   ${cpp_typesupport_target} ${PCL_LIBRARIES} ${NABO_LIBRARIES}
-  gtsam fast_max-clique_finder solid)
+  gtsam fast_max-clique_finder solid skid_registration)
 
 # Map Fusion (Scan Context)
 ament_auto_add_executable(${PROJECT_NAME}_mapFusionSC src/liorf-DiSO/mapFusion_sc.cpp)
@@ -174,6 +266,10 @@ if(BUILD_TESTING)
   target_include_directories(test_geographic_frames PRIVATE include)
   target_link_libraries(test_geographic_frames
     Eigen3::Eigen ${GeographicLib_LIBRARIES})
+
+  ament_add_gtest(test_skid_registration
+    test/test_skid_registration.cpp)
+  target_link_libraries(test_skid_registration skid_registration)
 endif()
 
 #############

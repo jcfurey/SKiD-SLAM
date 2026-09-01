@@ -32,6 +32,9 @@
   <depend>libpcl-all-dev</depend>
   <depend>libopencv-dev</depend>
   <depend>libjsoncpp-dev</depend>
+  <depend>liblz4-dev</depend>
+  <depend>libomp-dev</depend>
+  <depend>tbb</depend>
   <depend>geographiclib</depend>
   <depend>libboost-timer-dev</depend>
 

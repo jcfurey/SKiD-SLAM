@@ -44,12 +44,14 @@ sudo apt install \
   ros-$ROS_DISTRO-tf2 ros-$ROS_DISTRO-tf2-ros ros-$ROS_DISTRO-tf2-eigen \
   ros-$ROS_DISTRO-tf2-geometry-msgs ros-$ROS_DISTRO-cv-bridge \
   ros-$ROS_DISTRO-gtsam ros-$ROS_DISTRO-rviz2 \
-  libgeographiclib-dev libjsoncpp-dev libpcl-dev libopencv-dev libeigen3-dev
+  libgeographiclib-dev libjsoncpp-dev libpcl-dev libopencv-dev libeigen3-dev \
+  liblz4-dev libomp-dev libtbb-dev
 ```
 
-GTSAM is pulled from the ROS 2 package index (`ros-$ROS_DISTRO-gtsam`). libnabo
-is pinned as a nested submodule because Lyrical does not currently publish its
-binary package.
+GTSAM is pulled from the ROS 2 package index (`ros-$ROS_DISTRO-gtsam`). libnabo,
+KISS-Matcher, Small-GICP, and the registration stack's ROBIN/PMC/xenium
+dependencies are pinned as nested submodules. The latter three are declared as
+local CMake targets so configuration never downloads an unpinned dependency.
 
 ## :hammer: Build
 
@@ -62,7 +64,7 @@ colcon build --cmake-args -DCMAKE_BUILD_TYPE=Release
 source install/setup.bash
 ```
 
-For an existing checkout, initialize the pinned dependency with
+For an existing checkout, initialize all pinned dependencies with
 `git submodule update --init --recursive` before building.
 
 `mapOptmization.cpp` is template-heavy (GTSAM + PCL); on a machine with less
@@ -122,7 +124,7 @@ the compiler being OOM-killed.
   `package.xml` and wired into the targets automatically. Dependencies whose
   CMake package name differs from the rosdep key (GTSAM, Eigen3, PCL, OpenCV,
   JsonCpp, GeographicLib, Boost) are still found and linked explicitly in
-  `CMakeLists.txt`; the pinned libnabo submodule is built in-tree. Note that
+  `CMakeLists.txt`; the pinned third-party submodules are built in-tree. Note that
   `ament_auto_find_build_dependencies()` skips anything it fails to find, so
   the ROS packages are passed as `REQUIRED` to turn a missing one into a
   configure error rather than a confusing compile failure.
@@ -168,7 +170,8 @@ parameter file in `config/` (each `run_*.launch.py` selects one), or pass your
 own with the `params` argument of `launch/include/module_loam.launch.py`.
 DiSO FEATURES
 ---------------------------------------------------------------------------------------------------------------------------------------------------
-- Now utilizes G-ICP for mapFusion node, for better map-to-map matching
+- Uses KISS-Matcher coarse registration followed by Small-GICP fine
+  registration and a truncated-MSE/overlap gate in the SOLiD map-fusion node.
 
 - republish of map topics for 3rd-party application requiring map application
 

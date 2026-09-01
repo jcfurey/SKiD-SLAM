@@ -81,6 +81,7 @@ public:
     string imuTopic;
     string odomTopic;
     string gpsTopic;
+    string mapFusionLoopTopic;
 
     //Frames
     string lidarFrame;
@@ -193,6 +194,8 @@ public:
         imuTopic        = declare_and_get<std::string>("liorf.imuTopic", "imu_correct");
         odomTopic       = declare_and_get<std::string>("liorf.odomTopic", "odometry/imu");
         gpsTopic        = declare_and_get<std::string>("liorf.gpsTopic", "odometry/gps");
+        mapFusionLoopTopic = declare_and_get<std::string>(
+            "mapfusion.interRobot.loop_topic", "context/loop_info");
 
         lidarFrame    = declare_and_get<std::string>("liorf.lidarFrame", "base_link");
         baselinkFrame = declare_and_get<std::string>("liorf.baselinkFrame", "base_link");

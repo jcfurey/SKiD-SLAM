@@ -1,3 +1,18 @@
 [submodule "third_party/libnabo"]
 	path = third_party/libnabo
 	url = https://github.com/norlab-ulaval/libnabo.git
+[submodule "third_party/kiss_matcher"]
+	path = third_party/kiss_matcher
+	url = https://github.com/MIT-SPARK/KISS-Matcher.git
+[submodule "third_party/small_gicp"]
+	path = third_party/small_gicp
+	url = https://github.com/koide3/small_gicp.git
+[submodule "third_party/robin"]
+	path = third_party/robin
+	url = https://github.com/MIT-SPARK/ROBIN.git
+[submodule "third_party/pmc"]
+	path = third_party/pmc
+	url = https://github.com/jingnanshi/pmc.git
+[submodule "third_party/xenium"]
+	path = third_party/xenium
+	url = https://github.com/mpoeter/xenium.git

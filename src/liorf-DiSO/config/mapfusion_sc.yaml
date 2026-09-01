@@ -14,6 +14,7 @@
         interRobot:
             #topic
             sc_topic: "context"
+            loop_topic: "context/loop_info"
             sc_frame: "base_link"
             local_topic: "liorf/mapping/cloud_info"
 
