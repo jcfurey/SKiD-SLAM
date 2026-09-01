@@ -261,4 +261,4 @@ Newly opened:
 
 | Commit | Contents |
 |---|---|
-| this commit | Bound inter-robot communications and move scans on demand |
+| `040b43a` | Bound inter-robot communications and move scans on demand |
