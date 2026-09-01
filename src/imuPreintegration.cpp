@@ -262,8 +262,10 @@ public:
     gtsam::imuBias::ConstantBias prevBiasOdom;
 
     bool doneFirstOpt = false;
+    double lastImuT_received = -1;
     double lastImuT_imu = -1;
     double lastImuT_opt = -1;
+    uint64_t rejectedImuTimestampCount = 0;
 
     gtsam::ISAM2 optimizer;
     gtsam::NonlinearFactorGraph graphFactors;
@@ -342,6 +344,20 @@ public:
         lastImuT_imu = -1;
         doneFirstOpt = false;
         systemInitialized = false;
+    }
+
+    bool validIntegrationStep(double dt, const char * path)
+    {
+        if (std::isfinite(dt) && dt > 0.0)
+            return true;
+
+        ++rejectedImuTimestampCount;
+        RCLCPP_WARN_THROTTLE(
+            get_logger(), *get_clock(), 2000,
+            "Dropping a non-positive/non-finite IMU integration step in %s "
+            "(dt=%.9g, rejected=%lu).",
+            path, dt, static_cast<unsigned long>(rejectedImuTimestampCount));
+        return false;
     }
 
     void odometryHandler(const nav_msgs::msg::Odometry::SharedPtr odomMsg)
@@ -451,6 +467,11 @@ public:
             if (imuTime < currentCorrectionTime - delta_t)
             {
                 double dt = (lastImuT_opt < 0) ? (1.0 / imuRate) : (imuTime - lastImuT_opt);
+                if (!validIntegrationStep(dt, "optimization"))
+                {
+                    imuQueOpt.pop_front();
+                    continue;
+                }
                 imuIntegratorOpt_->integrateMeasurement(
                         gtsam::Vector3(thisImu->linear_acceleration.x, thisImu->linear_acceleration.y, thisImu->linear_acceleration.z),
                         gtsam::Vector3(thisImu->angular_velocity.x,    thisImu->angular_velocity.y,    thisImu->angular_velocity.z), dt);
@@ -520,6 +541,9 @@ public:
                 double imuTime = ROS_TIME(thisImu);
                 double dt = (lastImuQT < 0) ? (1.0 / imuRate) :(imuTime - lastImuQT);
 
+                if (!validIntegrationStep(dt, "repropagation"))
+                    continue;
+
                 imuIntegratorImu_->integrateMeasurement(gtsam::Vector3(thisImu->linear_acceleration.x, thisImu->linear_acceleration.y, thisImu->linear_acceleration.z),
                                                         gtsam::Vector3(thisImu->angular_velocity.x,    thisImu->angular_velocity.y,    thisImu->angular_velocity.z), dt);
                 lastImuQT = imuTime;
@@ -556,14 +580,30 @@ public:
 
         sensor_msgs::msg::Imu thisImu = imuConverter(*imu_raw);
 
+        const double imuTime = ROS_TIME(&thisImu);
+        if (!std::isfinite(imuTime) ||
+            (lastImuT_received >= 0.0 && imuTime <= lastImuT_received))
+        {
+            ++rejectedImuTimestampCount;
+            RCLCPP_WARN_THROTTLE(
+                get_logger(), *get_clock(), 2000,
+                "Dropping out-of-order IMU sample (stamp=%.9f, previous=%.9f, "
+                "rejected=%lu).",
+                imuTime, lastImuT_received,
+                static_cast<unsigned long>(rejectedImuTimestampCount));
+            return;
+        }
+        lastImuT_received = imuTime;
+
         imuQueOpt.push_back(thisImu);
         imuQueImu.push_back(thisImu);
 
         if (doneFirstOpt == false)
             return;
 
-        double imuTime = ROS_TIME(&thisImu);
         double dt = (lastImuT_imu < 0) ? (1.0 / imuRate) : (imuTime - lastImuT_imu);
+        if (!validIntegrationStep(dt, "real-time propagation"))
+            return;
         lastImuT_imu = imuTime;
 
         // integrate this single imu message

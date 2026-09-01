@@ -52,6 +52,7 @@
 #include <cfloat>
 #include <iterator>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <limits>
 #include <iomanip>
@@ -126,6 +127,18 @@ public:
     float mappingSurfLeafSize ;
     float surroundingKeyframeMapLeafSize;
     float loopClosureICPSurfLeafSize ;
+
+    // RESPLE/X-ICP-style observable-subspace scan matching. Information
+    // thresholds are scale-free shares within the translation or rotation
+    // point-to-plane Hessian block. A positive full threshold enables that
+    // block; a zero/full pair leaves it fully admitted.
+    bool observabilityAwareScanMatching;
+    double minimumTranslationInformationShare;
+    double fullTranslationInformationShare;
+    double minimumRotationInformationShare;
+    double fullRotationInformationShare;
+    double partialTranslationCorrectionBudget;
+    double partialRotationCorrectionBudget;
 
     float z_tollerance;
     float rotation_tollerance;
@@ -241,6 +254,39 @@ public:
 
         mappingSurfLeafSize           = declare_and_get<double>("liorf.mappingSurfLeafSize", 0.2);
         surroundingKeyframeMapLeafSize = declare_and_get<double>("liorf.surroundingKeyframeMapLeafSize", 0.2);
+
+        observabilityAwareScanMatching =
+            declare_and_get<bool>("liorf.observabilityAwareScanMatching", false);
+        minimumTranslationInformationShare =
+            declare_and_get<double>("liorf.minimumTranslationInformationShare", 0.005);
+        fullTranslationInformationShare =
+            declare_and_get<double>("liorf.fullTranslationInformationShare", 0.02);
+        minimumRotationInformationShare =
+            declare_and_get<double>("liorf.minimumRotationInformationShare", 0.005);
+        fullRotationInformationShare =
+            declare_and_get<double>("liorf.fullRotationInformationShare", 0.02);
+        partialTranslationCorrectionBudget =
+            declare_and_get<double>("liorf.partialTranslationCorrectionBudget", 0.15);
+        partialRotationCorrectionBudget =
+            declare_and_get<double>("liorf.partialRotationCorrectionBudget", 0.05);
+
+        const auto valid_information_band = [](double minimum_share, double full_share) {
+            return std::isfinite(minimum_share) && std::isfinite(full_share) &&
+                   minimum_share >= 0.0 && full_share >= minimum_share &&
+                   full_share <= 1.0;
+        };
+        if (!valid_information_band(minimumTranslationInformationShare,
+                                    fullTranslationInformationShare) ||
+            !valid_information_band(minimumRotationInformationShare,
+                                    fullRotationInformationShare) ||
+            !std::isfinite(partialTranslationCorrectionBudget) ||
+            !std::isfinite(partialRotationCorrectionBudget) ||
+            partialTranslationCorrectionBudget < 0.0 ||
+            partialRotationCorrectionBudget < 0.0)
+        {
+            throw std::invalid_argument(
+                "invalid observable scan-matching information band or correction budget");
+        }
 
         z_tollerance        = declare_and_get<double>("liorf.z_tollerance", FLT_MAX);
         rotation_tollerance = declare_and_get<double>("liorf.rotation_tollerance", FLT_MAX);

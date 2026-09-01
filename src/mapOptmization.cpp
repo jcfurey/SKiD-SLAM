@@ -2,6 +2,7 @@
 #include "liorf/msg/cloud_info.hpp"
 #include "liorf/srv/save_map.hpp"
 #include "liorf/msg/context_info.hpp"
+#include "observable_scan_match.hpp"
 // <!-- liorf_yjz_lucky_boy -->
 #include <sensor_msgs/msg/nav_sat_fix.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
@@ -22,6 +23,8 @@
 #include <gtsam/inference/Symbol.h>
 
 #include <gtsam/nonlinear/ISAM2.h>
+
+#include <Eigen/QR>
 
 #include <GeographicLib/Geocentric.hpp>
 #include <GeographicLib/LocalCartesian.hpp>
@@ -155,7 +158,12 @@ public:
     std::mutex mtxLoopInfo;
 
     bool isDegenerate = false;
-    cv::Mat matP;
+    liorf::observable_scan_match::GateConfig translationGateConfig;
+    liorf::observable_scan_match::GateConfig rotationGateConfig;
+    liorf::observable_scan_match::BlockObservability lastTranslationObservability;
+    liorf::observable_scan_match::BlockObservability lastRotationObservability;
+    double partialTranslationBudgetUsed = 0.0;
+    double partialRotationBudgetUsed = 0.0;
 
     int laserCloudSurfFromMapDSNum = 0;
     int laserCloudSurfLastDSNum = 0;
@@ -241,6 +249,28 @@ public:
         downSizeFilterICP.setLeafSize(loopClosureICPSurfLeafSize, loopClosureICPSurfLeafSize, loopClosureICPSurfLeafSize);
         downSizeFilterSurroundingKeyPoses.setLeafSize(surroundingKeyframeDensity, surroundingKeyframeDensity, surroundingKeyframeDensity); // for surrounding key poses of scan-to-map optimization
 
+        if (observabilityAwareScanMatching)
+        {
+            translationGateConfig = {
+                minimumTranslationInformationShare,
+                fullTranslationInformationShare,
+                partialTranslationCorrectionBudget};
+            rotationGateConfig = {
+                minimumRotationInformationShare,
+                fullRotationInformationShare,
+                partialRotationCorrectionBudget};
+            RCLCPP_INFO(
+                get_logger(),
+                "Observable scan matching enabled: translation shares %.4f..%.4f "
+                "(budget %.3f m), rotation shares %.4f..%.4f (budget %.3f rad).",
+                translationGateConfig.minimum_information_share,
+                translationGateConfig.full_information_share,
+                translationGateConfig.partial_admission_budget,
+                rotationGateConfig.minimum_information_share,
+                rotationGateConfig.full_information_share,
+                rotationGateConfig.partial_admission_budget);
+        }
+
         allocateMemory();
     }
 
@@ -278,7 +308,6 @@ public:
             transformTobeMapped[i] = 0;
         }
 
-        matP = cv::Mat(6, 6, CV_32F, cv::Scalar::all(0));
     }
 
     void contextLoopInfoHandler(const liorf::msg::ContextInfo::ConstSharedPtr& msgIn){
@@ -1283,12 +1312,10 @@ public:
             return false;
         }
 
-        cv::Mat matA(laserCloudSelNum, 6, CV_32F, cv::Scalar::all(0));
-        cv::Mat matAt(6, laserCloudSelNum, CV_32F, cv::Scalar::all(0));
-        cv::Mat matAtA(6, 6, CV_32F, cv::Scalar::all(0));
-        cv::Mat matB(laserCloudSelNum, 1, CV_32F, cv::Scalar::all(0));
-        cv::Mat matAtB(6, 1, CV_32F, cv::Scalar::all(0));
-        cv::Mat matX(6, 1, CV_32F, cv::Scalar::all(0));
+        using JacobianMatrix =
+            Eigen::Matrix<double, Eigen::Dynamic, 6, Eigen::RowMajor>;
+        JacobianMatrix matA = JacobianMatrix::Zero(laserCloudSelNum, 6);
+        Eigen::VectorXd matB = Eigen::VectorXd::Zero(laserCloudSelNum);
 
         PointType pointOri, coeff;
 
@@ -1329,66 +1356,90 @@ public:
                       + (cry * crz * pointOri.y - cry * srz * pointOri.z) * coeff.z;
               
             // camera -> lidar
-            matA.at<float>(i, 0) = arz;
-            matA.at<float>(i, 1) = ary;
-            matA.at<float>(i, 2) = arx;
-            matA.at<float>(i, 3) = coeff.x;
-            matA.at<float>(i, 4) = coeff.y;
-            matA.at<float>(i, 5) = coeff.z;
-            matB.at<float>(i, 0) = -coeff.intensity;
+            matA(i, 0) = arz;
+            matA(i, 1) = ary;
+            matA(i, 2) = arx;
+            matA(i, 3) = coeff.x;
+            matA(i, 4) = coeff.y;
+            matA(i, 5) = coeff.z;
+            matB(i) = -coeff.intensity;
         }
 
-        cv::transpose(matA, matAt);
-        matAtA = matAt * matA;
-        matAtB = matAt * matB;
-        cv::solve(matAtA, matAtB, matX, cv::DECOMP_QR);
-
-        if (iterCount == 0) {
-
-            cv::Mat matE(1, 6, CV_32F, cv::Scalar::all(0));
-            cv::Mat matV(6, 6, CV_32F, cv::Scalar::all(0));
-            cv::Mat matV2(6, 6, CV_32F, cv::Scalar::all(0));
-
-            cv::eigen(matAtA, matE, matV);
-            matV.copyTo(matV2);
-
-            isDegenerate = false;
-            float eignThre[6] = {100, 100, 100, 100, 100, 100};
-            for (int i = 5; i >= 0; i--) {
-                if (matE.at<float>(0, i) < eignThre[i]) {
-                    for (int j = 0; j < 6; j++) {
-                        matV2.at<float>(i, j) = 0;
-                    }
-                    isDegenerate = true;
-                } else {
-                    break;
-                }
-            }
-            matP = matV.inv() * matV2;
-        }
-
-        if (isDegenerate)
+        // Solve A dx = b directly in double precision. The previous LOAM path
+        // solved (A^T A) dx = A^T b in float, which squares the condition
+        // number precisely when a tunnel makes one pose direction weak.
+        Eigen::CompleteOrthogonalDecomposition<JacobianMatrix> decomposition;
+        decomposition.setThreshold(1.0e-8);
+        decomposition.compute(matA);
+        Eigen::Matrix<double, 6, 1> matX = decomposition.solve(matB);
+        if (!matX.allFinite())
         {
-            cv::Mat matX2(6, 1, CV_32F, cv::Scalar::all(0));
-            matX.copyTo(matX2);
-            matX = matP * matX2;
+            RCLCPP_WARN_THROTTLE(
+                get_logger(), *get_clock(), 2000,
+                "Rejected a non-finite point-to-plane correction (rank %ld, %d rows).",
+                static_cast<long>(decomposition.rank()), laserCloudSelNum);
+            isDegenerate = true;
+            return false;
         }
 
-        transformTobeMapped[0] += matX.at<float>(0, 0);
-        transformTobeMapped[1] += matX.at<float>(1, 0);
-        transformTobeMapped[2] += matX.at<float>(2, 0);
-        transformTobeMapped[3] += matX.at<float>(3, 0);
-        transformTobeMapped[4] += matX.at<float>(4, 0);
-        transformTobeMapped[5] += matX.at<float>(5, 0);
+        // RESPLE-style localizability is evaluated separately in translation
+        // and rotation, normalized by each block's trace. This avoids mixing
+        // radians and metres in one raw-eigenvalue threshold. Re-evaluate on
+        // every association iteration rather than freezing the first one.
+        const Eigen::Matrix<double, 6, 6> information = matA.transpose() * matA;
+        lastRotationObservability = liorf::observable_scan_match::analyze(
+            information.topLeftCorner<3, 3>(), rotationGateConfig);
+        lastTranslationObservability = liorf::observable_scan_match::analyze(
+            information.bottomRightCorner<3, 3>(), translationGateConfig);
+
+        matX.head<3>() = liorf::observable_scan_match::apply(
+            matX.head<3>(), lastRotationObservability, rotationGateConfig,
+            &partialRotationBudgetUsed);
+        matX.tail<3>() = liorf::observable_scan_match::apply(
+            matX.tail<3>(), lastTranslationObservability, translationGateConfig,
+            &partialTranslationBudgetUsed);
+
+        const bool iterationConstrained =
+            lastRotationObservability.constrained() ||
+            lastTranslationObservability.constrained() || decomposition.rank() < 6;
+        isDegenerate = isDegenerate || iterationConstrained;
+
+        if (iterCount == 0 && observabilityAwareScanMatching)
+        {
+            RCLCPP_INFO_THROTTLE(
+                get_logger(), *get_clock(), 2000,
+                "Scan observability: t_share=[%.4g %.4g %.4g], t_admit=[%.3f %.3f %.3f]; "
+                "r_share=[%.4g %.4g %.4g], r_admit=[%.3f %.3f %.3f], rank=%ld.",
+                lastTranslationObservability.information_shares(0),
+                lastTranslationObservability.information_shares(1),
+                lastTranslationObservability.information_shares(2),
+                lastTranslationObservability.admit_fractions(0),
+                lastTranslationObservability.admit_fractions(1),
+                lastTranslationObservability.admit_fractions(2),
+                lastRotationObservability.information_shares(0),
+                lastRotationObservability.information_shares(1),
+                lastRotationObservability.information_shares(2),
+                lastRotationObservability.admit_fractions(0),
+                lastRotationObservability.admit_fractions(1),
+                lastRotationObservability.admit_fractions(2),
+                static_cast<long>(decomposition.rank()));
+        }
+
+        transformTobeMapped[0] += matX(0);
+        transformTobeMapped[1] += matX(1);
+        transformTobeMapped[2] += matX(2);
+        transformTobeMapped[3] += matX(3);
+        transformTobeMapped[4] += matX(4);
+        transformTobeMapped[5] += matX(5);
 
         float deltaR = sqrt(
-                            pow(pcl::rad2deg(matX.at<float>(0, 0)), 2) +
-                            pow(pcl::rad2deg(matX.at<float>(1, 0)), 2) +
-                            pow(pcl::rad2deg(matX.at<float>(2, 0)), 2));
+                            pow(pcl::rad2deg(matX(0)), 2) +
+                            pow(pcl::rad2deg(matX(1)), 2) +
+                            pow(pcl::rad2deg(matX(2)), 2));
         float deltaT = sqrt(
-                            pow(matX.at<float>(3, 0) * 100, 2) +
-                            pow(matX.at<float>(4, 0) * 100, 2) +
-                            pow(matX.at<float>(5, 0) * 100, 2));
+                            pow(matX(3) * 100, 2) +
+                            pow(matX(4) * 100, 2) +
+                            pow(matX(5) * 100, 2));
 
         if (deltaR < 0.05 && deltaT < 0.05) {
             return true; // converged
@@ -1400,6 +1451,10 @@ public:
     {
         if (cloudKeyPoses3D->points.empty())
             return;
+
+        isDegenerate = false;
+        partialTranslationBudgetUsed = 0.0;
+        partialRotationBudgetUsed = 0.0;
 
         if (laserCloudSurfLastDSNum > 30)
         {
@@ -1420,6 +1475,7 @@ public:
 
             transformUpdate();
         } else {
+            isDegenerate = true;
             RCLCPP_WARN(get_logger(), "Not enough features! Only %d planar features available.", laserCloudSurfLastDSNum);
         }
     }

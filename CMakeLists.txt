@@ -157,6 +157,18 @@ target_link_libraries(${PROJECT_NAME}_mapFusionSC
   ${cpp_typesupport_target} ${PCL_LIBRARIES} ${NABO_LIBRARIES}
   gtsam fast_max-clique_finder scan_context)
 
+#########
+## Test #
+#########
+
+if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_observable_scan_match
+    test/test_observable_scan_match.cpp)
+  target_include_directories(test_observable_scan_match PRIVATE include)
+  target_link_libraries(test_observable_scan_match Eigen3::Eigen)
+endif()
+
 #############
 ## Install ##
 #############
