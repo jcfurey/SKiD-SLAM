@@ -71,6 +71,13 @@ the compiler being OOM-killed.
 
 ## HOW to run the package
 
+> **Geographic multi-platform limitation:** the current implementation does
+> not publish a REP-105 `earth` frame and must not be assumed to place robots
+> from distant sites into one geographic map. See
+> [Geographic and Multi-Platform Frame Architecture](doc/MULTI_PLATFORM_FRAME_ARCHITECTURE.md)
+> for the source audit, UTM boundary, required TF tree, and implementation
+> acceptance tests.
+
 1. Run the launch file (multi-robot):
   ```
     ros2 launch liorf run_liorf_multi.launch.py
