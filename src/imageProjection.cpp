@@ -30,6 +30,21 @@ POINT_CLOUD_REGISTER_POINT_STRUCT(OusterPointXYZIRT,
     (uint8_t, ring, ring) (uint16_t, noise, noise) (uint32_t, range, range)
 )
 
+// The workspace's common Livox bridge preserves the native relative timestamp
+// as uint32 nanoseconds and the Livox line as a uint16 ring. This differs from
+// both the Velodyne float-seconds layout and Ouster's uint8 ring layout.
+struct LivoxPointXYZIRT {
+    PCL_ADD_POINT4D;
+    PCL_ADD_INTENSITY;
+    uint32_t t;
+    uint16_t ring;
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+} EIGEN_ALIGN16;
+POINT_CLOUD_REGISTER_POINT_STRUCT(LivoxPointXYZIRT,
+    (float, x, x) (float, y, y) (float, z, z) (float, intensity, intensity)
+    (uint32_t, t, t) (uint16_t, ring, ring)
+)
+
 struct RobosensePointXYZIRT
 {
     PCL_ADD_POINT4D
@@ -99,6 +114,7 @@ private:
 
     pcl::PointCloud<PointXYZIRT>::Ptr laserCloudIn;
     pcl::PointCloud<OusterPointXYZIRT>::Ptr tmpOusterCloudIn;
+    pcl::PointCloud<LivoxPointXYZIRT>::Ptr tmpLivoxCloudIn;
     pcl::PointCloud<MulranPointXYZIRT>::Ptr tmpMulranCloudIn;
     pcl::PointCloud<PointType>::Ptr   fullCloud;
 
@@ -151,6 +167,7 @@ public:
     {
         laserCloudIn.reset(new pcl::PointCloud<PointXYZIRT>());
         tmpOusterCloudIn.reset(new pcl::PointCloud<OusterPointXYZIRT>());
+        tmpLivoxCloudIn.reset(new pcl::PointCloud<LivoxPointXYZIRT>());
         tmpMulranCloudIn.reset(new pcl::PointCloud<MulranPointXYZIRT>());
         fullCloud.reset(new pcl::PointCloud<PointType>());
 
@@ -223,9 +240,48 @@ public:
         // convert cloud
         currentCloudMsg = std::move(cloudQueue.front());
         cloudQueue.pop_front();
-        if (sensor == SensorType::VELODYNE || sensor == SensorType::LIVOX)
+        if (sensor == SensorType::VELODYNE)
         {
             pcl::moveFromROSMsg(currentCloudMsg, *laserCloudIn);
+        }
+        else if (sensor == SensorType::LIVOX)
+        {
+            // Native Livox PointCloud2 producers commonly expose float
+            // seconds as `time`; the benchmark bridge exposes uint32
+            // nanoseconds as `t`. Support both without silently zeroing the
+            // deskew time through a mismatched PCL field conversion.
+            bool hasNanosecondTime = false;
+            for (const auto &field : currentCloudMsg.fields)
+            {
+                if (field.name == "t" &&
+                    field.datatype == sensor_msgs::msg::PointField::UINT32)
+                {
+                    hasNanosecondTime = true;
+                    break;
+                }
+            }
+
+            if (!hasNanosecondTime)
+            {
+                pcl::moveFromROSMsg(currentCloudMsg, *laserCloudIn);
+            }
+            else
+            {
+                pcl::moveFromROSMsg(currentCloudMsg, *tmpLivoxCloudIn);
+                laserCloudIn->points.resize(tmpLivoxCloudIn->size());
+                laserCloudIn->is_dense = tmpLivoxCloudIn->is_dense;
+                for (size_t i = 0; i < tmpLivoxCloudIn->size(); i++)
+                {
+                    auto &src = tmpLivoxCloudIn->points[i];
+                    auto &dst = laserCloudIn->points[i];
+                    dst.x = src.x;
+                    dst.y = src.y;
+                    dst.z = src.z;
+                    dst.intensity = src.intensity;
+                    dst.ring = src.ring;
+                    dst.time = src.t * 1e-9f;
+                }
+            }
         }
         else if (sensor == SensorType::OUSTER)
         {
@@ -285,6 +341,12 @@ public:
         else {
             RCLCPP_ERROR_STREAM(get_logger(), "Unknown sensor type: " << int(sensor));
             rclcpp::shutdown();
+        }
+
+        if (laserCloudIn->empty())
+        {
+            RCLCPP_WARN(get_logger(), "Skipping an empty point cloud");
+            return false;
         }
 
         // get timestamp
