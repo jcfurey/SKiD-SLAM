@@ -99,7 +99,34 @@
       historyKeyframeSearchTimeDiff: 30.0           # seconds, key frame that is n seconds older will be considered for loop closure
       historyKeyframeSearchNum: 25                  # number of hostory key frames will be fused into a submap for loop closure
       loopClosureICPSurfLeafSize: 0.5               # downsample icp point cloud  
-      historyKeyframeFitnessScore: 0.3              # icp threshold, the smaller the better alignment
+      historyKeyframeFitnessScore: 0.3              # default gate on the truncated MSE below, in m^2
+
+      # Intra-robot loop closure. Candidates come from a radius search over the
+      # trajectory, from the SOLiD descriptor, or from both; every candidate is
+      # then registered and gated by the same paper pipeline the map-fusion node
+      # applies to inter-robot loops.
+      #
+      # The SOLiD descriptor itself is configured once, under mapfusion.solid in
+      # mapfusion_solid.yaml, so a place is described identically whether the
+      # revisit is this platform's or a peer's.
+      loopClosure:
+        enableRadiusSearch: true
+        enableSolidSearch: true
+        solidMinPoints: 100                         # scans smaller than this cannot describe a place
+        minKeyframeGap: 30                          # descriptor entries; a nearer match is the current place
+        minTimeGap: 30.0                            # seconds; defaults to historyKeyframeSearchTimeDiff
+        # Unlike inter-robot loops, these are not screened by PCM, so an
+        # accepted factor is down-weighted rather than trusted outright.
+        robustKernel: true
+        robustKernelScale: 1.0
+
+        # Same keys, meanings, and units as mapfusion.registration. Only the
+        # values that differ from the shared defaults need to appear here.
+        registration:
+          # Paper Equation (10): distance is m and score is m^2. Defaults to
+          # historyKeyframeFitnessScore when unset.
+          max_truncated_mse_m2: 0.3
+          min_overlap_ratio: 0.10
 
       # Visualization
       globalMapVisualizationSearchRadius: 1000.0    # meters, global map visualization radius

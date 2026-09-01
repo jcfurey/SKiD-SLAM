@@ -227,6 +227,25 @@ target_include_directories(skid_pose_uncertainty PUBLIC
 )
 target_link_libraries(skid_pose_uncertainty PUBLIC Eigen3::Eigen gtsam)
 
+# SOLiD place recognition shared by intra- and inter-robot loop detection.
+add_library(skid_loop_detection STATIC src/skid_loop_detection.cpp)
+target_include_directories(skid_loop_detection PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+)
+target_link_libraries(skid_loop_detection PUBLIC Eigen3::Eigen)
+
+# Isolates SOLiD's global PointType/PointXYZIRPYT declarations to one
+# translation unit so the mapping node can build descriptors too.
+add_library(skid_solid_descriptor STATIC src/skid_solid_descriptor.cpp)
+target_include_directories(skid_solid_descriptor
+  PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/liorf-DiSO/third_parties
+)
+target_link_libraries(skid_solid_descriptor
+  PUBLIC skid_loop_detection ${PCL_LIBRARIES}
+  PRIVATE solid
+)
+
 # <!-- liorf_yjz_lucky_boy -->
 # Range Image Projection
 ament_auto_add_executable(${PROJECT_NAME}_imageProjection src/imageProjection.cpp ${common_lib})
@@ -234,10 +253,11 @@ target_link_libraries(${PROJECT_NAME}_imageProjection
   ${cpp_typesupport_target} ${PCL_LIBRARIES} ${OpenCV_LIBRARIES})
 
 # Mapping Optimization
-ament_auto_add_executable(${PROJECT_NAME}_mapOptmization src/mapOptmization.cpp ${common_lib} include/Scancontext.cpp)
+ament_auto_add_executable(${PROJECT_NAME}_mapOptmization src/mapOptmization.cpp ${common_lib})
 target_link_libraries(${PROJECT_NAME}_mapOptmization
   ${cpp_typesupport_target} ${PCL_LIBRARIES} ${OpenCV_LIBRARIES} OpenMP::OpenMP_CXX
-  ${GeographicLib_LIBRARIES} gtsam skid_pose_uncertainty)
+  ${GeographicLib_LIBRARIES} gtsam skid_pose_uncertainty
+  skid_registration skid_loop_detection skid_solid_descriptor)
 
 # IMU Preintegration
 ament_auto_add_executable(${PROJECT_NAME}_imuPreintegration src/imuPreintegration.cpp ${common_lib})
@@ -249,7 +269,8 @@ target_link_libraries(${PROJECT_NAME}_imuPreintegration
 ament_auto_add_executable(${PROJECT_NAME}_mapFusion src/liorf-DiSO/mapFusion_so.cpp)
 target_link_libraries(${PROJECT_NAME}_mapFusion
   ${cpp_typesupport_target} ${PCL_LIBRARIES} ${NABO_LIBRARIES}
-  gtsam fast_max-clique_finder solid skid_registration skid_pose_uncertainty)
+  gtsam fast_max-clique_finder solid skid_registration skid_pose_uncertainty
+  skid_loop_detection)
 
 # Map Fusion (Scan Context)
 ament_auto_add_executable(${PROJECT_NAME}_mapFusionSC src/liorf-DiSO/mapFusion_sc.cpp)
@@ -286,6 +307,18 @@ if(BUILD_TESTING)
     test/test_loop_constraint_utils.cpp)
   target_link_libraries(test_loop_constraint_utils
     ${cpp_typesupport_target} skid_pose_uncertainty)
+
+  ament_add_gtest(test_skid_loop_detection
+    test/test_skid_loop_detection.cpp)
+  target_link_libraries(test_skid_loop_detection skid_loop_detection)
+
+  ament_add_gtest(test_skid_solid_descriptor
+    test/test_skid_solid_descriptor.cpp)
+  target_link_libraries(test_skid_solid_descriptor skid_solid_descriptor)
+
+  ament_add_gtest(test_skid_registration_params
+    test/test_skid_registration_params.cpp)
+  target_link_libraries(test_skid_registration_params skid_registration)
 endif()
 
 #############

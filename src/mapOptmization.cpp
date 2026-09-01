@@ -31,7 +31,10 @@
 #include <GeographicLib/Geocentric.hpp>
 #include <GeographicLib/LocalCartesian.hpp>
 
-#include "Scancontext.h"
+#include "skid_loop_detection.hpp"
+#include "skid_registration.hpp"
+#include "skid_registration_params.hpp"
+#include "skid_solid_descriptor.hpp"
 
 using namespace gtsam;
 
@@ -61,13 +64,6 @@ POINT_CLOUD_REGISTER_POINT_STRUCT (PointXYZIRPYT,
                                    (double, time, time))
 
 typedef PointXYZIRPYT  PointTypePose;
-
-enum class SCInputType 
-{ 
-    SINGLE_SCAN_FULL, 
-    SINGLE_SCAN_FEAT, 
-    MULTI_SCAN_FEAT 
-}; 
 
 class mapOptimization : public ParamServer
 {
@@ -188,8 +184,20 @@ public:
     std::unique_ptr<liorf::frames::GeographicMapAnchor> geographicAnchor;
     bool gpsOriginInitialized = false;
 
-    // scancontext loop closure
-    SCManager scManager;
+    // SOLiD place recognition for intra-robot loops. The descriptor index is
+    // appended by the mapping thread and searched by the loop-closure thread.
+    bool radiusLoopDetectionEnabled = true;
+    bool solidLoopDetectionEnabled = true;
+    bool loopRobustKernelEnabled = true;
+    double loopRobustKernelScale = 1.0;
+    liorf::solid::Params solidParams;
+    liorf::registration::Config loopRegistrationConfig;
+    std::mutex mtxSolidIndex;
+    std::unique_ptr<liorf::loop_detection::Index> solidIndex;
+    // Keyframe owning each stored descriptor. Scans that cannot produce a
+    // finite descriptor are skipped, so descriptor entries and keyframe
+    // indices are not interchangeable.
+    std::vector<int> solidKeyframeOf;
 
     explicit mapOptimization(const rclcpp::NodeOptions & options)
     : ParamServer("liorf_mapOptmization", options), timeLaserInfoStamp(0, 0, RCL_ROS_TIME)
@@ -198,6 +206,8 @@ public:
         parameters.relinearizeThreshold = 0.1;
         parameters.relinearizeSkip = 1;
         isam = new ISAM2(parameters);
+
+        declareLoopClosureParameters();
 
         if (geographicFrameMode == liorf::frames::GeographicFrameMode::ECEF_ANCHORED)
         {
@@ -751,7 +761,7 @@ public:
         {
             rate.sleep();
             performRSLoopClosure();
-            performSCLoopClosure();
+            performSOLiDLoopClosure();
             visualizeLoopClosure();
         }
     }
@@ -768,8 +778,254 @@ public:
             loopInfoVec.pop_front();
     }
 
+    // Declares the intra-robot loop-closure configuration. The descriptor
+    // parameters are shared with the map-fusion node so a place is described
+    // identically whether the revisit is this platform's or a peer's, and the
+    // registration parameters come from the same helper both nodes use.
+    void declareLoopClosureParameters()
+    {
+        radiusLoopDetectionEnabled =
+            declare_and_get<bool>("liorf.loopClosure.enableRadiusSearch", true);
+        solidLoopDetectionEnabled =
+            declare_and_get<bool>("liorf.loopClosure.enableSolidSearch", true);
+
+        // Inter-robot loops are additionally screened by PCM before they
+        // reach a factor graph; intra-robot loops are not, so a surviving
+        // false positive is down-weighted rather than trusted at its
+        // registration covariance.
+        loopRobustKernelEnabled =
+            declare_and_get<bool>("liorf.loopClosure.robustKernel", true);
+        loopRobustKernelScale =
+            declare_and_get<double>("liorf.loopClosure.robustKernelScale", 1.0);
+        if (!std::isfinite(loopRobustKernelScale) || loopRobustKernelScale <= 0.0)
+            throw std::invalid_argument(
+                "liorf.loopClosure.robustKernelScale must be finite and positive");
+
+        solidParams.max_range_m =
+            declare_and_get<int>("mapfusion.solid.max_range", 80);
+        solidParams.knn_feature_dim =
+            declare_and_get<int>("mapfusion.solid.knn_feature_dim", 40);
+        solidParams.num_sectors =
+            declare_and_get<int>("mapfusion.solid.num_sector", 60);
+        solidParams.num_heights =
+            declare_and_get<int>("mapfusion.solid.num_height", 64);
+        solidParams.fov_up_deg =
+            declare_and_get<double>("mapfusion.solid.fov_up", 2.0);
+        solidParams.fov_down_deg =
+            declare_and_get<double>("mapfusion.solid.fov_down", -24.8);
+        solidParams.min_points =
+            declare_and_get<int>("liorf.loopClosure.solidMinPoints", 100);
+
+        const std::string solidError = liorf::solid::validate(solidParams);
+        if (!solidError.empty())
+            throw std::invalid_argument(
+                "invalid SOLiD descriptor configuration: " + solidError);
+
+        liorf::loop_detection::Config detection;
+        detection.knn_feature_dim = solidParams.knn_feature_dim;
+        detection.num_sectors = solidParams.num_sectors;
+        detection.num_nearest_matches =
+            declare_and_get<int>("mapfusion.solid.num_nearest_matches", 50);
+        detection.num_match_candidates =
+            declare_and_get<int>("mapfusion.solid.num_match_candidates", 1);
+        // The SOLiD acceptance distance describes the descriptor, not the loop
+        // type, so intra- and inter-robot retrieval share one threshold.
+        detection.distance_threshold = static_cast<float>(
+            declare_and_get<double>("mapfusion.interRobot.loop_threshold", 0.2));
+        detection.min_index_gap =
+            declare_and_get<int>("liorf.loopClosure.minKeyframeGap", 30);
+        // A revisit must clear the same interval the radius search requires.
+        detection.min_time_gap_s = declare_and_get<double>(
+            "liorf.loopClosure.minTimeGap",
+            static_cast<double>(historyKeyframeSearchTimeDiff));
+
+        const std::string detectionError =
+            liorf::loop_detection::validate(detection);
+        if (!detectionError.empty())
+            throw std::invalid_argument(
+                "invalid intra-robot loop detection configuration: " +
+                detectionError);
+        solidIndex =
+            std::make_unique<liorf::loop_detection::Index>(detection);
+
+        // PCL's fitness score and the paper's truncated MSE are both mean
+        // squared nearest-neighbor distances in m^2, so the existing
+        // per-dataset threshold carries over as the default gate.
+        loopRegistrationConfig = liorf::registration::declareConfig(
+            [this](const std::string & name, auto default_value) {
+                return this->declare_and_get<decltype(default_value)>(
+                    name, default_value);
+            },
+            "liorf.loopClosure.registration.",
+            static_cast<double>(historyKeyframeFitnessScore));
+    }
+
+    struct LoopRegistrationResult
+    {
+        bool valid = false;
+        gtsam::Pose3 poseBetween;
+        liorf::uncertainty::Matrix6d covariance =
+            liorf::uncertainty::Matrix6d::Zero();
+        double truncatedMse = 0.0;
+        double overlap = 0.0;
+        std::size_t inliers = 0;
+    };
+
+    // Coarse-to-fine registration of two of this platform's keyframes, gated
+    // and weighted exactly as an inter-robot loop is.
+    //
+    // Both clouds are expressed in the map frame using the current, still
+    // drifted keyframe poses. KISS-Matcher needs no initial guess, so the
+    // drift only has to be small enough for the two scans to overlap. The
+    // registered correction maps the current keyframe onto the revisited one,
+    // and the propagated relative pose is the measurement the graph consumes.
+    LoopRegistrationResult registerLoopKeyframes(int loopKeyCur, int loopKeyPre)
+    {
+        LoopRegistrationResult result;
+
+        pcl::PointCloud<PointType>::Ptr curKeyframeCloud(new pcl::PointCloud<PointType>());
+        pcl::PointCloud<PointType>::Ptr prevKeyframeCloud(new pcl::PointCloud<PointType>());
+        loopFindNearKeyframes(curKeyframeCloud, loopKeyCur, 0, -1);
+        loopFindNearKeyframes(prevKeyframeCloud, loopKeyPre, historyKeyframeSearchNum, -1);
+        if (curKeyframeCloud->size() < 300 || prevKeyframeCloud->size() < 1000)
+            return result;
+
+        if (pubHistoryKeyFrames->get_subscription_count() != 0)
+            publishCloud(pubHistoryKeyFrames, prevKeyframeCloud, timeLaserInfoStamp, mapFrameId);
+
+        liorf::registration::PointCloud sourcePoints;
+        liorf::registration::PointCloud targetPoints;
+        sourcePoints.reserve(curKeyframeCloud->size());
+        targetPoints.reserve(prevKeyframeCloud->size());
+        for (const auto& point : curKeyframeCloud->points)
+            sourcePoints.emplace_back(point.x, point.y, point.z);
+        for (const auto& point : prevKeyframeCloud->points)
+            targetPoints.emplace_back(point.x, point.y, point.z);
+
+        const liorf::registration::Result registration =
+            liorf::registration::registerClouds(
+                sourcePoints, targetPoints, loopRegistrationConfig);
+        if (!registration.accepted())
+        {
+            RCLCPP_DEBUG(
+                get_logger(),
+                "Intra-robot loop %d -> %d rejected (%s): %s "
+                "[corr=%zu, coarse_inliers=%zu, fine_inliers=%zu, overlap=%.3f, tMSE=%.6f m^2]",
+                loopKeyCur, loopKeyPre,
+                liorf::registration::toString(registration.status),
+                registration.detail.c_str(),
+                registration.coarse_correspondences,
+                registration.coarse_translation_inliers,
+                registration.fine_inliers,
+                registration.metric.overlap_ratio,
+                registration.metric.value_m2);
+            return result;
+        }
+
+        const gtsam::Pose3 correction(
+            gtsam::Rot3(registration.T_target_source.linear()),
+            gtsam::Point3(registration.T_target_source.translation()));
+
+        if (pubIcpKeyFrames->get_subscription_count() != 0)
+        {
+            Eigen::Affine3f correctionAffine;
+            correctionAffine.matrix() =
+                registration.T_target_source.matrix().cast<float>();
+            pcl::PointCloud<PointType>::Ptr closedCloud(new pcl::PointCloud<PointType>());
+            pcl::transformPointCloud(*curKeyframeCloud, *closedCloud, correctionAffine);
+            publishCloud(pubIcpKeyFrames, closedCloud, timeLaserInfoStamp, mapFrameId);
+        }
+
+        // The two keyframe poses are the graph's own estimate rather than
+        // independent measurements, so only the registration contributes
+        // uncertainty here.
+        const gtsam::Pose3 driftedCur =
+            pclPointTogtsamPose3(copy_cloudKeyPoses6D->points[loopKeyCur]);
+        const gtsam::Pose3 poseTo =
+            pclPointTogtsamPose3(copy_cloudKeyPoses6D->points[loopKeyPre]);
+
+        const auto correctedCur = liorf::uncertainty::compose(
+            correction, registration.uncertainty.covariance,
+            driftedCur, liorf::uncertainty::Matrix6d::Zero());
+        if (!liorf::uncertainty::validCovariance(correctedCur.covariance))
+        {
+            RCLCPP_WARN(get_logger(),
+                "Intra-robot loop %d -> %d covariance failed pose composition",
+                loopKeyCur, loopKeyPre);
+            return result;
+        }
+
+        const auto relative = liorf::uncertainty::between(
+            correctedCur.pose, correctedCur.covariance,
+            poseTo, liorf::uncertainty::Matrix6d::Zero());
+        if (!liorf::uncertainty::positiveDefiniteCovariance(relative.covariance))
+        {
+            RCLCPP_WARN(get_logger(),
+                "Intra-robot loop %d -> %d covariance failed relative-pose propagation",
+                loopKeyCur, loopKeyPre);
+            return result;
+        }
+
+        result.valid = true;
+        result.poseBetween = relative.pose;
+        result.covariance = relative.covariance;
+        result.truncatedMse = registration.metric.value_m2;
+        result.overlap = registration.metric.overlap_ratio;
+        result.inliers = registration.metric.correspondence_count;
+        return result;
+    }
+
+    // Factor weight for an accepted intra-robot loop. The registration
+    // covariance sets the shape and scale; the optional Cauchy kernel only
+    // bounds how far a gross outlier can pull the graph.
+    gtsam::SharedNoiseModel loopNoiseModel(
+        const liorf::uncertainty::Matrix6d& covariance) const
+    {
+        auto gaussian = gtsam::noiseModel::Gaussian::Covariance(covariance);
+        if (!loopRobustKernelEnabled)
+            return gaussian;
+
+        return gtsam::noiseModel::Robust::Create(
+            gtsam::noiseModel::mEstimator::Cauchy::Create(loopRobustKernelScale),
+            gaussian);
+    }
+
+    // Registers a detected intra-robot candidate and, when it passes the paper
+    // gates, queues it as a covariance-weighted pose-graph factor.
+    bool addIntraRobotLoop(int loopKeyCur, int loopKeyPre, const char* detector)
+    {
+        const int keyframeCount = static_cast<int>(copy_cloudKeyPoses6D->size());
+        if (loopKeyCur < 0 || loopKeyPre < 0 || loopKeyCur == loopKeyPre ||
+            loopKeyCur >= keyframeCount || loopKeyPre >= keyframeCount ||
+            loopKeyCur >= static_cast<int>(surfCloudKeyFrames.size()) ||
+            loopKeyPre >= static_cast<int>(surfCloudKeyFrames.size()))
+            return false;
+
+        const LoopRegistrationResult registered =
+            registerLoopKeyframes(loopKeyCur, loopKeyPre);
+        if (!registered.valid)
+            return false;
+
+        mtx.lock();
+        loopIndexQueue.push_back(make_pair(loopKeyCur, loopKeyPre));
+        loopPoseQueue.push_back(registered.poseBetween);
+        loopNoiseQueue.push_back(loopNoiseModel(registered.covariance));
+        mtx.unlock();
+
+        loopIndexContainer[loopKeyCur] = loopKeyPre;
+
+        RCLCPP_INFO(get_logger(),
+            "Accepted %s intra-robot loop %d -> %d: tMSE=%.6f m^2 overlap=%.3f inliers=%zu",
+            detector, loopKeyCur, loopKeyPre, registered.truncatedMse,
+            registered.overlap, registered.inliers);
+        return true;
+    }
+
     void performRSLoopClosure()
     {
+        if (!radiusLoopDetectionEnabled)
+            return;
+
         if (cloudKeyPoses3D->points.empty() == true)
             return;
 
@@ -785,73 +1041,16 @@ public:
             if (detectLoopClosureDistance(&loopKeyCur, &loopKeyPre) == false)
                 return;
 
-        // extract cloud
-        pcl::PointCloud<PointType>::Ptr cureKeyframeCloud(new pcl::PointCloud<PointType>());
-        pcl::PointCloud<PointType>::Ptr prevKeyframeCloud(new pcl::PointCloud<PointType>());
-        {
-            loopFindNearKeyframes(cureKeyframeCloud, loopKeyCur, 0, -1);
-            loopFindNearKeyframes(prevKeyframeCloud, loopKeyPre, historyKeyframeSearchNum, -1);
-            if (cureKeyframeCloud->size() < 300 || prevKeyframeCloud->size() < 1000)
-                return;
-            if (pubHistoryKeyFrames->get_subscription_count() != 0)
-                publishCloud(pubHistoryKeyFrames, prevKeyframeCloud, timeLaserInfoStamp, mapFrameId);
-        }
-
-        // ICP Settings
-        static pcl::GeneralizedIterativeClosestPoint<PointType, PointType> icp;
-        icp.setMaxCorrespondenceDistance(historyKeyframeSearchRadius*2);
-        icp.setMaximumIterations(100);
-        icp.setTransformationEpsilon(1e-6);
-        icp.setEuclideanFitnessEpsilon(1e-6);
-        icp.setRANSACIterations(0);
-
-        // Align clouds
-        icp.setInputSource(cureKeyframeCloud);
-        icp.setInputTarget(prevKeyframeCloud);
-        pcl::PointCloud<PointType>::Ptr unused_result(new pcl::PointCloud<PointType>());
-        icp.align(*unused_result);
-
-        if (icp.hasConverged() == false || icp.getFitnessScore() > historyKeyframeFitnessScore)
-            return;
-
-        // publish corrected cloud
-        if (pubIcpKeyFrames->get_subscription_count() != 0)
-        {
-            pcl::PointCloud<PointType>::Ptr closed_cloud(new pcl::PointCloud<PointType>());
-            pcl::transformPointCloud(*cureKeyframeCloud, *closed_cloud, icp.getFinalTransformation());
-            publishCloud(pubIcpKeyFrames, closed_cloud, timeLaserInfoStamp, mapFrameId);
-        }
-
-        // Get pose transformation
-        float x, y, z, roll, pitch, yaw;
-        Eigen::Affine3f correctionLidarFrame;
-        correctionLidarFrame = icp.getFinalTransformation();
-        // transform from world origin to wrong pose
-        Eigen::Affine3f tWrong = pclPointToAffine3f(copy_cloudKeyPoses6D->points[loopKeyCur]);
-        // transform from world origin to corrected pose
-        Eigen::Affine3f tCorrect = correctionLidarFrame * tWrong;// pre-multiplying -> successive rotation about a fixed frame
-        pcl::getTranslationAndEulerAngles (tCorrect, x, y, z, roll, pitch, yaw);
-        gtsam::Pose3 poseFrom = Pose3(Rot3::RzRyRx(roll, pitch, yaw), Point3(x, y, z));
-        gtsam::Pose3 poseTo = pclPointTogtsamPose3(copy_cloudKeyPoses6D->points[loopKeyPre]);
-        gtsam::Vector Vector6(6);
-        float noiseScore = icp.getFitnessScore();
-        Vector6 << noiseScore, noiseScore, noiseScore, noiseScore, noiseScore, noiseScore;
-        noiseModel::Diagonal::shared_ptr constraintNoise = noiseModel::Diagonal::Variances(Vector6);
-
-        // Add pose constraint
-        mtx.lock();
-        loopIndexQueue.push_back(make_pair(loopKeyCur, loopKeyPre));
-        loopPoseQueue.push_back(poseFrom.between(poseTo));
-        loopNoiseQueue.push_back(constraintNoise);
-        mtx.unlock();
-
-        // add loop constriant
-        loopIndexContainer[loopKeyCur] = loopKeyPre;
+        addIntraRobotLoop(loopKeyCur, loopKeyPre, "radius-search");
     }
 
-    // copy from sc-lio-sam
-    void performSCLoopClosure()
+    // Intra-robot place recognition, using the SOLiD descriptor and the
+    // coarse-to-fine registration that inter-robot loops use.
+    void performSOLiDLoopClosure()
     {
+        if (!solidLoopDetectionEnabled || !solidIndex)
+            return;
+
         if (cloudKeyPoses3D->points.empty() == true)
             return;
 
@@ -860,102 +1059,41 @@ public:
         *copy_cloudKeyPoses6D = *cloudKeyPoses6D;
         mtx.unlock();
 
-        // find keys
-        // first: nn index, second: yaw diff 
-        auto detectResult = scManager.detectLoopClosureID(); 
-        int loopKeyCur    = copy_cloudKeyPoses3D->size() - 1;;
-        int loopKeyPre    = detectResult.first;
-        float yawDiffRad  = detectResult.second; // not use for v1 (because pcl icp withi initial somthing wrong...)
-        if( loopKeyPre == -1)
-            return;
-
-        auto it = loopIndexContainer.find(loopKeyCur);
-        if (it != loopIndexContainer.end())
-            return;
-
-        // std::cout << "SC loop found! between " << loopKeyCur << " and " << loopKeyPre << "." << std::endl; // giseop
-
-        // extract cloud
-        pcl::PointCloud<PointType>::Ptr cureKeyframeCloud(new pcl::PointCloud<PointType>());
-        pcl::PointCloud<PointType>::Ptr prevKeyframeCloud(new pcl::PointCloud<PointType>());
+        int loopKeyCur = -1;
+        std::vector<liorf::loop_detection::Candidate> candidates;
+        std::vector<int> candidateKeyframes;
         {
-            int base_key = 0;
-            loopFindNearKeyframes(cureKeyframeCloud, loopKeyCur, 0, base_key); // giseop 
-            loopFindNearKeyframes(prevKeyframeCloud, loopKeyPre, historyKeyframeSearchNum, base_key); // giseop 
-
-            if (cureKeyframeCloud->size() < 300 || prevKeyframeCloud->size() < 1000)
+            std::lock_guard<std::mutex> lock(mtxSolidIndex);
+            if (solidKeyframeOf.empty())
                 return;
-            if (pubHistoryKeyFrames->get_subscription_count() != 0)
-                publishCloud(pubHistoryKeyFrames, prevKeyframeCloud, timeLaserInfoStamp, mapFrameId);
+
+            loopKeyCur = solidKeyframeOf.back();
+            candidates = solidIndex->searchLatest();
+            candidateKeyframes.reserve(candidates.size());
+            for (const auto& candidate : candidates)
+                candidateKeyframes.push_back(
+                    candidate.index < solidKeyframeOf.size()
+                        ? solidKeyframeOf[candidate.index]
+                        : -1);
         }
 
-        // ICP Settings
-        pcl::IterativeClosestPoint<PointType, PointType> icp;
-        icp.setMaxCorrespondenceDistance(historyKeyframeSearchRadius*2);
-        icp.setMaximumIterations(100);
-        icp.setTransformationEpsilon(1e-6);
-        icp.setEuclideanFitnessEpsilon(1e-6);
-        icp.setRANSACIterations(0);
-
-        // Align clouds
-        icp.setInputSource(cureKeyframeCloud);
-        icp.setInputTarget(prevKeyframeCloud);
-        pcl::PointCloud<PointType>::Ptr unused_result(new pcl::PointCloud<PointType>());
-        icp.align(*unused_result);
-
-        if (icp.hasConverged() == false || icp.getFitnessScore() > historyKeyframeFitnessScore)
+        if (candidates.empty())
             return;
 
-        // publish corrected cloud
-        if (pubIcpKeyFrames->get_subscription_count() != 0)
+        // One loop factor per keyframe, as the radius search already assumes.
+        if (loopIndexContainer.find(loopKeyCur) != loopIndexContainer.end())
+            return;
+
+        for (std::size_t i = 0; i < candidateKeyframes.size(); ++i)
         {
-            pcl::PointCloud<PointType>::Ptr closed_cloud(new pcl::PointCloud<PointType>());
-            pcl::transformPointCloud(*cureKeyframeCloud, *closed_cloud, icp.getFinalTransformation());
-            publishCloud(pubIcpKeyFrames, closed_cloud, timeLaserInfoStamp, mapFrameId);
+            RCLCPP_DEBUG(get_logger(),
+                "SOLiD candidate %d -> %d: distance=%.4f yaw=%.3f rad",
+                loopKeyCur, candidateKeyframes[i],
+                static_cast<double>(candidates[i].range_distance),
+                static_cast<double>(candidates[i].yaw_rad));
+            if (addIntraRobotLoop(loopKeyCur, candidateKeyframes[i], "SOLiD"))
+                return;
         }
-
-        // Get pose transformation
-        float x, y, z, roll, pitch, yaw;
-        Eigen::Affine3f correctionLidarFrame;
-        correctionLidarFrame = icp.getFinalTransformation();
-
-        // // transform from world origin to wrong pose
-        // Eigen::Affine3f tWrong = pclPointToAffine3f(copy_cloudKeyPoses6D->points[loopKeyCur]);
-        // // transform from world origin to corrected pose
-        // Eigen::Affine3f tCorrect = correctionLidarFrame * tWrong;// pre-multiplying -> successive rotation about a fixed frame
-        // pcl::getTranslationAndEulerAngles (tCorrect, x, y, z, roll, pitch, yaw);
-        // gtsam::Pose3 poseFrom = Pose3(Rot3::RzRyRx(roll, pitch, yaw), Point3(x, y, z));
-        // gtsam::Pose3 poseTo = pclPointTogtsamPose3(copy_cloudKeyPoses6D->points[loopKeyPre]);
-
-        // gtsam::Vector Vector6(6);
-        // float noiseScore = icp.getFitnessScore();
-        // Vector6 << noiseScore, noiseScore, noiseScore, noiseScore, noiseScore, noiseScore;
-        // noiseModel::Diagonal::shared_ptr constraintNoise = noiseModel::Diagonal::Variances(Vector6);
-
-        // giseop 
-        pcl::getTranslationAndEulerAngles (correctionLidarFrame, x, y, z, roll, pitch, yaw);
-        gtsam::Pose3 poseFrom = Pose3(Rot3::RzRyRx(roll, pitch, yaw), Point3(x, y, z));
-        gtsam::Pose3 poseTo = Pose3(Rot3::RzRyRx(0.0, 0.0, 0.0), Point3(0.0, 0.0, 0.0));
-
-        // giseop, robust kernel for a SC loop
-        float robustNoiseScore = 0.5; // constant is ok...
-        gtsam::Vector robustNoiseVector6(6); 
-        robustNoiseVector6 << robustNoiseScore, robustNoiseScore, robustNoiseScore, robustNoiseScore, robustNoiseScore, robustNoiseScore;
-        noiseModel::Base::shared_ptr robustConstraintNoise; 
-        robustConstraintNoise = gtsam::noiseModel::Robust::Create(
-            gtsam::noiseModel::mEstimator::Cauchy::Create(1), // optional: replacing Cauchy by DCS or GemanMcClure, but with a good front-end loop detector, Cauchy is empirically enough.
-            gtsam::noiseModel::Diagonal::Variances(robustNoiseVector6)
-        ); // - checked it works. but with robust kernel, map modification may be delayed (i.e,. requires more true-positive loop factors)
-
-        // Add pose constraint
-        mtx.lock();
-        loopIndexQueue.push_back(make_pair(loopKeyCur, loopKeyPre));
-        loopPoseQueue.push_back(poseFrom.between(poseTo));
-        loopNoiseQueue.push_back(robustConstraintNoise);
-        mtx.unlock();
-
-        // add loop constriant
-        loopIndexContainer[loopKeyCur] = loopKeyPre;
     }
 
     bool detectLoopClosureDistance(int *latestID, int *closestID)
@@ -1854,29 +1992,27 @@ public:
         // save key frame cloud
         surfCloudKeyFrames.push_back(thisSurfKeyFrame);
 
-        // The following code is copy from sc-lio-sam
-        // Scan Context loop detector - giseop
-        // - SINGLE_SCAN_FULL: using downsampled original point cloud (/full_cloud_projected + downsampling)
-        // - SINGLE_SCAN_FEAT: using surface feature as an input point cloud for scan context (2020.04.01: checked it works.)
-        // - MULTI_SCAN_FEAT: using NearKeyframes (because a MulRan scan does not have beyond region, so to solve this issue ... )
-        const SCInputType sc_input_type = SCInputType::SINGLE_SCAN_FULL; // change this 
-
-        if( sc_input_type == SCInputType::SINGLE_SCAN_FULL )
+        // SOLiD descriptor for intra-robot place recognition. The full
+        // deskewed scan is described here, which is what the map-fusion node
+        // describes and exchanges, so both loop types compare like for like.
+        if (solidLoopDetectionEnabled && solidIndex)
         {
             pcl::PointCloud<PointType>::Ptr thisRawCloudKeyFrame(new pcl::PointCloud<PointType>());
             pcl::fromROSMsg(cloudInfo.cloud_deskewed, *thisRawCloudKeyFrame);
 
-            scManager.makeAndSaveScancontextAndKeys(*thisRawCloudKeyFrame);
-        }  
-        else if (sc_input_type == SCInputType::SINGLE_SCAN_FEAT)
-        { 
-            scManager.makeAndSaveScancontextAndKeys(*thisSurfKeyFrame); 
-        }
-        else if (sc_input_type == SCInputType::MULTI_SCAN_FEAT)
-        { 
-            pcl::PointCloud<PointType>::Ptr multiKeyFrameFeatureCloud(new pcl::PointCloud<PointType>());
-            loopFindNearKeyframes(multiKeyFrameFeatureCloud, cloudKeyPoses6D->size() - 1, historyKeyframeSearchNum, -1);
-            scManager.makeAndSaveScancontextAndKeys(*multiKeyFrameFeatureCloud); 
+            const liorf::loop_detection::Descriptor descriptor =
+                liorf::solid::describe(thisRawCloudKeyFrame, solidParams);
+            const int thisKeyframe =
+                static_cast<int>(surfCloudKeyFrames.size()) - 1;
+
+            std::lock_guard<std::mutex> lock(mtxSolidIndex);
+            if (solidIndex->add(descriptor, timeLaserInfoCur) !=
+                static_cast<std::size_t>(-1))
+                solidKeyframeOf.push_back(thisKeyframe);
+            else
+                RCLCPP_DEBUG(get_logger(),
+                    "Keyframe %d produced no usable SOLiD descriptor",
+                    thisKeyframe);
         }
 
         // save path for visualization

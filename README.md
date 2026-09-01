@@ -156,7 +156,8 @@ the compiler being OOM-killed.
 
 ## Distributed SLAM example
 - Here we provide a distributed multi-robot SLAM example for 3 robots, intended for use with the two datasets provided below.
-- Code from [Scan Context](https://github.com/irapkaist/scancontext) is used for feature description.
+- Place description uses [SOLiD](https://github.com/sparolab/solid.git). Scan
+  Context remains only in the `liorf_mapFusionSC` comparison node.
 - We use code from [PCM](https://github.com/lajoiepy/robust_distributed_mapper/tree/d609f59658956e1b7fe06c786ed7d07776ecb426/cpp/src/pairwise_consistency_maximization)
 for outlier detection.
 
@@ -171,9 +172,17 @@ own with the `params` argument of `launch/include/module_loam.launch.py`.
 DiSO FEATURES
 ---------------------------------------------------------------------------------------------------------------------------------------------------
 - Uses KISS-Matcher coarse registration followed by Small-GICP fine
-  registration and a truncated-MSE/overlap gate in the SOLiD map-fusion node.
+  registration and a truncated-MSE/overlap gate for **both** inter-robot loops
+  in the SOLiD map-fusion node and intra-robot loops in the local mapping node.
+  The local node's Scan Context plus PCL ICP path has been replaced by the
+  SOLiD descriptor and the same registration module; the descriptor
+  parameters live once under `mapfusion.solid`, and the registration
+  parameters are declared from one shared helper, so the two loop types cannot
+  drift apart.
 - Propagates a physically dimensioned, Hessian-shaped 6-DoF covariance through
-  Mahalanobis PCM and a typed loop-constraint message into GTSAM. The
+  Mahalanobis PCM and a typed loop-constraint message into GTSAM. Intra-robot
+  loops carry the same covariance into their pose-graph factor, optionally
+  behind a Cauchy kernel because they are not screened by PCM. The
   derivation, calibration boundary, and remaining paper gaps are recorded in
   [`doc/PAPER_V3_GAP_AUDIT.md`](doc/PAPER_V3_GAP_AUDIT.md).
 

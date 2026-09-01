@@ -16,7 +16,9 @@
 #include "nabo/nabo.h"
 #include "loop_constraint_utils.hpp"
 #include "skid_pose_uncertainty.hpp"
+#include "skid_loop_detection.hpp"
 #include "skid_registration.hpp"
+#include "skid_registration_params.hpp"
 
 //ros
 #include <rclcpp/rclcpp.hpp>
@@ -362,81 +364,15 @@ private:
         _pcm_start_threshold = declare_and_get<int>("mapfusion.interRobot.pcm_start_threshold", 5);
         _use_position_search = declare_and_get<bool>("mapfusion.interRobot.use_position_search", false);
 
-        _registration_config.coarse_voxel_size_m = declare_and_get<double>(
-            "mapfusion.registration.coarse_voxel_size_m", 2.0);
-        _registration_config.coarse_use_voxel_sampling = declare_and_get<bool>(
-            "mapfusion.registration.coarse_use_voxel_sampling", true);
-        _registration_config.coarse_use_quatro = declare_and_get<bool>(
-            "mapfusion.registration.coarse_use_quatro", false);
-        _registration_config.coarse_linearity_threshold = declare_and_get<double>(
-            "mapfusion.registration.coarse_linearity_threshold", 0.99);
-        _registration_config.coarse_max_correspondences = declare_and_get<int>(
-            "mapfusion.registration.coarse_max_correspondences", 5000);
-        _registration_config.coarse_normal_radius_gain = declare_and_get<double>(
-            "mapfusion.registration.coarse_normal_radius_gain", 3.5);
-        _registration_config.coarse_fpfh_radius_gain = declare_and_get<double>(
-            "mapfusion.registration.coarse_fpfh_radius_gain", 5.0);
-        _registration_config.coarse_robin_noise_bound_gain = declare_and_get<double>(
-            "mapfusion.registration.coarse_robin_noise_bound_gain", 1.0);
-        _registration_config.coarse_solver_noise_bound_gain = declare_and_get<double>(
-            "mapfusion.registration.coarse_solver_noise_bound_gain", 0.75);
-        _registration_config.coarse_clamp_noise_bounds = declare_and_get<bool>(
-            "mapfusion.registration.coarse_clamp_noise_bounds", true);
-
-        const int min_coarse_correspondences = declare_and_get<int>(
-            "mapfusion.registration.min_coarse_correspondences", 5);
-        const int min_coarse_inliers = declare_and_get<int>(
-            "mapfusion.registration.min_coarse_inliers", 3);
-        const int min_fine_inliers = declare_and_get<int>(
-            "mapfusion.registration.min_fine_inliers", 20);
-        const int min_metric_inliers = declare_and_get<int>(
-            "mapfusion.registration.min_metric_inliers", 20);
-        if (min_coarse_correspondences < 0 || min_coarse_inliers < 0 ||
-            min_fine_inliers < 0 || min_metric_inliers < 0) {
-            throw std::invalid_argument(
-                "mapfusion registration inlier counts cannot be negative");
-        }
-        _registration_config.min_coarse_correspondences =
-            static_cast<std::size_t>(min_coarse_correspondences);
-        _registration_config.min_coarse_inliers =
-            static_cast<std::size_t>(min_coarse_inliers);
-        _registration_config.min_fine_inliers =
-            static_cast<std::size_t>(min_fine_inliers);
-        _registration_config.min_metric_inliers =
-            static_cast<std::size_t>(min_metric_inliers);
-
-        _registration_config.fine_downsampling_resolution_m = declare_and_get<double>(
-            "mapfusion.registration.fine_downsampling_resolution_m", 0.5);
-        _registration_config.fine_max_correspondence_distance_m = declare_and_get<double>(
-            "mapfusion.registration.fine_max_correspondence_distance_m", 2.0);
-        _registration_config.fine_rotation_epsilon_rad = declare_and_get<double>(
-            "mapfusion.registration.fine_rotation_epsilon_rad", 0.0017453292519943296);
-        _registration_config.fine_translation_epsilon_m = declare_and_get<double>(
-            "mapfusion.registration.fine_translation_epsilon_m", 0.001);
-        _registration_config.fine_num_neighbors = declare_and_get<int>(
-            "mapfusion.registration.fine_num_neighbors", 10);
-        _registration_config.fine_num_threads = declare_and_get<int>(
-            "mapfusion.registration.fine_num_threads", 4);
-        _registration_config.fine_max_iterations = declare_and_get<int>(
-            "mapfusion.registration.fine_max_iterations", 30);
-
-        _registration_config.truncated_mse_max_correspondence_distance_m =
-            declare_and_get<double>(
-                "mapfusion.registration.truncated_mse_max_correspondence_distance_m", 3.0);
-        _registration_config.max_truncated_mse_m2 = declare_and_get<double>(
-            "mapfusion.registration.max_truncated_mse_m2", legacy_icp_threshold);
-        _registration_config.min_overlap_ratio = declare_and_get<double>(
-            "mapfusion.registration.min_overlap_ratio", 0.10);
-        _registration_config.nominal_rotation_stddev_rad = declare_and_get<double>(
-            "mapfusion.registration.nominal_rotation_stddev_rad", 0.05);
-        _registration_config.nominal_translation_stddev_m = declare_and_get<double>(
-            "mapfusion.registration.nominal_translation_stddev_m", 0.20);
-        _registration_config.uncertainty_reference_mse_m2 = declare_and_get<double>(
-            "mapfusion.registration.uncertainty_reference_mse_m2", 0.04);
-        _registration_config.uncertainty_min_information_ratio = declare_and_get<double>(
-            "mapfusion.registration.uncertainty_min_information_ratio", 0.01);
-        _registration_config.uncertainty_max_variance_scale = declare_and_get<double>(
-            "mapfusion.registration.uncertainty_max_variance_scale", 100.0);
+        // Shared with the local mapping node's intra-robot loops so both
+        // paths gate on one parameter set. See skid_registration_params.hpp.
+        _registration_config = liorf::registration::declareConfig(
+            [this](const std::string & name, auto default_value) {
+                return this->declare_and_get<decltype(default_value)>(
+                    name, default_value);
+            },
+            "mapfusion.registration.",
+            legacy_icp_threshold);
 
         if (!std::isfinite(_pcm_thres) || _pcm_thres <= 0.0 ||
             _pcm_start_threshold < 2 ||
@@ -446,13 +382,6 @@ private:
             _pcm_local_translation_stddev_m <= 0.0) {
             throw std::invalid_argument(
                 "mapfusion PCM threshold/uncertainty values are invalid");
-        }
-
-        const std::string registration_error =
-            liorf::registration::validate(_registration_config);
-        if (!registration_error.empty()) {
-            throw std::invalid_argument(
-                "invalid mapfusion.registration configuration: " + registration_error);
         }
 
     }
@@ -1048,9 +977,11 @@ private:
         SOLiDBin bin_nearest;
         PointTypePose source_pose_initial, target_pose;
 
-        float solid_pitch = (min_idx+1) * M_PI * 2 /_num_sectors;
-        if (solid_pitch > M_PI)
-            solid_pitch -= (M_PI * 2);
+        // Azimuth rotation implied by the winning A-SOLiD shift. The shared
+        // helper counts whole sectors; the previous local expression added one
+        // extra sector of yaw to every coarse guess.
+        float solid_pitch =
+            liorf::loop_detection::sectorShiftToYaw(min_idx, _num_sectors);
 
         int robot_id_this = robotID2Number(bin.robotname);
 
@@ -1148,35 +1079,23 @@ private:
         return true;
     }
 
+    // Inter- and intra-robot loops score places with the same shared SOLiD
+    // distance; see include/skid_loop_detection.hpp.
     float distBtnSOLiDs(Eigen::VectorXf rsolid1, Eigen::VectorXf rsolid2, Eigen::VectorXf asolid1, Eigen::VectorXf asolid2, int & idx){
-        // calculate min cosine distance of R-SOLiD
-        float sim = (rsolid1.dot(rsolid2))/(rsolid1.norm() * rsolid2.norm());
-        float dist = 1-sim;
+        liorf::loop_detection::Descriptor query;
+        query.range = std::move(rsolid1);
+        query.angular = std::move(asolid1);
+        liorf::loop_detection::Descriptor candidate;
+        candidate.range = std::move(rsolid2);
+        candidate.angular = std::move(asolid2);
 
-        float minL1normDist = std::numeric_limits<float>::max();
-        int minIndex = 0;
-        int numAngle = asolid1.size();
-
-        for(int shiftIndex = 0; shiftIndex < numAngle; ++shiftIndex)
-        {
-            Eigen::VectorXf shiftedQuery = Eigen::VectorXf::Zero(numAngle);
-            for (int i = 0; i < numAngle; ++i)
-            {
-                shiftedQuery((i+shiftIndex) % numAngle) = asolid1(i);
-                
-            }
-            float L1NormDist = (asolid2 - shiftedQuery).cwiseAbs().sum();
-
-            if(L1NormDist < minL1normDist)
-            {
-                minL1normDist = L1NormDist;
-                minIndex = shiftIndex;
-            }
-        }
-
-        idx = minIndex;
-
-        return dist;
+        const liorf::loop_detection::Comparison comparison =
+            liorf::loop_detection::compare(query, candidate);
+        idx = comparison.sector_shift;
+        // An unusable descriptor pair scores worse than any threshold rather
+        // than producing a NaN that compares false against every gate.
+        return comparison.valid() ? comparison.range_distance
+                                  : std::numeric_limits<float>::infinity();
     }
     
     pcl::PointCloud<PointType>::Ptr transformPointCloud(pcl::PointCloud<PointType>::Ptr cloudIn, PointTypePose* transformIn)
