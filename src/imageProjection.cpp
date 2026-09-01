@@ -30,6 +30,26 @@ POINT_CLOUD_REGISTER_POINT_STRUCT(OusterPointXYZIRT,
     (uint8_t, ring, ring) (uint16_t, noise, noise) (uint32_t, range, range)
 )
 
+// Recent ouster_ros releases expose `ring` as uint8, while the RESPLE
+// TestTrack recording uses the PointCloud2 convention's uint16 ring field.
+// PCL requires an exact datatype match when mapping named fields, so retain
+// both layouts instead of silently decoding every uint16 ring as zero.
+struct OusterPointXYZIRT16 {
+    PCL_ADD_POINT4D;
+    float intensity;
+    uint32_t t;
+    uint16_t reflectivity;
+    uint16_t ring;
+    uint16_t ambient;
+    uint32_t range;
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+} EIGEN_ALIGN16;
+POINT_CLOUD_REGISTER_POINT_STRUCT(OusterPointXYZIRT16,
+    (float, x, x) (float, y, y) (float, z, z) (float, intensity, intensity)
+    (uint32_t, t, t) (uint16_t, reflectivity, reflectivity)
+    (uint16_t, ring, ring) (uint16_t, ambient, ambient) (uint32_t, range, range)
+)
+
 // The workspace's common Livox bridge preserves the native relative timestamp
 // as uint32 nanoseconds and the Livox line as a uint16 ring. This differs from
 // both the Velodyne float-seconds layout and Ouster's uint8 ring layout.
@@ -114,6 +134,7 @@ private:
 
     pcl::PointCloud<PointXYZIRT>::Ptr laserCloudIn;
     pcl::PointCloud<OusterPointXYZIRT>::Ptr tmpOusterCloudIn;
+    pcl::PointCloud<OusterPointXYZIRT16>::Ptr tmpOusterCloudIn16;
     pcl::PointCloud<LivoxPointXYZIRT>::Ptr tmpLivoxCloudIn;
     pcl::PointCloud<MulranPointXYZIRT>::Ptr tmpMulranCloudIn;
     pcl::PointCloud<PointType>::Ptr   fullCloud;
@@ -167,6 +188,7 @@ public:
     {
         laserCloudIn.reset(new pcl::PointCloud<PointXYZIRT>());
         tmpOusterCloudIn.reset(new pcl::PointCloud<OusterPointXYZIRT>());
+        tmpOusterCloudIn16.reset(new pcl::PointCloud<OusterPointXYZIRT16>());
         tmpLivoxCloudIn.reset(new pcl::PointCloud<LivoxPointXYZIRT>());
         tmpMulranCloudIn.reset(new pcl::PointCloud<MulranPointXYZIRT>());
         fullCloud.reset(new pcl::PointCloud<PointType>());
@@ -285,20 +307,60 @@ public:
         }
         else if (sensor == SensorType::OUSTER)
         {
-            // Convert to Velodyne format
-            pcl::moveFromROSMsg(currentCloudMsg, *tmpOusterCloudIn);
-            laserCloudIn->points.resize(tmpOusterCloudIn->size());
-            laserCloudIn->is_dense = tmpOusterCloudIn->is_dense;
-            for (size_t i = 0; i < tmpOusterCloudIn->size(); i++)
+            const auto ringField = std::find_if(
+                currentCloudMsg.fields.begin(), currentCloudMsg.fields.end(),
+                [](const sensor_msgs::msg::PointField &field) {
+                    return field.name == "ring";
+                });
+            if (ringField == currentCloudMsg.fields.end())
             {
-                auto &src = tmpOusterCloudIn->points[i];
-                auto &dst = laserCloudIn->points[i];
-                dst.x = src.x;
-                dst.y = src.y;
-                dst.z = src.z;
-                dst.intensity = src.intensity;
-                dst.ring = src.ring;
-                dst.time = src.t * 1e-9f;
+                RCLCPP_ERROR(get_logger(),
+                    "Ouster point cloud ring channel not available");
+                rclcpp::shutdown();
+                return false;
+            }
+
+            if (ringField->datatype == sensor_msgs::msg::PointField::UINT8)
+            {
+                pcl::moveFromROSMsg(currentCloudMsg, *tmpOusterCloudIn);
+                laserCloudIn->points.resize(tmpOusterCloudIn->size());
+                laserCloudIn->is_dense = tmpOusterCloudIn->is_dense;
+                for (size_t i = 0; i < tmpOusterCloudIn->size(); i++)
+                {
+                    const auto &src = tmpOusterCloudIn->points[i];
+                    auto &dst = laserCloudIn->points[i];
+                    dst.x = src.x;
+                    dst.y = src.y;
+                    dst.z = src.z;
+                    dst.intensity = src.intensity;
+                    dst.ring = src.ring;
+                    dst.time = src.t * 1e-9f;
+                }
+            }
+            else if (ringField->datatype == sensor_msgs::msg::PointField::UINT16)
+            {
+                pcl::moveFromROSMsg(currentCloudMsg, *tmpOusterCloudIn16);
+                laserCloudIn->points.resize(tmpOusterCloudIn16->size());
+                laserCloudIn->is_dense = tmpOusterCloudIn16->is_dense;
+                for (size_t i = 0; i < tmpOusterCloudIn16->size(); i++)
+                {
+                    const auto &src = tmpOusterCloudIn16->points[i];
+                    auto &dst = laserCloudIn->points[i];
+                    dst.x = src.x;
+                    dst.y = src.y;
+                    dst.z = src.z;
+                    dst.intensity = src.intensity;
+                    dst.ring = src.ring;
+                    dst.time = src.t * 1e-9f;
+                }
+            }
+            else
+            {
+                RCLCPP_ERROR(get_logger(),
+                    "Unsupported Ouster ring datatype %u (expected UINT8 or UINT16)",
+                    static_cast<unsigned>(ringField->datatype));
+                rclcpp::shutdown();
+                return false;
             }
         } // <!-- liorf_yjz_lucky_boy -->
         else if (sensor == SensorType::MULRAN)
@@ -349,17 +411,46 @@ public:
             return false;
         }
 
+        // Organized Ouster clouds retain missing returns as NaNs and mark the
+        // message non-dense. Compact only those invalid returns; rejecting the
+        // complete scan discards otherwise valid measurements.
+        if (!laserCloudIn->is_dense)
+        {
+            const size_t inputPointCount = laserCloudIn->size();
+            const auto validEnd = std::remove_if(
+                laserCloudIn->points.begin(), laserCloudIn->points.end(),
+                [](const PointXYZIRT &point) {
+                    return !std::isfinite(point.x) ||
+                           !std::isfinite(point.y) ||
+                           !std::isfinite(point.z);
+                });
+            laserCloudIn->points.erase(validEnd, laserCloudIn->points.end());
+            laserCloudIn->width = static_cast<uint32_t>(laserCloudIn->size());
+            laserCloudIn->height = 1;
+            laserCloudIn->is_dense = true;
+
+            if (laserCloudIn->empty())
+            {
+                RCLCPP_WARN(get_logger(),
+                    "Skipping a point cloud containing no finite XYZ returns");
+                return false;
+            }
+
+            RCLCPP_WARN_ONCE(get_logger(),
+                "Compacting non-dense point clouds (first scan retained %zu of %zu points)",
+                laserCloudIn->size(), inputPointCount);
+        }
+
         // get timestamp
         cloudHeader = currentCloudMsg.header;
         timeScanCur = stamp2Sec(cloudHeader.stamp);
-        timeScanEnd = timeScanCur + laserCloudIn->points.back().time;
-
-        // check dense flag
-        if (laserCloudIn->is_dense == false)
+        float scanDuration = 0.0f;
+        for (const auto &point : laserCloudIn->points)
         {
-            RCLCPP_ERROR(get_logger(), "Point cloud is not in dense format, please remove NaN points first!");
-            rclcpp::shutdown();
+            if (std::isfinite(point.time))
+                scanDuration = std::max(scanDuration, point.time);
         }
+        timeScanEnd = timeScanCur + scanDuration;
 
         // check ring channel
         static int ringFlag = 0;
@@ -621,7 +712,16 @@ public:
 
         if (firstPointFlag == true)
         {
-            transStartInverse = (pcl::getTransformation(posXCur, posYCur, posZCur, rotXCur, rotYCur, rotZCur)).inverse();
+            // Organized Ouster clouds are row-major by ring, not ordered by
+            // relative point time. Always deskew into the scan-header frame
+            // rather than whichever point happens to be stored first.
+            float rotXStart, rotYStart, rotZStart;
+            findRotation(timeScanCur, &rotXStart, &rotYStart, &rotZStart);
+            float posXStart, posYStart, posZStart;
+            findPosition(0.0, &posXStart, &posYStart, &posZStart);
+            transStartInverse = pcl::getTransformation(
+                posXStart, posYStart, posZStart,
+                rotXStart, rotYStart, rotZStart).inverse();
             firstPointFlag = false;
         }
 
