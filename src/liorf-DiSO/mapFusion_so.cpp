@@ -8,6 +8,8 @@
 #include "liorf/msg/cloud_info.hpp"
 #include "liorf/msg/context_info.hpp"
 #include "liorf/msg/loop_constraint.hpp"
+#include "liorf/msg/scan_data.hpp"
+#include "liorf/msg/scan_request.hpp"
 
 //third party
 #include "SOLiD/solid.h"
@@ -16,6 +18,7 @@
 #include "nabo/nabo.h"
 #include "loop_constraint_utils.hpp"
 #include "skid_pose_uncertainty.hpp"
+#include "skid_comms.hpp"
 #include "skid_loop_detection.hpp"
 #include "skid_registration.hpp"
 #include "skid_registration_params.hpp"
@@ -57,7 +60,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <chrono>
 #include <limits>
+#include <memory>
 #include <unordered_map>
 #include <thread>
 #include <mutex>
@@ -74,6 +79,8 @@ private:
     rclcpp::Subscription<liorf::msg::ContextInfo>::SharedPtr _sub_solid_info;
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr _sub_odom_trans;
     rclcpp::Subscription<liorf::msg::LoopConstraint>::SharedPtr _sub_loop_info_global;
+    rclcpp::Subscription<liorf::msg::ScanRequest>::SharedPtr _sub_scan_request;
+    rclcpp::Subscription<liorf::msg::ScanData>::SharedPtr _sub_scan_data;
 
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr _sub_communication_signal;
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr _sub_signal_1;
@@ -93,6 +100,10 @@ private:
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr _pub_trans_odom2odom;
 
     rclcpp::Publisher<liorf::msg::LoopConstraint>::SharedPtr _pub_loop_info_global;
+    rclcpp::Publisher<liorf::msg::ScanRequest>::SharedPtr _pub_scan_request;
+    rclcpp::Publisher<liorf::msg::ScanData>::SharedPtr _pub_scan_data;
+
+    rclcpp::TimerBase::SharedPtr _comms_maintenance_timer;
 
     //parameters
     std::string _robot_id;
@@ -138,14 +149,46 @@ private:
     std::mutex mtx_publish_1;
     std::mutex mtx_publish_2;
     std::mutex mtx;
+    // The announcement thread and the callback group both touch the counters.
+    mutable std::mutex mtx_stats;
 
     std::string _robot_initial;
     std::string _pcm_matrix_folder;
 
     liorf::msg::CloudInfo   _cloud_info;
 //    liorf::msg::ContextInfo _context_info;
-    std::vector<SOLiDBin> _context_list_to_publish_1;
-    std::vector<SOLiDBin> _context_list_to_publish_2;
+    // Announcement backlog per peer. Bounded: a peer whose link has been down
+    // is better served by recent places than by an unbounded history, and
+    // every held entry used to pin a full feature cloud in memory.
+    liorf::comms::BoundedQueue<SOLiDBin> _context_list_to_publish_1;
+    liorf::comms::BoundedQueue<SOLiDBin> _context_list_to_publish_2;
+
+    // Communication policy: what is retained, what is asked for, and what it
+    // all costs. See include/skid_comms.hpp.
+    liorf::comms::Config _comms_config;
+    bool _announce_scans = false;
+    double _announce_rate_hz = 10.0;
+    double _comms_maintenance_period_s = 1.0;
+    double _comms_report_period_s = 30.0;
+    double _last_comms_report_s = 0.0;
+    std::unique_ptr<liorf::comms::ScanCache> _scan_cache;
+    std::unique_ptr<liorf::comms::RequestTracker> _scan_requests;
+    std::unique_ptr<liorf::comms::DeferredCandidateQueue> _deferred_candidates;
+    liorf::comms::TransferStats _announce_stats;
+    liorf::comms::TransferStats _scan_stats;
+    // Every scan this node holds, its own and its peers'. One store with one
+    // eviction policy, so the memory ceiling is a single configured number
+    // rather than the sum of several unbounded containers.
+    std::unordered_map<liorf::comms::ScanKey,
+                       pcl::PointCloud<PointType>::Ptr,
+                       liorf::comms::ScanKeyHash> _scans;
+    // Bin index holding each known descriptor, so an arriving scan can be
+    // filed against the place that is already in the KD-tree.
+    std::unordered_map<liorf::comms::ScanKey, int, liorf::comms::ScanKeyHash>
+        _bin_of_scan_key;
+    // Whether this node fuses maps, or only announces its places. Mirrors the
+    // condition that decides whether the announcement subscription exists.
+    bool _performs_fusion = false;
 
     pcl::KdTreeFLANN<PointType>::Ptr _kdtree_pose_to_publish;
     pcl::PointCloud<PointType>::Ptr _cloud_pose_to_publish;
@@ -268,6 +311,16 @@ public:
 
         }
 
+        // Scan transfer is a separate, on-demand channel from the descriptor
+        // announcements above. Every robot both serves and issues requests, so
+        // these are subscribed unconditionally.
+        _sub_scan_request = create_subscription<liorf::msg::ScanRequest>(
+            _solid_topic + "/scan_request", rclcpp::QoS(20),
+            std::bind(&MapFusion::scanRequestHandler, this, std::placeholders::_1), subOpt);
+        _sub_scan_data = create_subscription<liorf::msg::ScanData>(
+            _solid_topic + "/scan_data", rclcpp::QoS(20),
+            std::bind(&MapFusion::scanDataHandler, this, std::placeholders::_1), subOpt);
+
 
 
         _pub_context_info = create_publisher<liorf::msg::ContextInfo>(_solid_topic + "/context_info", 1);
@@ -278,37 +331,59 @@ public:
         _pub_trans_odom2odom = create_publisher<nav_msgs::msg::Odometry>(_solid_topic + "/trans_odom", 1);
         _pub_loop_info_global = create_publisher<liorf::msg::LoopConstraint>(
                 _solid_topic + "/loop_info_global", 1);
+        _pub_scan_request = create_publisher<liorf::msg::ScanRequest>(
+                _solid_topic + "/scan_request", 20);
+        _pub_scan_data = create_publisher<liorf::msg::ScanData>(
+                _solid_topic + "/scan_data", 20);
 
+        // Resends timed-out scan requests, drops candidates whose scans never
+        // arrived, and reports what the link is costing.
+        _comms_maintenance_timer = create_wall_timer(
+            std::chrono::duration<double>(_comms_maintenance_period_s),
+            std::bind(&MapFusion::commsMaintenance, this), _callback_group);
+
+    }
+
+    // Drains one peer's announcement backlog, oldest first.
+    //
+    // The backlog is FIFO rather than the previous newest-first stack: with a
+    // bounded queue, taking from the newest end starves the tail permanently,
+    // and dropping is already handled at the bounded queue's oldest end.
+    void publishPendingAnnouncements(
+        const std::string & peer_id,
+        int peer_id_th,
+        bool peer_signal,
+        std::mutex & queue_mutex,
+        liorf::comms::BoundedQueue<SOLiDBin> & queue)
+    {
+        if (peer_id.empty() || !_communication_signal || !peer_signal ||
+            _robot_id_th >= peer_id_th)
+            return;
+
+        SOLiDBin bin;
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex);
+            if (!queue.pop(bin))
+                return;
+        }
+        publishContextInfo(bin, peer_id);
     }
 
     void publishContextInfoThread(){
         int signal_id_th_1 = _signal_id_1.empty() ? -1 : robotID2Number(_signal_id_1);
         int signal_id_th_2 = _signal_id_2.empty() ? -1 : robotID2Number(_signal_id_2);
+        // The previous loop had no wait of any kind and spun a core flat out
+        // whenever a peer was idle or the backlog was empty.
+        rclcpp::Rate rate(_announce_rate_hz);
         while (rclcpp::ok())
         {
-            if (!_signal_id_1.empty() && _communication_signal && _signal_1 &&
-                _robot_id_th < signal_id_th_1){
-                if (_context_list_to_publish_1.empty())
-                    continue;
-                //publish solid info to other robots
-                mtx_publish_1.lock();
-                SOLiDBin bin = _context_list_to_publish_1.back();
-                _context_list_to_publish_1.pop_back();
-                mtx_publish_1.unlock();
-                publishContextInfo(bin, _signal_id_1);
-            }
-            if (!_signal_id_2.empty() && _communication_signal && _signal_2 &&
-                _robot_id_th < signal_id_th_2){
-                if (_context_list_to_publish_2.empty())
-                    continue;
-                //publish solid info to other robots
-                mtx_publish_2.lock();
-                SOLiDBin bin = _context_list_to_publish_2.back();
-                _context_list_to_publish_2.pop_back();
-                mtx_publish_2.unlock();
-                publishContextInfo(bin, _signal_id_2);
-
-            }
+            rate.sleep();
+            publishPendingAnnouncements(
+                _signal_id_1, signal_id_th_1, _signal_1,
+                mtx_publish_1, _context_list_to_publish_1);
+            publishPendingAnnouncements(
+                _signal_id_2, signal_id_th_2, _signal_2,
+                mtx_publish_2, _context_list_to_publish_2);
         }
     }
 
@@ -364,6 +439,67 @@ private:
         _pcm_start_threshold = declare_and_get<int>("mapfusion.interRobot.pcm_start_threshold", 5);
         _use_position_search = declare_and_get<bool>("mapfusion.interRobot.use_position_search", false);
 
+        // Communication policy. The descriptor is what the paper exchanges
+        // continuously; a scan moves only when a match has already justified
+        // registration, and every buffer that holds one is bounded.
+        _announce_scans =
+            declare_and_get<bool>("mapfusion.comms.announce_scans", false);
+        _announce_rate_hz =
+            declare_and_get<double>("mapfusion.comms.announce_rate_hz", 10.0);
+        _comms_maintenance_period_s = declare_and_get<double>(
+            "mapfusion.comms.maintenance_period_s", 1.0);
+        _comms_report_period_s = declare_and_get<double>(
+            "mapfusion.comms.report_period_s", 30.0);
+
+        const int max_pending_announcements = declare_and_get<int>(
+            "mapfusion.comms.max_pending_announcements", 100);
+        const int max_cached_scans =
+            declare_and_get<int>("mapfusion.comms.max_cached_scans", 500);
+        const int max_cached_scan_mib =
+            declare_and_get<int>("mapfusion.comms.max_cached_scan_mib", 512);
+        const int max_inflight_requests = declare_and_get<int>(
+            "mapfusion.comms.max_inflight_requests", 8);
+        const int max_request_attempts = declare_and_get<int>(
+            "mapfusion.comms.max_request_attempts", 3);
+        const int max_deferred_candidates = declare_and_get<int>(
+            "mapfusion.comms.max_deferred_candidates", 64);
+        if (max_pending_announcements < 1 || max_cached_scans < 1 ||
+            max_cached_scan_mib < 1 || max_inflight_requests < 1 ||
+            max_request_attempts < 1 || max_deferred_candidates < 1) {
+            throw std::invalid_argument(
+                "mapfusion.comms bounds must all be at least 1");
+        }
+        _comms_config.max_pending_announcements =
+            static_cast<std::size_t>(max_pending_announcements);
+        _comms_config.max_cached_scans =
+            static_cast<std::size_t>(max_cached_scans);
+        _comms_config.max_cached_scan_bytes =
+            static_cast<std::size_t>(max_cached_scan_mib) * 1024u * 1024u;
+        _comms_config.max_inflight_requests =
+            static_cast<std::size_t>(max_inflight_requests);
+        _comms_config.max_request_attempts =
+            static_cast<std::size_t>(max_request_attempts);
+        _comms_config.max_deferred_candidates =
+            static_cast<std::size_t>(max_deferred_candidates);
+        _comms_config.request_timeout_s = declare_and_get<double>(
+            "mapfusion.comms.request_timeout_s", 5.0);
+        _comms_config.max_deferred_age_s = declare_and_get<double>(
+            "mapfusion.comms.max_deferred_age_s", 60.0);
+
+        const std::string comms_error = liorf::comms::validate(_comms_config);
+        if (!comms_error.empty()) {
+            throw std::invalid_argument(
+                "invalid mapfusion.comms configuration: " + comms_error);
+        }
+        if (!std::isfinite(_announce_rate_hz) || _announce_rate_hz <= 0.0 ||
+            !std::isfinite(_comms_maintenance_period_s) ||
+            _comms_maintenance_period_s <= 0.0 ||
+            !std::isfinite(_comms_report_period_s) ||
+            _comms_report_period_s <= 0.0) {
+            throw std::invalid_argument(
+                "mapfusion.comms rates and periods must be finite and positive");
+        }
+
         // Shared with the local mapping node's intra-robot loops so both
         // paths gate on one parameter set. See skid_registration_params.hpp.
         _registration_config = liorf::registration::declareConfig(
@@ -408,6 +544,10 @@ private:
 
         _robot_id_th = robotID2Number(_robot_id);
 
+        // Mirrors the condition guarding the announcement subscription: the
+        // initial robot announces its places but does not fuse maps itself.
+        _performs_fusion = (_robot_id != _robot_initial);
+
         _trans_to_publish.intensity = 0;
 
         _num_bin = 0;//
@@ -416,6 +556,16 @@ private:
         _signal_1 = true;
         _signal_2 = true;
 
+        _context_list_to_publish_1 = liorf::comms::BoundedQueue<SOLiDBin>(
+            _comms_config.max_pending_announcements);
+        _context_list_to_publish_2 = liorf::comms::BoundedQueue<SOLiDBin>(
+            _comms_config.max_pending_announcements);
+        _scan_cache = std::make_unique<liorf::comms::ScanCache>(_comms_config);
+        _scan_requests =
+            std::make_unique<liorf::comms::RequestTracker>(_comms_config);
+        _deferred_candidates =
+            std::make_unique<liorf::comms::DeferredCandidateQueue>(_comms_config);
+        _last_comms_report_s = 0.0;
 
     }
 
@@ -461,19 +611,36 @@ private:
         bin.pose.yaw   =  _cloud_info.initial_guess_yaw;
         bin.pose.intensity = _cloud_info.imu_available;
 
-        bin.cloud->clear();
+        // ptcloud2bin swaps the cloud it is handed into the bin it returns, so
+        // bin.cloud aliases _laser_cloud_sum, which the next scan overwrites in
+        // place. Anything retained past this callback needs its own buffer.
+        bin.cloud.reset(new pcl::PointCloud<PointType>());
         pcl::copyPointCloud(*_laser_cloud_feature,  *bin.cloud);
 
-        //push the bin info into the wait list
-        mtx_publish_1.lock();
-        _context_list_to_publish_1.push_back(bin);
-        mtx_publish_1.unlock();
-        mtx_publish_2.lock();
-        _context_list_to_publish_2.push_back(bin);
-        mtx_publish_2.unlock();
+        // Retain this place's own scan so a peer's request can be answered
+        // later. It shares the one bounded budget with received scans.
+        storeScan(scanKeyOf(bin), bin.cloud);
 
+        // Peers get the descriptor; the scan stays here until asked for.
+        SOLiDBin announcement = bin;
+        if (!_announce_scans)
+            announcement.cloud.reset(new pcl::PointCloud<PointType>());
 
-        publishContextInfo(bin, _robot_id);
+        {
+            std::lock_guard<std::mutex> lock(mtx_publish_1);
+            _context_list_to_publish_1.push(announcement);
+        }
+        {
+            std::lock_guard<std::mutex> lock(mtx_publish_2);
+            _context_list_to_publish_2.push(announcement);
+        }
+
+        // Own places enter the local index directly. Routing them back through
+        // the shared announcement topic would put this robot's own scan on the
+        // link for every peer to receive and discard, which is the cost this
+        // split exists to remove.
+        if (_performs_fusion)
+            run(bin);
 
     }
 
@@ -487,6 +654,62 @@ private:
 
     void signalHandler2(const std_msgs::msg::Bool::ConstSharedPtr& msg){
         _signal_2 = msg->data;
+    }
+
+    double nowSeconds() const { return this->now().seconds(); }
+
+    // The keyframe index a place occupies in its own robot's trajectory.
+    //
+    // The mapping node transports it in the pose intensity channel, which is a
+    // float, so this is exact only below 2^24 keyframes. Every side derives
+    // the identity the same way, so the two ends agree regardless.
+    static std::int64_t keyframeIndexOf(const SOLiDBin & bin) {
+        return static_cast<std::int64_t>(std::llround(bin.pose.intensity));
+    }
+
+    static liorf::comms::ScanKey scanKeyOf(const SOLiDBin & bin) {
+        liorf::comms::ScanKey key;
+        key.robot_id = bin.robotname;
+        key.keyframe_index = keyframeIndexOf(bin);
+        return key;
+    }
+
+    // Payload estimate, not wire size: it counts the point data and the
+    // descriptor but not serialization or transport framing.
+    static std::size_t cloudBytes(const sensor_msgs::msg::PointCloud2 & cloud) {
+        return cloud.data.size();
+    }
+
+    std::size_t announcementBytes(const liorf::msg::ContextInfo & info) const {
+        return cloudBytes(info.scan_cloud) +
+               sizeof(float) * (info.asolid.size() + info.rsolid.size()) +
+               info.robot_id.size() + info.robot_id_receive.size() + 64u;
+    }
+
+    bool haveScan(const liorf::comms::ScanKey & key) const {
+        const auto it = _scans.find(key);
+        return it != _scans.end() && it->second && !it->second->empty();
+    }
+
+    pcl::PointCloud<PointType>::Ptr findScan(
+        const liorf::comms::ScanKey & key) const {
+        const auto it = _scans.find(key);
+        return it == _scans.end() ? nullptr : it->second;
+    }
+
+    // Files a scan and applies the retention policy. The cache decides what
+    // must go; this is the only place scans are added or released.
+    void storeScan(
+        const liorf::comms::ScanKey & key,
+        const pcl::PointCloud<PointType>::Ptr & cloud) {
+        if (!key.valid() || !cloud || cloud->empty())
+            return;
+
+        const std::size_t bytes = cloud->size() * sizeof(PointType);
+        _scans[key] = cloud;
+        for (const auto & evicted : _scan_cache->insert(key, bytes)) {
+            _scans.erase(evicted);
+        }
     }
 
     void publishContextInfo( SOLiDBin bin , std::string robot_to){
@@ -512,6 +735,7 @@ private:
         }
 
         context_info.robot_id_receive = robot_to;
+        context_info.keyframe_index = keyframeIndexOf(bin);
         context_info.pose_x = bin.pose.x;
         context_info.pose_y = bin.pose.y;
         context_info.pose_z = bin.pose.z;
@@ -520,11 +744,219 @@ private:
         context_info.pose_yaw   =  bin.pose.yaw;
         context_info.pose_intensity = bin.pose.intensity;
 
-        context_info.scan_cloud =  publishCloud(_pub_cloud, bin.cloud, sec2Stamp(bin.time), _robot_id + "/" + _solid_frame);
+        // Announcements are descriptor-only by default. The context topic is
+        // shared by every robot, so a cloud attached here is paid for on the
+        // link whether or not the addressee is the one that wanted it; the
+        // scan follows on request instead.
+        if (_announce_scans && bin.cloud) {
+            context_info.scan_cloud = publishCloud(
+                _pub_cloud, bin.cloud, sec2Stamp(bin.time),
+                _robot_id + "/" + _solid_frame);
+        }
+
+        const std::size_t bytes = announcementBytes(context_info);
         mtx.lock();
         _pub_context_info->publish(context_info);
         mtx.unlock();
-//        context_info.SOLiDBin.
+        {
+            std::lock_guard<std::mutex> lock(mtx_stats);
+            _announce_stats.recordSent(bytes);
+        }
+    }
+
+    void publishScanRequest(const liorf::comms::ScanKey & key) {
+        liorf::msg::ScanRequest request;
+        request.header.stamp = this->now();
+        request.header.frame_id = _robot_id;
+        request.robot_id = _robot_id;
+        request.robot_id_receive = key.robot_id;
+        request.keyframe_index = key.keyframe_index;
+        _pub_scan_request->publish(request);
+        {
+            std::lock_guard<std::mutex> lock(mtx_stats);
+            _scan_stats.recordSent(
+                request.robot_id.size() + request.robot_id_receive.size() + 64u);
+        }
+    }
+
+    // Asks a peer for a scan, subject to the in-flight cap and the retry
+    // budget. Returns true when the request is now outstanding.
+    bool requestScan(const liorf::comms::ScanKey & key, double now_s) {
+        if (key.robot_id == _robot_id) {
+            // Our own scan aged out of the cache; no peer can return it.
+            RCLCPP_DEBUG(get_logger(),
+                "Own scan %s is no longer cached and cannot be recovered",
+                key.str().c_str());
+            return false;
+        }
+
+        const liorf::comms::RequestDecision decision =
+            _scan_requests->request(key, now_s);
+        switch (decision) {
+            case liorf::comms::RequestDecision::kSend:
+                publishScanRequest(key);
+                return true;
+            case liorf::comms::RequestDecision::kAlreadyPending:
+                return true;
+            default:
+                RCLCPP_DEBUG(get_logger(), "Scan request for %s not sent: %s",
+                    key.str().c_str(), liorf::comms::toString(decision));
+                return false;
+        }
+    }
+
+    void scanRequestHandler(const liorf::msg::ScanRequest::ConstSharedPtr& msgIn){
+        if (!_communication_signal)
+            return;
+        if (msgIn->robot_id_receive != _robot_id)
+            return;
+
+        liorf::comms::ScanKey key;
+        key.robot_id = _robot_id;
+        key.keyframe_index = msgIn->keyframe_index;
+
+        liorf::msg::ScanData data;
+        data.header.stamp = this->now();
+        data.header.frame_id = _robot_id;
+        data.robot_id = _robot_id;
+        data.robot_id_receive = msgIn->robot_id;
+        data.keyframe_index = msgIn->keyframe_index;
+
+        const pcl::PointCloud<PointType>::Ptr cloud = findScan(key);
+        data.available = cloud && !cloud->empty();
+        if (data.available) {
+            pcl::toROSMsg(*cloud, data.scan_cloud);
+            data.scan_cloud.header.stamp = data.header.stamp;
+            data.scan_cloud.header.frame_id = _robot_id + "/" + _solid_frame;
+            _scan_cache->touch(key);
+        } else {
+            // Saying so explicitly stops the requester burning its retry
+            // budget on a scan this robot no longer holds.
+            RCLCPP_DEBUG(get_logger(),
+                "Scan %s requested by %s is no longer held",
+                key.str().c_str(), msgIn->robot_id.c_str());
+        }
+
+        _pub_scan_data->publish(data);
+        {
+            std::lock_guard<std::mutex> lock(mtx_stats);
+            _scan_stats.recordSent(cloudBytes(data.scan_cloud) + 64u);
+        }
+    }
+
+    void scanDataHandler(const liorf::msg::ScanData::ConstSharedPtr& msgIn){
+        if (!_communication_signal)
+            return;
+        if (msgIn->robot_id_receive != _robot_id)
+            return;
+
+        liorf::comms::ScanKey key;
+        key.robot_id = msgIn->robot_id;
+        key.keyframe_index = msgIn->keyframe_index;
+        if (!key.valid())
+            return;
+
+        const double now_s = nowSeconds();
+        const double latency = _scan_requests->complete(key, now_s);
+        {
+            std::lock_guard<std::mutex> lock(mtx_stats);
+            _scan_stats.recordReceived(cloudBytes(msgIn->scan_cloud) + 64u);
+            if (latency >= 0.0)
+                _scan_stats.recordLatency(latency);
+        }
+
+        if (!msgIn->available) {
+            // The owner cannot supply it, so nothing parked on it can ever
+            // complete. Release those candidates rather than let them age out.
+            _deferred_candidates->release(key);
+            return;
+        }
+
+        pcl::PointCloud<PointType>::Ptr cloud(new pcl::PointCloud<PointType>());
+        pcl::fromROSMsg(msgIn->scan_cloud, *cloud);
+        if (cloud->empty())
+            return;
+        storeScan(key, cloud);
+
+        const auto bin_it = _bin_of_scan_key.find(key);
+        if (bin_it == _bin_of_scan_key.end()) {
+            // The scan arrived before, or without, its descriptor. It is
+            // cached; a later announcement will pick it up.
+            return;
+        }
+
+        bool new_candidate = false;
+        for (const auto & ready : _deferred_candidates->release(key)) {
+            if (!candidateScansHeld(ready.query_bin, ready.candidate_bin))
+                continue;
+            new_candidate =
+                getInitialGuess(
+                    ready.query_bin, ready.candidate_bin, ready.sector_shift) ||
+                new_candidate;
+        }
+        if (new_candidate)
+            optimizeAndPublish();
+    }
+
+    // Periodic upkeep for the scan channel: resend what timed out, abandon
+    // what is past its budget, drop candidates whose scans never arrived, and
+    // report what the link is costing.
+    void commsMaintenance() {
+        const double now_s = nowSeconds();
+
+        const liorf::comms::RequestTracker::Expired expired =
+            _scan_requests->expire(now_s);
+        for (const auto & key : expired.resend)
+            publishScanRequest(key);
+        for (const auto & key : expired.abandoned) {
+            RCLCPP_WARN(get_logger(),
+                "Giving up on scan %s after %zu attempts", key.str().c_str(),
+                _comms_config.max_request_attempts);
+            _deferred_candidates->release(key);
+        }
+        _deferred_candidates->expire(now_s);
+
+        if (now_s - _last_comms_report_s < _comms_report_period_s)
+            return;
+        _last_comms_report_s = now_s;
+
+        std::size_t dropped_1 = 0;
+        std::size_t dropped_2 = 0;
+        {
+            std::lock_guard<std::mutex> lock(mtx_publish_1);
+            dropped_1 = _context_list_to_publish_1.dropped();
+        }
+        {
+            std::lock_guard<std::mutex> lock(mtx_publish_2);
+            dropped_2 = _context_list_to_publish_2.dropped();
+        }
+        std::string announce_summary;
+        std::string scan_summary;
+        {
+            std::lock_guard<std::mutex> lock(mtx_stats);
+            announce_summary = _announce_stats.summary();
+            scan_summary = _scan_stats.summary();
+        }
+
+        RCLCPP_INFO(get_logger(),
+            "comms announcements: %s | scans: %s | cache %zu scans / %.1f MiB "
+            "| requests in flight %zu, retried %zu, abandoned %zu, throttled %zu "
+            "| deferred %zu (dropped %zu, expired %zu) "
+            "| announcement backlog dropped %zu/%zu | cache evictions %zu",
+            announce_summary.c_str(),
+            scan_summary.c_str(),
+            _scan_cache->size(),
+            static_cast<double>(_scan_cache->bytes()) / (1024.0 * 1024.0),
+            _scan_requests->inflight(),
+            _scan_requests->retried(),
+            _scan_requests->abandoned(),
+            _scan_requests->throttled(),
+            _deferred_candidates->size(),
+            _deferred_candidates->dropped(),
+            _deferred_candidates->expired(),
+            dropped_1,
+            dropped_2,
+            _scan_cache->evicted());
     }
 
     void OdomTransHandler(const nav_msgs::msg::Odometry::ConstSharedPtr& odomMsg){
@@ -752,10 +1184,20 @@ private:
         bin.pose.roll  = msgIn->pose_roll;
         bin.pose.pitch = msgIn->pose_pitch;
         bin.pose.yaw   = msgIn->pose_yaw;
-        bin.pose.intensity = msgIn->pose_intensity;
+        // The explicit keyframe index is the place's identity; pose_intensity
+        // carries the same value for the legacy consumers of this message.
+        bin.pose.intensity = static_cast<float>(msgIn->keyframe_index);
 
+        // An announcement may or may not carry its scan. When it does the
+        // scan is filed immediately; when it does not, it is requested only if
+        // a descriptor match turns into a candidate.
         bin.cloud.reset(new pcl::PointCloud<PointType>());
-        pcl::fromROSMsg(msgIn->scan_cloud, *bin.cloud);
+        if (!msgIn->scan_cloud.data.empty())
+            pcl::fromROSMsg(msgIn->scan_cloud, *bin.cloud);
+        {
+            std::lock_guard<std::mutex> lock(mtx_stats);
+            _announce_stats.recordReceived(announcementBytes(*msgIn));
+        }
 
         // SOLiD
         bin.asolid = Eigen::VectorXf::Zero(_num_sectors);
@@ -781,10 +1223,17 @@ private:
         if(_idx_nearest_list.empty() && _use_position_search)
             distanceSearch(bin);
 
-        if(!getInitialGuesses(bin)){
+        if(!getInitialGuesses()){
             return;
         }
 
+        optimizeAndPublish();
+    }
+
+    // Runs once new inter-robot candidates exist, whether they were produced
+    // by an arriving announcement or by a scan that completed a parked
+    // candidate later.
+    void optimizeAndPublish(){
         if(!incrementalPCM()){
             return;
         }
@@ -866,8 +1315,19 @@ private:
 
     void buildKDTree(SOLiDBin bin){
         _num_bin++;
+
+        // The scan store owns point clouds; the bin keeps the descriptor and
+        // pose. Keeping both would give one cloud two lifetimes, only one of
+        // which the retention policy controls.
+        const liorf::comms::ScanKey key = scanKeyOf(bin);
+        if (bin.cloud && !bin.cloud->empty())
+            storeScan(key, bin.cloud);
+        bin.cloud.reset(new pcl::PointCloud<PointType>());
+
         //store data received
         _bin_with_id.emplace( std::make_pair(_num_bin-1, bin) );
+        if (key.valid())
+            _bin_of_scan_key[key] = _num_bin - 1;
 
         PointType tmp_pose;
         tmp_pose.x = bin.pose.x; tmp_pose.y = bin.pose.y; tmp_pose.z = bin.pose.z;
@@ -959,20 +1419,88 @@ private:
         idx_list.clear();
     }
 
-    bool getInitialGuesses(SOLiDBin bin){
+    // True when both scans behind a candidate are held right now.
+    bool candidateScansHeld(int query_bin, int candidate_bin) const {
+        const auto query = _bin_with_id.find(query_bin);
+        const auto candidate = _bin_with_id.find(candidate_bin);
+        if (query == _bin_with_id.end() || candidate == _bin_with_id.end())
+            return false;
+        return haveScan(scanKeyOf(query->second)) &&
+               haveScan(scanKeyOf(candidate->second));
+    }
+
+    // Ensures both scans behind a candidate are available, asking for what is
+    // missing and parking the candidate until it arrives.
+    //
+    // Returns true only when the candidate can be registered immediately.
+    bool ensureCandidateScans(int query_bin, int candidate_bin, int min_idx,
+                              double now_s) {
+        const auto query = _bin_with_id.find(query_bin);
+        const auto candidate = _bin_with_id.find(candidate_bin);
+        if (query == _bin_with_id.end() || candidate == _bin_with_id.end())
+            return false;
+
+        std::vector<liorf::comms::ScanKey> missing;
+        for (const SOLiDBin * bin : {&query->second, &candidate->second}) {
+            const liorf::comms::ScanKey key = scanKeyOf(*bin);
+            if (!key.valid())
+                return false;
+            if (haveScan(key)) {
+                _scan_cache->touch(key);
+                continue;
+            }
+            missing.push_back(key);
+        }
+        if (missing.empty())
+            return true;
+
+        bool every_request_outstanding = true;
+        for (const auto & key : missing)
+            every_request_outstanding =
+                requestScan(key, now_s) && every_request_outstanding;
+        if (!every_request_outstanding) {
+            // Nothing will arrive for at least one of these scans, so parking
+            // the candidate would only occupy a slot until it aged out.
+            return false;
+        }
+
+        liorf::comms::DeferredCandidate deferred;
+        deferred.query_bin = query_bin;
+        deferred.candidate_bin = candidate_bin;
+        deferred.sector_shift = min_idx;
+        deferred.parked_at_s = now_s;
+        deferred.missing = std::move(missing);
+        _deferred_candidates->park(std::move(deferred));
+        return false;
+    }
+
+    bool getInitialGuesses(){
         if(_idx_nearest_list.size() == 0){
             return false;
         }
+        const int query_bin = _num_bin - 1;
+        const double now_s = nowSeconds();
         bool new_candidate_signal = false;
         for (auto it: _idx_nearest_list){
-            new_candidate_signal = getInitialGuess(bin, it.first, it.second);
+            if (!ensureCandidateScans(query_bin, it.first, it.second, now_s))
+                continue;
+            // Evaluated first so every candidate is attempted, not just the
+            // last one: the previous assignment discarded earlier results.
+            new_candidate_signal =
+                getInitialGuess(query_bin, it.first, it.second) ||
+                new_candidate_signal;
         }
         return new_candidate_signal;
     }
 
-    bool getInitialGuess(SOLiDBin bin, int idx_nearest, int min_idx){
+    bool getInitialGuess(int query_bin, int idx_nearest, int min_idx){
 
-        int id0 = idx_nearest, id1 = _num_bin - 1;
+        const auto query_it = _bin_with_id.find(query_bin);
+        if (query_it == _bin_with_id.end())
+            return false;
+        SOLiDBin bin = query_it->second;
+
+        int id0 = idx_nearest, id1 = query_bin;
 
         SOLiDBin bin_nearest;
         PointTypePose source_pose_initial, target_pose;
@@ -996,7 +1524,7 @@ private:
             bin_nearest = bin;
             bin = _bin_with_id.at(idx_nearest);
 
-            id0 = _num_bin - 1;
+            id0 = query_bin;
             id1 = idx_nearest;
 
             solid_pitch = -solid_pitch;
@@ -1040,9 +1568,22 @@ private:
             source_pose_initial.z =  target_pose.z;
         }
 
+        const pcl::PointCloud<PointType>::Ptr source_scan =
+            findScan(scanKeyOf(bin));
+        const pcl::PointCloud<PointType>::Ptr target_scan =
+            findScan(scanKeyOf(bin_nearest));
+        if (!source_scan || source_scan->empty() ||
+            !target_scan || target_scan->empty()) {
+            // Evicted between being requested and being used.
+            RCLCPP_DEBUG(get_logger(),
+                "Candidate %d -> %d dropped: a scan is no longer held",
+                id0, id1);
+            return false;
+        }
+
         const RegistrationOutput registered = registerRelativeMotion(
-            transformPointCloud(bin.cloud, &source_pose_initial),
-            transformPointCloud(bin_nearest.cloud, &target_pose),
+            transformPointCloud(source_scan, &source_pose_initial),
+            transformPointCloud(target_scan, &target_pose),
             source_pose_initial);
 
         if (!registered.valid)

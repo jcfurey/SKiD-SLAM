@@ -316,4 +316,4 @@ Newly opened by this session:
 | Commit | Contents |
 |---|---|
 | `680e941` | Unify intra- and inter-robot loop closure on the paper pipeline |
-| this commit | Restore the retained Scan Context and vendored headers; add this change record |
+| `b3aa857` | Restore the retained Scan Context and vendored headers; add this change record |

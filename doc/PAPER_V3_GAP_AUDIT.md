@@ -2,7 +2,7 @@
 
 Status: living audit and implementation record for the `v3` branch
 
-Last updated: 1 September 2026 (intra-robot pipeline reuse)
+Last updated: 1 September 2026 (intra-robot pipeline reuse; bounded on-demand communications)
 
 Audit baseline: commit `475b59f`, before the paper-registration work below.
 The gap table records that baseline so the provenance problem remains visible;
@@ -11,6 +11,14 @@ the implementation-status section records what has since been restored.
 Paper: `2505.08230v3`, *SKiD-SLAM: Robust, Lightweight, and
 Distributed Multi-Robot LiDAR SLAM in Resource-Constrained Field
 Environments* (30 July 2025)
+
+## Change records
+
+Per-change records, each with the decisions behind it and its verification
+boundary:
+
+- [`UNIFIED_LOOP_CLOSURE_CHANGE_RECORD.md`](UNIFIED_LOOP_CLOSURE_CHANGE_RECORD.md)
+- [`BOUNDED_COMMUNICATIONS_CHANGE_RECORD.md`](BOUNDED_COMMUNICATIONS_CHANGE_RECORD.md)
 
 ## Executive summary
 
@@ -40,6 +48,8 @@ contract, and contains correctness issues that need tests and reimplementation.
 - ROS 2 Jazzy/Lyrical build and launch support.
 - RESPLE/X-ICP-inspired observable-subspace local scan matching.
 - REP-105 local frame separation and optional ECEF geographic anchoring.
+- Descriptor-only announcements with on-demand scan transfer, bounded queues
+  and caches, and byte/latency reporting.
 
 The last two items are post-paper extensions and should be retained while
 paper parity is restored.
@@ -119,9 +129,23 @@ nodes were not compiled or run. The node-level changes still need a ROS 2
 Lyrical build and a bag replay before the intra-robot claims above can be
 called measured rather than implemented.
 
-The remaining P1/P2 work is Equation (6) keyframe-state semantics,
-bounded/on-demand communications, field configurations, ZeroMQ deployment
-documentation, and the paper evaluation harness.
+The communication path is now bounded and on-demand:
+
+- Announcements carry the SOLiD descriptor only. A scan crosses the link when a
+  descriptor match has already justified attempting registration, requested
+  through `ScanRequest` and returned through `ScanData`.
+- Every buffer that can hold a scan is bounded: the per-peer announcement
+  backlog, the scan cache (by both entry count and total bytes), the
+  outstanding-request set, and the candidates parked waiting for a scan.
+- Requests have an in-flight cap, a timeout, a bounded retry budget, and an
+  explicit abandoned state. An owner that no longer holds a scan says so
+  instead of letting the requester spend its budget.
+- Bytes, message counts, and round-trip latency are reported for both channels,
+  alongside drop, eviction, retry, and abandonment counters.
+
+The remaining P1/P2 work is Equation (6) keyframe-state semantics, field
+configurations, ZeroMQ deployment documentation, and the paper evaluation
+harness.
 
 ### Registration covariance model
 
@@ -223,9 +247,9 @@ than a tighter one. Per-dataset calibration is still outstanding.
 | P0 | Delivery of accepted loop factors | Implemented with one parameter-derived topic and typed `LoopConstraint` publisher/subscriber contract. | Add a launch-level two-node delivery test. |
 | P1 | One SOLiD/registration pipeline for inter- and intra-robot loops | Implemented. Intra-robot loops are detected with SOLiD and registered and gated by the same module map fusion uses; the descriptor distance and the registration parameter set are single-sourced. Map fusion still skips same-robot candidates, which is now the correct division of work rather than a gap. | Calibrate the intra-robot gates on field data and add a bag-level comparison against the Scan Context baseline. |
 | P1 | Distributed keyframe PGO matching Equation 6 | Partial approximation. The factor transport is now typed and covariance-aware, but map fusion still optimizes one `Pose3` per robot/map while each robot owns a separate keyframe graph. | Represent direct cross-robot keyframe factors and the relevant remote trajectory subset explicitly, or document and validate an equivalent distributed formulation. |
-| P1 | Lightweight message pool | A simple pair of unbounded per-peer vectors is used. Every descriptor message also embeds the complete feature cloud, and received clouds are retained indefinitely. | Separate descriptor announcements from on-demand scan transfer, bound queues/caches, define retry/backpressure behavior, and report bytes and latency. |
+| P1 | Lightweight message pool | Implemented. Announcements are descriptor-only; scans transfer on request. Announcement backlogs, the scan cache, outstanding requests, and parked candidates are all bounded, with defined retry, backpressure, and abandonment behaviour, and byte/latency reporting on both channels. | Measure the achieved bandwidth and latency on field bags and calibrate the cache budget against the datasets' revisit horizons. |
 | P1 | Meaningful inter-robot uncertainty | Implemented for the SOLiD paper pipeline: Hessian-shaped, physically calibrated full covariance is propagated through PCM, map alignment, the typed loop message, and the GTSAM factor. | Calibrate on field data and extend trajectory uncertainty beyond the configured PCM floor. |
-| P2 | ROS + ZeroMQ field communication setup (Section VI-B) | No ZeroMQ transport or reproducible network setup is present. | Add an optional transport adapter or document the external component used by the paper. |
+| P2 | ROS + ZeroMQ field communication setup (Section VI-B) | No ZeroMQ transport or reproducible network setup is present. The message contract is now transport-agnostic: announcements and scans are separate, bounded topics, so a bridge carries descriptors and scans independently. | Add an optional transport adapter or document the external component used by the paper. |
 | P2 | Paper dataset configurations | GEODE, GRACO, Majang, Moon, Park, and STEAM configs from `0611f71` are absent. | Port them to ROS 2 parameters and add sensor/topic validation. Add cave and planetary field configs if the data are available. |
 | P2 | Paper evaluation harness | No reproducible PR, RTE/RRE, success-rate, ATE/ARE, descriptor-memory, or communication-latency pipeline is included. | Add scripts, manifests, ground-truth conventions, and expected result summaries. |
 | P2 | Pipeline test coverage | Unit coverage now includes coarse-to-fine registration, truncated MSE, covariance, SE(3) PCM propagation, message conversion, SOLiD descriptor construction, descriptor retrieval, and the shared registration parameter contract, in addition to frame tests. | Add topic/launch routing, failure injection, and multi-robot graph tests. |
@@ -255,8 +279,15 @@ than a tighter one. Per-dataset calibration is still outstanding.
   covariance-weighted factor construction.
 - `src/liorf-DiSO/mapFusion_so.cpp`, `KNNSearch()`: candidates from the same
   robot are discarded, because the local node now owns them.
-- `src/liorf-DiSO/mapFusion_so.cpp`, `publishContextInfo()`: the entire feature
-  cloud is serialized into every context message.
+- `include/skid_comms.hpp`, `src/skid_comms.cpp`: the bounded announcement
+  queue, scan-cache retention policy, request tracker, deferred-candidate
+  store, and transfer accounting.
+- `msg/ScanRequest.msg`, `msg/ScanData.msg`: the on-demand scan channel.
+- `src/liorf-DiSO/mapFusion_so.cpp`, `publishContextInfo()`: announcements
+  carry the descriptor; the scan is omitted unless
+  `mapfusion.comms.announce_scans` is set.
+- `src/liorf-DiSO/mapFusion_so.cpp`, `ensureCandidateScans()`,
+  `scanDataHandler()`: candidates park until the scans they need arrive.
 - `src/liorf-DiSO/mapFusion_so.cpp`, `gtsamFactorGraph()`: graph keys are robot
   numeric identifiers, not the keyframe states in the paper's Equation 6.
 - `third_party/` and `CMakeLists.txt`: KISS-Matcher, Small-GICP, ROBIN, PMC,
@@ -330,8 +361,8 @@ Items 1-3 are complete; item 4 is partially complete:
 
 ### Phase 4: resource and evaluation parity
 
-1. Split descriptor announcements from requested scan payloads.
-2. Bound all queues and scan caches.
+1. **Completed:** split descriptor announcements from requested scan payloads.
+2. **Completed:** bound all queues and scan caches.
 3. Restore ROS 2 field configurations and dataset manifests.
 4. Reproduce the paper's place-recognition, registration, mapping, memory, and
    communication metrics.

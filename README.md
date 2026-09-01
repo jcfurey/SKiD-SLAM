@@ -181,6 +181,12 @@ DiSO FEATURES
   parameters live once under `mapfusion.solid`, and the registration
   parameters are declared from one shared helper, so the two loop types cannot
   drift apart.
+- Exchanges SOLiD descriptors continuously and moves a feature scan only when
+  a descriptor match has already justified attempting registration. Every
+  buffer that can hold a scan is bounded, requests have defined retry and
+  backpressure behaviour, and both channels report bytes and round-trip
+  latency. See
+  [`doc/BOUNDED_COMMUNICATIONS_CHANGE_RECORD.md`](doc/BOUNDED_COMMUNICATIONS_CHANGE_RECORD.md).
 - Propagates a physically dimensioned, Hessian-shaped 6-DoF covariance through
   Mahalanobis PCM and a typed loop-constraint message into GTSAM. Intra-robot
   loops carry the same covariance into their pose-graph factor, optionally

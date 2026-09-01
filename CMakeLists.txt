@@ -163,6 +163,8 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/CloudInfo.msg"
   "msg/ContextInfo.msg"
   "msg/LoopConstraint.msg"
+  "msg/ScanRequest.msg"
+  "msg/ScanData.msg"
   "srv/SaveMap.srv"
   DEPENDENCIES std_msgs geometry_msgs nav_msgs sensor_msgs
 )
@@ -227,6 +229,12 @@ target_include_directories(skid_pose_uncertainty PUBLIC
 )
 target_link_libraries(skid_pose_uncertainty PUBLIC Eigen3::Eigen gtsam)
 
+# Bounded communication policy for the distributed map-fusion node.
+add_library(skid_comms STATIC src/skid_comms.cpp)
+target_include_directories(skid_comms PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+)
+
 # SOLiD place recognition shared by intra- and inter-robot loop detection.
 add_library(skid_loop_detection STATIC src/skid_loop_detection.cpp)
 target_include_directories(skid_loop_detection PUBLIC
@@ -270,7 +278,7 @@ ament_auto_add_executable(${PROJECT_NAME}_mapFusion src/liorf-DiSO/mapFusion_so.
 target_link_libraries(${PROJECT_NAME}_mapFusion
   ${cpp_typesupport_target} ${PCL_LIBRARIES} ${NABO_LIBRARIES}
   gtsam fast_max-clique_finder solid skid_registration skid_pose_uncertainty
-  skid_loop_detection)
+  skid_loop_detection skid_comms)
 
 # Map Fusion (Scan Context)
 ament_auto_add_executable(${PROJECT_NAME}_mapFusionSC src/liorf-DiSO/mapFusion_sc.cpp)
@@ -319,6 +327,10 @@ if(BUILD_TESTING)
   ament_add_gtest(test_skid_registration_params
     test/test_skid_registration_params.cpp)
   target_link_libraries(test_skid_registration_params skid_registration)
+
+  ament_add_gtest(test_skid_comms
+    test/test_skid_comms.cpp)
+  target_link_libraries(test_skid_comms skid_comms)
 endif()
 
 #############

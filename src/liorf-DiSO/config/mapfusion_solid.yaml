@@ -36,6 +36,38 @@
             robot_initial: jackal0
             use_position_search: false #use position search may introduce more global loop closure, but spend more time for candidate checking
 
+        comms:
+            # Descriptor announcements are continuous; scans move only when a
+            # descriptor match has justified attempting registration. Set
+            # announce_scans true to restore the older behaviour of attaching
+            # every feature cloud to every announcement.
+            announce_scans: false
+            # One announcement per peer per tick, so this must exceed the
+            # keyframe rate or the backlog below will start dropping places.
+            announce_rate_hz: 10.0
+            maintenance_period_s: 1.0
+            report_period_s: 30.0
+
+            # Announcements held per peer while its link is down. Beyond this
+            # the oldest is dropped, so a long outage costs recent places
+            # rather than unbounded memory.
+            max_pending_announcements: 100
+
+            # Retained scans, own and received, under one budget. These bound
+            # memory at the cost of no longer being able to register a revisit
+            # of a place that has aged out.
+            max_cached_scans: 500
+            max_cached_scan_mib: 512
+
+            # Backpressure on scan requests.
+            max_inflight_requests: 8
+            request_timeout_s: 5.0
+            max_request_attempts: 3
+
+            # Candidates waiting for a scan to arrive.
+            max_deferred_candidates: 64
+            max_deferred_age_s: 60.0
+
         registration:
             # KISS-Matcher coarse global alignment.
             coarse_voxel_size_m: 2.0
