@@ -87,7 +87,9 @@ private:
 };
 
 //circShift from https://github.com/irapkaist/SC-LeGO-LOAM
-Eigen::MatrixXf circShift( Eigen::MatrixXf &_mat, int _num_shift )
+// inline: defined in a header, so every translation unit that includes it
+// would otherwise emit its own definition and the link fails.
+inline Eigen::MatrixXf circShift( Eigen::MatrixXf &_mat, int _num_shift )
 {
     // shift columns to right direction 
     assert(_num_shift >= 0);

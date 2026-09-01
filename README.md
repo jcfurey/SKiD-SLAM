@@ -91,6 +91,14 @@ the compiler being OOM-killed.
   previously both robots advertised the same name in a multi-robot session.
 * `imuPreintegration` hosts two nodes in one process, so the launch file remaps
   their names individually rather than with a process-wide `name=`.
+* The build uses `ament_cmake_auto`, so ROS dependencies are declared once in
+  `package.xml` and wired into the targets automatically. Dependencies whose
+  CMake package name differs from the rosdep key (GTSAM, Eigen3, PCL, OpenCV,
+  GeographicLib, Boost) cannot be resolved that way and are still found and
+  linked explicitly in `CMakeLists.txt`. Note that
+  `ament_auto_find_build_dependencies()` skips anything it fails to find, so
+  the ROS packages are passed as `REQUIRED` to turn a missing one into a
+  configure error rather than a confusing compile failure.
 
  <p align='center'>
       <img src="./demo/multi-2023-11-01_21.15.36.gif" alt="drawing" width="800" height = "400"/>

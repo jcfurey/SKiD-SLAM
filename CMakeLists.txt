@@ -11,30 +11,38 @@ set(CMAKE_CXX_FLAGS_RELEASE "-O3 -g")
 
 add_compile_options(-Wall -pthread)
 
-# ament / ROS 2
-find_package(ament_cmake REQUIRED)
-find_package(rosidl_default_generators REQUIRED)
-find_package(rclcpp REQUIRED)
-find_package(std_msgs REQUIRED)
-find_package(sensor_msgs REQUIRED)
-find_package(geometry_msgs REQUIRED)
-find_package(nav_msgs REQUIRED)
-find_package(visualization_msgs REQUIRED)
-find_package(tf2 REQUIRED)
-find_package(tf2_ros REQUIRED)
-find_package(tf2_eigen REQUIRED)
-find_package(tf2_geometry_msgs REQUIRED)
-find_package(pcl_conversions REQUIRED)
-find_package(cv_bridge REQUIRED)
+# ament_cmake_auto discovers every ROS dependency declared in package.xml and
+# wires their include directories and libraries into the targets below, so the
+# dependency list lives in exactly one place. Names passed as REQUIRED fail the
+# configure step when missing; anything else is skipped silently, which is why
+# the packages below are listed explicitly.
+find_package(ament_cmake_auto REQUIRED)
+ament_auto_find_build_dependencies(REQUIRED
+  rclcpp
+  std_msgs
+  sensor_msgs
+  geometry_msgs
+  nav_msgs
+  visualization_msgs
+  tf2
+  tf2_ros
+  tf2_eigen
+  tf2_geometry_msgs
+  pcl_conversions
+  cv_bridge
+  libnabo
+  rosidl_default_generators
+)
 
-# third party
+# Dependencies whose CMake package name differs from the rosdep key in
+# package.xml (GTSAM vs gtsam, Eigen3 vs eigen, ...), so ament_auto cannot
+# resolve them. These are found and linked explicitly.
 find_package(OpenMP REQUIRED)
 find_package(PCL REQUIRED QUIET)
 find_package(OpenCV REQUIRED QUIET)
 find_package(GTSAM REQUIRED QUIET)
 find_package(Eigen3 REQUIRED)
 find_package(Boost REQUIRED COMPONENTS timer)
-find_package(libnabo REQUIRED)
 
 set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "/usr/share/cmake/geographiclib/")
 find_package(GeographicLib REQUIRED)
@@ -62,24 +70,9 @@ rosidl_generate_interfaces(${PROJECT_NAME}
 )
 rosidl_get_typesupport_target(cpp_typesupport_target ${PROJECT_NAME} "rosidl_typesupport_cpp")
 
-set(ROS_DEPENDENCIES
-  rclcpp
-  std_msgs
-  sensor_msgs
-  geometry_msgs
-  nav_msgs
-  visualization_msgs
-  tf2
-  tf2_ros
-  tf2_eigen
-  tf2_geometry_msgs
-  pcl_conversions
-  cv_bridge
-)
-
+# ament_auto_add_* already puts ``include`` on the include path.
 include_directories(
   lib
-  include
   ${PCL_INCLUDE_DIRS}
   ${OpenCV_INCLUDE_DIRS}
   ${GTSAM_INCLUDE_DIRS}
@@ -98,8 +91,12 @@ file(GLOB common_lib "lib/*.cpp")
 ## Build ##
 ###########
 
-# Maximum Clique Solver (used by the map fusion node)
-add_library(fast_max-clique_finder
+# Static so the executables stay self-contained; ament_auto links every library
+# added here into every executable, and an archive contributes nothing to a
+# binary that does not reference it.
+
+# Maximum Clique Solver (used by the map fusion nodes)
+ament_auto_add_library(fast_max-clique_finder STATIC
   src/liorf-DiSO/third_parties/fast_max-clique_finder/src/findClique.cpp
   src/liorf-DiSO/third_parties/fast_max-clique_finder/src/findCliqueHeu.cpp
   src/liorf-DiSO/third_parties/fast_max-clique_finder/src/utils.cpp
@@ -107,48 +104,41 @@ add_library(fast_max-clique_finder
 )
 target_compile_options(fast_max-clique_finder PRIVATE -w)
 
-add_library(solid
+ament_auto_add_library(solid STATIC
   src/liorf-DiSO/third_parties/SOLiD/solid.cpp
 )
-ament_target_dependencies(solid pcl_conversions sensor_msgs)
 target_link_libraries(solid ${PCL_LIBRARIES})
 
-add_library(scan_context
+ament_auto_add_library(scan_context STATIC
   src/liorf-DiSO/third_parties/scanContext/scanContext.cpp
 )
-ament_target_dependencies(scan_context pcl_conversions sensor_msgs)
 target_link_libraries(scan_context ${PCL_LIBRARIES})
 
 # <!-- liorf_yjz_lucky_boy -->
 # Range Image Projection
-add_executable(${PROJECT_NAME}_imageProjection src/imageProjection.cpp ${common_lib})
-ament_target_dependencies(${PROJECT_NAME}_imageProjection ${ROS_DEPENDENCIES})
+ament_auto_add_executable(${PROJECT_NAME}_imageProjection src/imageProjection.cpp ${common_lib})
 target_link_libraries(${PROJECT_NAME}_imageProjection
   ${cpp_typesupport_target} ${PCL_LIBRARIES} ${OpenCV_LIBRARIES})
 
 # Mapping Optimization
-add_executable(${PROJECT_NAME}_mapOptmization src/mapOptmization.cpp ${common_lib} include/Scancontext.cpp)
-ament_target_dependencies(${PROJECT_NAME}_mapOptmization ${ROS_DEPENDENCIES})
+ament_auto_add_executable(${PROJECT_NAME}_mapOptmization src/mapOptmization.cpp ${common_lib} include/Scancontext.cpp)
 target_link_libraries(${PROJECT_NAME}_mapOptmization
   ${cpp_typesupport_target} ${PCL_LIBRARIES} ${OpenCV_LIBRARIES} OpenMP::OpenMP_CXX
   ${GeographicLib_LIBRARIES} gtsam)
 
 # IMU Preintegration
-add_executable(${PROJECT_NAME}_imuPreintegration src/imuPreintegration.cpp ${common_lib})
-ament_target_dependencies(${PROJECT_NAME}_imuPreintegration ${ROS_DEPENDENCIES})
+ament_auto_add_executable(${PROJECT_NAME}_imuPreintegration src/imuPreintegration.cpp ${common_lib})
 target_link_libraries(${PROJECT_NAME}_imuPreintegration
   ${cpp_typesupport_target} ${PCL_LIBRARIES} ${OpenCV_LIBRARIES} gtsam)
 
 # Map Fusion (SOLiD)
-add_executable(${PROJECT_NAME}_mapFusion src/liorf-DiSO/mapFusion_so.cpp)
-ament_target_dependencies(${PROJECT_NAME}_mapFusion ${ROS_DEPENDENCIES})
+ament_auto_add_executable(${PROJECT_NAME}_mapFusion src/liorf-DiSO/mapFusion_so.cpp)
 target_link_libraries(${PROJECT_NAME}_mapFusion
   ${cpp_typesupport_target} ${PCL_LIBRARIES} ${NABO_LIBRARIES}
   gtsam fast_max-clique_finder solid)
 
 # Map Fusion (Scan Context)
-add_executable(${PROJECT_NAME}_mapFusionSC src/liorf-DiSO/mapFusion_sc.cpp)
-ament_target_dependencies(${PROJECT_NAME}_mapFusionSC ${ROS_DEPENDENCIES})
+ament_auto_add_executable(${PROJECT_NAME}_mapFusionSC src/liorf-DiSO/mapFusion_sc.cpp)
 target_link_libraries(${PROJECT_NAME}_mapFusionSC
   ${cpp_typesupport_target} ${PCL_LIBRARIES} ${NABO_LIBRARIES}
   gtsam fast_max-clique_finder scan_context)
@@ -157,31 +147,16 @@ target_link_libraries(${PROJECT_NAME}_mapFusionSC
 ## Install ##
 #############
 
-install(TARGETS
-  ${PROJECT_NAME}_imageProjection
-  ${PROJECT_NAME}_mapOptmization
-  ${PROJECT_NAME}_imuPreintegration
-  ${PROJECT_NAME}_mapFusion
-  ${PROJECT_NAME}_mapFusionSC
-  DESTINATION lib/${PROJECT_NAME}
-)
-
-install(TARGETS fast_max-clique_finder solid scan_context
-  ARCHIVE DESTINATION lib
-  LIBRARY DESTINATION lib
-  RUNTIME DESTINATION bin
-)
-
+# Not INSTALL_TO_SHARE: config/doc holds the README media and must be excluded.
 install(DIRECTORY launch config src/liorf-DiSO/config
   DESTINATION share/${PROJECT_NAME}
   PATTERN "doc" EXCLUDE
 )
 
-install(DIRECTORY include/
-  DESTINATION include/${PROJECT_NAME}
-)
+# Runtime dependency of the generated interfaces; it is an exec_depend, so
+# ament_auto_package() does not pick it up on its own.
+ament_export_dependencies(rosidl_default_runtime)
 
-ament_export_include_directories(include)
-ament_export_dependencies(rosidl_default_runtime ${ROS_DEPENDENCIES})
-
-ament_package()
+# ament_auto_package installs the executables to lib/${PROJECT_NAME}, the
+# libraries to lib, and the headers to include/${PROJECT_NAME}.
+ament_auto_package(USE_SCOPED_HEADER_INSTALL_DIR)
