@@ -2,7 +2,7 @@
 
 Session date: 1 September 2026
 
-Branch: `claude/v3-paper-parity-wha23w`
+Original branch: `claude/v3-paper-parity-wha23w`; continued on `v3`
 
 Session baseline: commit `d205d92`, *Propagate registration uncertainty through
 loop factors*
@@ -19,6 +19,7 @@ what the whole session leaves unverified.
 | [`UNIFIED_LOOP_CLOSURE_CHANGE_RECORD.md`](UNIFIED_LOOP_CLOSURE_CHANGE_RECORD.md) | P1 — One SOLiD/registration pipeline for inter- and intra-robot loops |
 | [`BOUNDED_COMMUNICATIONS_CHANGE_RECORD.md`](BOUNDED_COMMUNICATIONS_CHANGE_RECORD.md) | P1 — Lightweight message pool |
 | [`MAP_ALIGNMENT_UNCERTAINTY_CHANGE_RECORD.md`](MAP_ALIGNMENT_UNCERTAINTY_CHANGE_RECORD.md) | P1 — Distributed keyframe PGO matching Equation 6 (partial) |
+| [`DISTRIBUTED_KEYFRAME_GRAPH_CHANGE_RECORD.md`](DISTRIBUTED_KEYFRAME_GRAPH_CHANGE_RECORD.md) | P1 — Direct factors and sparse remote keyframes for Equations 6 and 7 |
 | [`EVALUATION_HARNESS_CHANGE_RECORD.md`](EVALUATION_HARNESS_CHANGE_RECORD.md) | P2 — Paper dataset configurations, and the evaluation harness |
 | [`FIELD_COMMUNICATION_CHANGE_RECORD.md`](FIELD_COMMUNICATION_CHANGE_RECORD.md) | P2 — ROS + ZeroMQ field communication setup |
 
@@ -37,6 +38,8 @@ what the whole session leaves unverified.
 | `90aa278` | Record the evaluation harness commit hash |
 | `b71198b` | Add the ZeroMQ peer transport and inter-robot bridge |
 | `e38dfd8` | Record the field communication commit hash |
+| `b41a338` | Prepare pose graph for remote keyframe states |
+| `d0ac2e7` | Implement direct distributed keyframe factors |
 
 ## Audit movement
 
@@ -50,8 +53,10 @@ what the whole session leaves unverified.
 | P2 — ROS + ZeroMQ field communication | Absent | Implemented; bridge unbuilt |
 | P2 — Pipeline test coverage | Registration and frames only | Ten suites |
 
-One parity item remains: **remote keyframe variables** for full Equation (6)
-parity, blocked on the symbol-space refactor named in the audit.
+At the close of the original 1 September session, one structural parity item
+remained: **remote keyframe variables**, blocked on the symbol-space refactor
+named in the audit. The 2 September continuation below records its
+implementation and the fidelity work that replaces it as the open boundary.
 
 ## New components
 
@@ -160,15 +165,50 @@ noise bounds were being clamped. Closures continued to be accepted, but those
 warnings are field-calibration debt and should be resolved before treating the
 run as an accuracy result.
 
+### Post-session Equation (6) implementation — 2 September 2026
+
+The symbol-space blocker was removed in `b41a338`: every locally owned pose
+factor now uses an explicit GTSAM `X(index)` key, newest-pose lookups use the
+known local key, and pose correction iterates the local keyframe count rather
+than every value in iSAM2. This allows remote values to coexist without being
+mistaken for local point-cloud indices.
+
+Commit `d0ac2e7` then changed the default map-fusion route from algebraically
+eliminated local-only loops to direct PCM-approved cross-robot factors. The
+loop contract names both robot/keyframe endpoints and carries each endpoint's
+pose in its owner's map. Every recipient keeps the Equation (7) subset of peer
+poses in a separate symbol namespace and connects those observations with a
+sparse owner-frame relative-motion tree. Registration factors retain their
+full covariance; peer-motion edges have separately configured uncertainty
+floors. Initial values derived from a registration are seeds, not duplicate
+priors. Reversed endpoint reports are canonicalized so the same physical
+measurement cannot be counted twice.
+
+The full `liorf` package rebuilt on ROS 2 Lyrical, including both modified
+nodes and the ZeroMQ bridge. All 13 non-socket CTest targets pass, and all 25
+ZeroMQ transport cases pass with loopback access. The graph suite includes a
+solver-level two-robot correction test plus key-space, sparse-trajectory,
+orientation, and deduplication cases.
+
+The parent workspace's new synthetic HelmDyn08/09 launcher is suitable for the
+next integration check, but its documented derived
+`HelmDyn08_09_two_robot_v1` bag is not present on the mounted dataset. It was
+not regenerated implicitly because the provenance-preserving artifact is
+approximately 1.1 GiB. Live two-pipeline factor delivery, RViz behaviour, and
+trajectory accuracy therefore remain unclaimed.
+
+The exact graph semantics, map/Earth separation, compatibility behaviour, and
+remaining fidelity limits are in
+[`DISTRIBUTED_KEYFRAME_GRAPH_CHANGE_RECORD.md`](DISTRIBUTED_KEYFRAME_GRAPH_CHANGE_RECORD.md).
+
 ## Suggested next steps
 
-1. Record a multi-robot bag with `LoopDiagnostic`, extract candidate and
-   registration CSVs, and validate their ground-truth conventions.
+1. Generate or provide the provenance-preserving HelmDyn08/09 derived bag,
+   replay both pipelines, and verify direct factor delivery and graph updates.
 2. Bench-verify the ZeroMQ bridge with two bridges on one host.
 3. Calibrate the KISS-Matcher noise bounds and registration gates on field
-   data, then measure rather than just smoke-test HelmDyn03.
+   data, along with the new remote-motion uncertainty floors.
 4. Fill in each evaluation manifest's `expected` block once the protocol is
    confirmed against the paper.
-5. Only then attempt remote keyframe variables, which need the symbol-space
-   refactor the audit describes and which fail silently rather than loudly if
-   they are wrong.
+5. Exchange revisioned peer corrections or original peer odometry/loop factors
+   with covariance, and add factor retraction when a later PCM clique changes.

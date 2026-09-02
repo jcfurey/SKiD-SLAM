@@ -2,7 +2,9 @@
 
 Status: living audit and implementation record for the `v3` branch
 
-Last updated: 1 September 2026 (intra-robot pipeline reuse; bounded on-demand communications; map-alignment uncertainty; paper dataset configurations; evaluation harness and structured loop diagnostics; ZeroMQ transport)
+Last updated: 2 September 2026 (direct distributed keyframe factors and sparse
+remote keyframe state; previous registration, communications, evaluation, and
+frame work retained)
 
 Audit baseline: commit `475b59f`, before the paper-registration work below.
 The gap table records that baseline so the provenance problem remains visible;
@@ -24,6 +26,7 @@ boundary:
 - [`UNIFIED_LOOP_CLOSURE_CHANGE_RECORD.md`](UNIFIED_LOOP_CLOSURE_CHANGE_RECORD.md)
 - [`BOUNDED_COMMUNICATIONS_CHANGE_RECORD.md`](BOUNDED_COMMUNICATIONS_CHANGE_RECORD.md)
 - [`MAP_ALIGNMENT_UNCERTAINTY_CHANGE_RECORD.md`](MAP_ALIGNMENT_UNCERTAINTY_CHANGE_RECORD.md)
+- [`DISTRIBUTED_KEYFRAME_GRAPH_CHANGE_RECORD.md`](DISTRIBUTED_KEYFRAME_GRAPH_CHANGE_RECORD.md)
 - [`EVALUATION_HARNESS_CHANGE_RECORD.md`](EVALUATION_HARNESS_CHANGE_RECORD.md)
 - [`FIELD_COMMUNICATION_CHANGE_RECORD.md`](FIELD_COMMUNICATION_CHANGE_RECORD.md)
 
@@ -51,7 +54,9 @@ contract, and contains correctness issues that need tests and reimplementation.
 - SOLiD descriptor construction, KD-tree inter-robot candidate search, and
   descriptor-based intra-robot candidate search.
 - PCM consistency matrices and maximum-clique filtering.
-- Per-robot GTSAM pose graphs and a map-level inter-robot alignment graph.
+- Per-robot GTSAM pose graphs augmented by sparse remote keyframe states and
+  direct PCM-approved cross-robot factors.
+- A separate map-level inter-robot alignment graph for fleet TF placement.
 - ROS 2 Jazzy/Lyrical build and launch support.
 - RESPLE/X-ICP-inspired observable-subspace local scan matching.
 - REP-105 local frame separation and optional ECEF geographic anchoring.
@@ -91,8 +96,9 @@ the audit baseline:
   Registration covariance is propagated through the complete SE(3) cycle,
   with separate angular and linear uncertainty for the local trajectory.
 - Accepted loops use `LoopConstraint.msg`, with a quaternion pose, full 6x6
-  covariance, explicit keyframe indices, and registration diagnostics. The
-  mapping back end consumes the covariance as a full GTSAM Gaussian model.
+  covariance, explicit robot/keyframe endpoints, owner-frame endpoint poses,
+  and registration diagnostics. The mapping back end consumes the covariance
+  as a full GTSAM Gaussian model.
 - The message conversion explicitly permutes the ROS covariance convention
   `[tx, ty, tz, rx, ry, rz]` to GTSAM's tangent convention
   `[rx, ry, rz, tx, ty, tz]` and is covered by a round-trip test.
@@ -111,6 +117,11 @@ the audit baseline:
   optionally behind a Cauchy kernel. That kernel is on by default because
   inter-robot loops are screened by PCM and intra-robot loops are not; it
   bounds a surviving false positive without discarding the covariance shape.
+- PCM-approved inter-robot registrations are now delivered directly to both
+  endpoint robots. Each local optimizer retains its own `X(index)` variables
+  plus the Equation (7) subset of peer keyframes, joined by sparse peer-motion
+  edges. Map alignment remains a TF/coordination output and no longer mediates
+  these graph factors in the default mode.
 
 The dependencies are Git submodules pinned to revisions available when the
 paper-era implementation was created. They are built from local source; CMake
@@ -153,9 +164,10 @@ The communication path is now bounded and on-demand:
 - Bytes, message counts, and round-trip latency are reported for both channels,
   alongside drop, eviction, retry, and abandonment counters.
 
-The remaining P1/P2 work is Equation (6) remote-keyframe state semantics and
-measured multi-robot field evaluation, including ZeroMQ bench/radio results and
-paper-protocol calibration.
+The structural Equation (6)/(7) path is now implemented. Remaining P1/P2 work
+is fidelity and evidence: revisioned peer corrections or peer factor exchange,
+remote-motion covariance calibration, live two-robot replay, ZeroMQ
+bench/radio results, and paper-protocol evaluation.
 
 ### Registration covariance model
 
@@ -246,101 +258,52 @@ distances in m^2; PCL's is untruncated and therefore never smaller, so a
 threshold tuned against it is a permissive bound for the paper's metric rather
 than a tighter one. Per-dataset calibration is still outstanding.
 
-### Equation (6) and the two-level formulation
+### Equation (6) and the distributed keyframe graph
 
-The paper optimizes keyframe states with cross-robot factors. This package
-optimizes two levels instead, and this section records exactly where the two
-agree and where they do not, so the gap is a known quantity rather than an
-assumption.
+A file-by-file record of the implementation and its verification boundary is
+in
+[`DISTRIBUTED_KEYFRAME_GRAPH_CHANGE_RECORD.md`](DISTRIBUTED_KEYFRAME_GRAPH_CHANGE_RECORD.md).
 
-#### What is actually optimized
+The old implementation optimized two separate levels: each mapping node held
+only its local keyframes, while map fusion estimated one alignment per robot.
+It waited for two registrations, eliminated the peer frame algebraically, and
+published a local-to-local factor. That route remains available for comparison
+but is no longer the default.
 
-**Level 1, per robot.** Each platform's mapping node owns a keyframe graph over
-its own poses, with odometry, GPS, intra-robot loop factors, and the
-inter-robot-derived factors described below. Keys are the platform's own
-keyframe indices; no remote pose is ever a variable.
+The default now follows the state structure of paper Equations (6) and (7):
 
-**Level 2, in map fusion.** For each peer `p`, one SE(3) variable `T_p` -- this
-robot's map frame into `p`'s -- is fitted by weighted least squares to the
-accepted registrations. For accepted registration `i`, with `S_i` this robot's
-keyframe pose in its own frame and `A_i` the same keyframe expressed in `p`'s
-frame, the residual is between `T_p^-1 . A_i` and `S_i`, weighted by the
-registration covariance.
+- A platform's locally owned poses occupy explicit `X(index)` keys.
+- Every PCM-approved registration is published directly between its two
+  robot/keyframe endpoints and is delivered to both endpoint robots.
+- Each recipient creates a distinct remote variable for the other endpoint.
+  Only remote poses touched by accepted registrations are retained.
+- Remote poses belonging to one peer are connected by a sparse spanning tree
+  of owner-frame relative motions. Those differences are invariant to the
+  peer map's unknown placement.
+- Registration factors use the full propagated covariance. Remote-motion
+  factors use separately configured angular and translational uncertainty
+  floors.
 
-#### How cross-robot information reaches a keyframe graph
+Initial values for new remote poses are derived from the local endpoint and
+the registration, but are not added as priors. Thus one direct factor fixes a
+new remote state relative to a local pose without changing that local pose; a
+second direct factor and peer-motion edge create the correction cycle. This is
+the correct gauge behaviour and is pinned by a solver-level two-robot test.
 
-Not as a factor between `X^a_j` and `X^b_k`. Two registrations against the same
-peer are differenced to produce a constraint between two of *this* robot's
-keyframes:
+Map fusion still estimates and publishes fleet-map-to-platform-map transforms,
+but that alignment no longer mediates direct keyframe factors. This keeps the
+Equation (6) graph independent of Earth, UTM/UPS, and potentially distant map
+origins. Endpoint-pair identities are canonicalized so two observers reporting
+the same registration in opposite directions cannot double-count it.
 
-```
-z = (A_that)^-1 . A_this
-```
-
-Both `A` terms are expressed in the same peer's frame, so that frame cancels
-algebraically. The result is an intra-trajectory factor carrying inter-robot
-information, and both registration covariances propagate into it through the
-tested SE(3) helpers.
-
-#### Where the formulations agree
-
-For a pair of registrations against **the same peer**, this loses nothing. The
-peer's frame cancels exactly rather than approximately, no estimated quantity
-mediates, and the factor's covariance is the correct first-order propagation of
-the two registration covariances. In the two-robot case that is every
-inter-robot factor the system produces.
-
-#### Where they do not
-
-1. **A lone registration contributes nothing.** A single observation of a peer
-   has no second observation to difference against, so it never reaches a
-   keyframe graph. A joint formulation would use it directly against the remote
-   keyframe.
-2. **Remote trajectories are not corrected.** Because no remote pose is a
-   variable, this robot's observations cannot improve the peer's trajectory,
-   and the peer's later corrections cannot revise constraints already emitted.
-3. **Shared information is double counted.** Emitted factors that share a
-   registration -- and, in the multi-peer case, a map alignment -- are added to
-   the graph as independent `BetweenFactor`s. The correlation between them is
-   not represented.
-4. **Multi-peer factors are mediated by an estimate.** When the two endpoints
-   were registered against *different* peers, each must come back through that
-   peer's alignment `T_p` before they can be differenced.
-
-Point 4 was previously worse than an approximation: the alignment was composed
-in with zero uncertainty, so the resulting factor was overconfident by exactly
-the alignment's error. The alignment's marginal is now recovered from its own
-optimization, floored by
-`mapfusion.interRobot.map_alignment_{rotation,translation}_stddev_*`, and
-propagated. The alignment and the registrations remain correlated and are
-treated as independent, which errs towards a *larger* covariance; treating the
-alignment as exact erred towards a smaller one. `test_skid_pose_uncertainty`
-pins that direction as a property of the composition chain.
-
-This matters only with three or more robots. With two, the same-peer branch
-above applies and no alignment enters.
-
-#### Blockers to representing remote keyframes
-
-Full Equation (6) parity needs remote poses as variables in the local graph.
-Three concrete things block that today, all verified against the current code:
-
-1. `src/mapOptmization.cpp`, `correctPoses()`: iterates
-   `numPoses = isamCurrentEstimate.size()` and indexes both
-   `isamCurrentEstimate.at<Pose3>(i)` and `cloudKeyPoses3D->points[i]` by the
-   same `i`. Any variable that is not a local keyframe breaks the
-   correspondence and the key lookup.
-2. `src/mapOptmization.cpp`, `saveKeyFramesAndFactor()`: takes the newest pose
-   as `isamCurrentEstimate.at<Pose3>(isamCurrentEstimate.size() - 1)` and its
-   covariance as `isam->marginalCovariance(isamCurrentEstimate.size() - 1)`.
-   Both assume the highest key is the newest local keyframe.
-3. `msg/LoopConstraint.msg` names one `robot_id` and two indices, so it cannot
-   express endpoints belonging to two different trajectories.
-
-The order to remove them in is 1 and 2 first -- give local keyframes an
-explicit symbol space and iterate the keyframe count rather than the value
-count -- then 3, then remote variables with priors supplied by the observing
-robot. None of that is attempted here.
+This is **structural parity**, with important fidelity limits. Peer odometry is
+currently reconstructed from snapshots of announced optimized poses rather
+than imported as its original factors and covariance; later corrections at the
+owner do not revise stored remote edges; peer GPS and intra-robot loop factors
+are not imported; and factors accepted by an earlier PCM clique cannot yet be
+retracted. The default uncertainty floors and all field thresholds remain to be
+calibrated. These are now the Equation (6) gaps—not absent symbol spaces,
+indexing assumptions, or an endpoint-incapable message.
 
 ## Paper-to-package gaps
 
@@ -350,15 +313,15 @@ robot. None of that is attempted here.
 | P0 | Small-GICP fine registration (Figure 2 and Section IV-C) | Implemented with the KISS result as the initial estimate and one tested `target <- source` convention. | Add field-dataset accuracy evaluation. |
 | P0 | KISS correspondence sanity check | Implemented with correspondence, solver-inlier, finite/rigid-transform, and exception gates. Structured bag diagnostics retain every rejection status and detail. | Inspect rejection distributions and calibrate them on multi-robot field runs. |
 | P0 | Truncated MSE measurement gate (Section IV-D.1, Equation 10) | Implemented in squared metres with separate overlap/inlier gates and exact tests. | Calibrate thresholds per dataset. |
-| P0 | Delivery of accepted loop factors | Implemented with one parameter-derived topic and typed `LoopConstraint` publisher/subscriber contract. | Add a launch-level two-node delivery test. |
+| P0 | Delivery of accepted loop factors | Implemented with one parameter-derived topic and an endpoint-aware typed `LoopConstraint` contract. Every newly PCM-approved registration is sent directly to both endpoint graphs; factor queues and the bridge are sized for clique bursts. | Run the synthetic two-pipeline launch once its derived bag is available, then add acknowledgement/replay if disconnected peers must recover missed factors. |
 | P1 | One SOLiD/registration pipeline for inter- and intra-robot loops | Implemented. Intra-robot loops are detected with SOLiD and registered and gated by the same module map fusion uses; the descriptor distance and the registration parameter set are single-sourced. Map fusion still skips same-robot candidates, which is now the correct division of work rather than a gap. | Calibrate the intra-robot gates on field data and add a bag-level comparison against the Scan Context baseline. |
-| P1 | Distributed keyframe PGO matching Equation 6 | Partial approximation, now analysed rather than assumed. Map fusion still optimizes one `Pose3` per robot/map while each robot owns a separate keyframe graph. The two-robot case is shown below to lose no information; the multi-peer case no longer treats the map alignment as exact. | Represent remote keyframe variables explicitly. The three code-level blockers are named in "Equation (6) and the two-level formulation" below. |
+| P1 | Distributed keyframe PGO matching Equation 6 | Structurally implemented. Each optimizer has explicit local symbols, sparse peer-keyframe variables, direct full-covariance cross-robot factors, and peer-motion edges; the map-alignment graph is no longer in the factor path. | Exchange revisioned peer corrections or original peer factors/covariances, support PCM factor retraction, and validate the live graph on multi-robot bags and field data. |
 | P1 | Lightweight message pool | Implemented. Announcements are descriptor-only; scans transfer on request. Announcement backlogs, the scan cache, outstanding requests, and parked candidates are all bounded, with defined retry, backpressure, and abandonment behaviour, and byte/latency reporting on both channels. | Measure the achieved bandwidth and latency on field bags and calibrate the cache budget against the datasets' revisit horizons. |
-| P1 | Meaningful inter-robot uncertainty | Implemented for the SOLiD paper pipeline: Hessian-shaped, physically calibrated full covariance is propagated through PCM, map alignment, the typed loop message, and the GTSAM factor. | Calibrate on field data and extend trajectory uncertainty beyond the configured PCM floor. |
+| P1 | Meaningful inter-robot uncertainty | Implemented for registration: Hessian-shaped, physically scaled full covariance is propagated through PCM, the typed loop message, and each direct GTSAM factor. Sparse remote-motion edges have separate angular/linear floors. | Calibrate on field data and replace fixed remote-motion floors with the peer trajectory's propagated covariance. |
 | P2 | ROS + ZeroMQ field communication setup (Section VI-B) | Implemented and compiled on ROS 2 Lyrical. `liorf_zmqBridge` carries the inter-robot topics over a ZeroMQ PUB/SUB mesh through a type-agnostic generic pub/sub bridge; the transport underneath is tested over real sockets. The deployment is in `doc/FIELD_COMMUNICATION.md`. The bridge is optional: a system without ZeroMQ builds everything else. | Bench-verify two bridge nodes across isolated ROS domains, then measure over a real radio. |
 | P2 | Paper dataset configurations | Implemented. GEODE, GRACO, Majang, Moon, Park, and STEAM are ported to ROS 2 parameters with a launch file each, and every parameter file is checked against the declared parameter contract by `validate_config_parameters`. | Verify each against its bag: topic names, `imuRate`, and the Moon sensor/topic pairing noted in that file are unverified against real data. Add cave and planetary field configs if the data are available. |
 | P2 | Paper evaluation harness | Implemented in `evaluation/`: PR curves, RTE/RRE and success rate, ATE/ARE with rigid, Sim(3) or yaw alignment, descriptor memory against a Scan Context baseline, and communication cost read back from the map-fusion diagnostics. `LoopDiagnostic` records every eligible descriptor score, scan outcome, registration result, and PCM decision with keyframe timestamps; `extract_diagnostics_from_bag.py` produces candidate and accepted-registration CSVs. Manifests exist for all six datasets, and the metrics and extraction rules are tested against analytically known cases. | Record a real multi-robot run, inspect the extracted conventions against ground truth, and fill in each manifest's `expected` block once the paper's protocol is confirmed to match. |
-| P2 | Pipeline test coverage | Unit coverage now includes coarse-to-fine registration, truncated MSE, covariance, SE(3) PCM propagation and inversion, message conversion, SOLiD descriptor construction, descriptor retrieval, the shared registration parameter contract, the communication policy, and a parameter-contract check over every configuration and launch file. | Add failure injection and multi-robot graph tests. |
+| P2 | Pipeline test coverage | Unit coverage now includes coarse-to-fine registration, truncated MSE, covariance, SE(3) PCM propagation and inversion, endpoint-aware message conversion, SOLiD descriptor construction/retrieval, graph key namespaces, sparse remote trajectories, factor orientation/deduplication, a solver-level two-robot correction graph, communication policy, and the full parameter contract. | Add ROS launch-level factor-delivery tests, disconnect/replay failure injection, and measured multi-robot bag evaluation. |
 | P2 | Public package identity | The ROS package is still named and described as Liorf and retains upstream maintainer metadata. | Decide whether to rename the ROS package; at minimum correct description, authorship, dependencies, and third-party notices. |
 
 ## Current implementation evidence
@@ -370,13 +333,22 @@ robot. None of that is attempted here.
 - `src/liorf-DiSO/mapFusion_so.cpp`, `registerRelativeMotion()`: the paper
   coarse-to-fine pipeline produces a pose and full covariance.
 - `msg/LoopConstraint.msg` and `include/loop_constraint_utils.hpp`: accepted
-  factors no longer overload descriptor dimensions or a scalar intensity.
+  factors name both robot/keyframe endpoints, carry owner-frame endpoint poses,
+  and no longer overload descriptor dimensions or a scalar intensity.
 - `msg/LoopDiagnostic.msg`, `src/liorf-DiSO/mapFusion_so.cpp`, and
   `evaluation/extract_diagnostics_from_bag.py`: descriptor retrieval, scan
   acquisition, registration, and PCM decisions retain one candidate identity
   and can be converted directly into the harness CSV inputs.
-- `src/mapOptmization.cpp`, `contextLoopInfoHandler()`: the per-platform graph
-  consumes the full covariance through `noiseModel::Gaussian::Covariance`.
+- `include/skid_graph_keys.hpp` and `include/skid_remote_graph.hpp`: local and
+  peer variables occupy separate symbol spaces; sparse peer trajectories,
+  oriented initialization, and canonical factor identity are testable outside
+  ROS.
+- `src/mapOptmization.cpp`, `contextLoopInfoHandler()`: the per-platform iSAM2
+  graph inserts direct local-to-peer factors with full covariance and sparse
+  peer-motion edges.
+- `src/liorf-DiSO/mapFusion_so.cpp`, `publishAcceptedDirectFactors()`: every
+  newly PCM-approved registration is sent to both endpoint robots without
+  composing through a map alignment.
 - `include/skid_loop_detection.hpp`, `src/skid_loop_detection.cpp`: the SOLiD
   distance, circular-shift yaw, and candidate rules used by both nodes.
 - `include/skid_solid_descriptor.hpp`, `src/skid_solid_descriptor.cpp`: the
@@ -398,11 +370,10 @@ robot. None of that is attempted here.
   `mapfusion.comms.announce_scans` is set.
 - `src/liorf-DiSO/mapFusion_so.cpp`, `ensureCandidateScans()`,
   `scanDataHandler()`: candidates park until the scans they need arrive.
-- `src/liorf-DiSO/mapFusion_so.cpp`, `gtsamFactorGraph()`: graph keys are robot
-  numeric identifiers, not the keyframe states in the paper's Equation 6.
-- `src/liorf-DiSO/mapFusion_so.cpp`, `gtsamExpressionGraph()`, `mapAlignment()`,
-  `sendLoopThis()`: the map alignment's marginal is recovered, floored, and
-  propagated into cross-peer loop factors.
+- `src/liorf-DiSO/mapFusion_so.cpp`, `gtsamFactorGraph()` and
+  `gtsamExpressionGraph()`: the separate robot/map alignment graph remains for
+  fleet TF placement. It is not the Equation (6) keyframe graph and does not
+  mediate factors while direct mode is enabled.
 - `config/{geode,graco,majang_rover,moon,park,steam_legged}.yaml` and their
   launch files: the paper's field datasets, ported from `0611f71`.
 - `include/skid_transport.hpp`, `src/skid_transport.cpp`: the ZeroMQ peer
@@ -479,14 +450,15 @@ Items 1-4 are complete:
 1. **Completed:** the same descriptor, registration, gating, and covariance
    code serves intra-robot loops. See "Intra-robot loop closure" below for the
    division of work that remains between the two nodes.
-2. **Completed for factor delivery:** introduce a typed loop-factor message
-   rather than overloading `ContextInfo` dimensions and a scalar score. Direct
-   cross-robot state semantics still belong to item 3.
-3. Make the optimized state and information matrices match Equation 6, or
-   provide a documented equivalence proof and evaluation. **Partially done:**
-   the analysis and the exact departures are recorded in "Equation (6) and the
-   two-level formulation"; the multi-peer information matrices are corrected.
-   Remote keyframe variables are still not represented.
+2. **Completed:** the typed loop-factor message names both robot/keyframe
+   endpoints, carries owner-frame endpoint poses, and delivers one direct
+   registration to both endpoint graphs.
+3. **Structurally completed; fidelity and evaluation remain:** local and sparse
+   remote keyframes coexist in each optimizer and direct factors use the
+   registration covariance as Equation (6) requires. Peer motion currently
+   comes from announced pose snapshots with fixed uncertainty floors rather
+   than revisioned original peer factors. See "Equation (6) and the distributed
+   keyframe graph" and its change record.
 
 ### Phase 4: resource and evaluation parity
 
