@@ -2,9 +2,10 @@
 
 Status: living audit and implementation record for the `v3` branch
 
-Last updated: 2 September 2026 (direct distributed keyframe factors and sparse
-remote keyframe state; previous registration, communications, evaluation, and
-frame work retained)
+Last updated: 2 September 2026 (two-robot runtime verification, corrected PCM
+direction, delayed factor commitment, and keyframe timestamp provenance;
+previous registration, communications, evaluation, graph, and frame work
+retained)
 
 Audit baseline: commit `475b59f`, before the paper-registration work below.
 The gap table records that baseline so the provenance problem remains visible;
@@ -27,6 +28,7 @@ boundary:
 - [`BOUNDED_COMMUNICATIONS_CHANGE_RECORD.md`](BOUNDED_COMMUNICATIONS_CHANGE_RECORD.md)
 - [`MAP_ALIGNMENT_UNCERTAINTY_CHANGE_RECORD.md`](MAP_ALIGNMENT_UNCERTAINTY_CHANGE_RECORD.md)
 - [`DISTRIBUTED_KEYFRAME_GRAPH_CHANGE_RECORD.md`](DISTRIBUTED_KEYFRAME_GRAPH_CHANGE_RECORD.md)
+- [`PCM_COMMITMENT_CHANGE_RECORD.md`](PCM_COMMITMENT_CHANGE_RECORD.md)
 - [`EVALUATION_HARNESS_CHANGE_RECORD.md`](EVALUATION_HARNESS_CHANGE_RECORD.md)
 - [`FIELD_COMMUNICATION_CHANGE_RECORD.md`](FIELD_COMMUNICATION_CHANGE_RECORD.md)
 
@@ -55,7 +57,7 @@ contract, and contains correctness issues that need tests and reimplementation.
   descriptor-based intra-robot candidate search.
 - PCM consistency matrices and maximum-clique filtering.
 - Per-robot GTSAM pose graphs augmented by sparse remote keyframe states and
-  direct PCM-approved cross-robot factors.
+  direct PCM-committed cross-robot factors.
 - A separate map-level inter-robot alignment graph for fleet TF placement.
 - ROS 2 Jazzy/Lyrical build and launch support.
 - RESPLE/X-ICP-inspired observable-subspace local scan matching.
@@ -95,6 +97,13 @@ the audit baseline:
 - PCM now evaluates Equation (11) as a dimensionless Mahalanobis distance.
   Registration covariance is propagated through the complete SE(3) cycle,
   with separate angular and linear uncertainty for the local trajectory.
+- PCM receives `target <- source` measurements as Equation (11) requires; the
+  legacy registration queue's stored `source <- target` pose is inverted with
+  covariance propagation before the consistency cycle is evaluated.
+- Current maximum-clique membership is provisional. A configurable minimum
+  clique size and consecutive-membership count produce a monotonic committed
+  set, and only that set may affect map alignment or either factor publisher.
+  A factor-publication switch supports non-mutating calibration runs.
 - Accepted loops use `LoopConstraint.msg`, with a quaternion pose, full 6x6
   covariance, explicit robot/keyframe endpoints, owner-frame endpoint poses,
   and registration diagnostics. The mapping back end consumes the covariance
@@ -117,7 +126,7 @@ the audit baseline:
   optionally behind a Cauchy kernel. That kernel is on by default because
   inter-robot loops are screened by PCM and intra-robot loops are not; it
   bounds a surviving false positive without discarding the covariance shape.
-- PCM-approved inter-robot registrations are now delivered directly to both
+- PCM-committed inter-robot registrations are now delivered directly to both
   endpoint robots. Each local optimizer retains its own `X(index)` variables
   plus the Equation (7) subset of peer keyframes, joined by sparse peer-motion
   edges. Map alignment remains a TF/coordination output and no longer mediates
@@ -146,9 +155,25 @@ The intra-robot pipeline reuse was first verified in isolation, then built as a
 complete ROS 2 Lyrical package on 1 September 2026. A full 161.3-second
 HelmDyn03 replay at 1x delivered every LiDAR and IMU input, produced odometry at
 about 20 Hz, and exercised accepted radius-search and SOLiD intra-robot loops.
-That is a sustained single-robot smoke test, not an accuracy result: the
-repeated KISS-Matcher noise-bound clamping warnings still require calibration,
-and a multi-robot replay is needed for the map-fusion pipeline.
+That established a sustained single-robot smoke test.
+
+On 2 September, a corrected factor-enabled 70-second segment of the synthetic
+HelmDyn08/09 fixture ran two estimator/map-fusion pipelines at 2x. Each bridge
+forwarded 1,400 LiDAR and 14,001 IMU messages without a reported loss or
+mismatch. The trace contained 8,566 descriptor candidates, 86 accepted
+registrations, 23 commitment transitions, and 37 unique direct factors
+recorded on each endpoint topic. The INFO console contained no KISS
+noise-bound warnings: the explicit default effective bounds are now 1.0 m for
+ROBIN and 0.75 m for the solver, and validation prevents silent clamp reliance.
+
+The replay uncovered and then verified a keyframe provenance fix. A queued
+descriptor announcement had inherited the node's latest cloud timestamp when
+its background FIFO drained; it now preserves the timestamp captured with the
+descriptor. Of the 37 factors in the corrected run, 30 had both endpoint times
+within 30 ms of retimed mocap, and all 30 had translation RTE below 1.33 m
+(0.16 m median, 0.40 m p90). The remaining seven lie in mocap gaps and are not
+included in that strict result. This remains a bounded synthetic test rather
+than a paper-comparable field evaluation.
 
 The communication path is now bounded and on-demand:
 
@@ -164,10 +189,11 @@ The communication path is now bounded and on-demand:
 - Bytes, message counts, and round-trip latency are reported for both channels,
   alongside drop, eviction, retry, and abandonment counters.
 
-The structural Equation (6)/(7) path is now implemented. Remaining P1/P2 work
-is fidelity and evidence: revisioned peer corrections or peer factor exchange,
-remote-motion covariance calibration, live two-robot replay, ZeroMQ
-bench/radio results, and paper-protocol evaluation.
+The structural Equation (6)/(7) path is now implemented and has bounded
+two-pipeline runtime evidence. Remaining P1/P2 work is fidelity and stronger
+evidence: revisioned peer corrections or peer factor exchange, complete-bag
+and real simultaneous multi-robot evaluation, remote-motion covariance
+calibration, ZeroMQ bench/radio results, and paper-protocol evaluation.
 
 ### Registration covariance model
 
@@ -273,7 +299,7 @@ but is no longer the default.
 The default now follows the state structure of paper Equations (6) and (7):
 
 - A platform's locally owned poses occupy explicit `X(index)` keys.
-- Every PCM-approved registration is published directly between its two
+- Every PCM-committed registration is published directly between its two
   robot/keyframe endpoints and is delivered to both endpoint robots.
 - Each recipient creates a distinct remote variable for the other endpoint.
   Only remote poses touched by accepted registrations are retained.
@@ -300,28 +326,30 @@ This is **structural parity**, with important fidelity limits. Peer odometry is
 currently reconstructed from snapshots of announced optimized poses rather
 than imported as its original factors and covariance; later corrections at the
 owner do not revise stored remote edges; peer GPS and intra-robot loop factors
-are not imported; and factors accepted by an earlier PCM clique cannot yet be
-retracted. The default uncertainty floors and all field thresholds remain to be
-calibrated. These are now the Equation (6) gaps—not absent symbol spaces,
-indexing assumptions, or an endpoint-incapable message.
+are not imported; and a committed factor cannot yet be retracted if a
+persistent later clique excludes it. Delayed commitment now filters transient
+and undersized cliques but does not replace factor removal. The default
+uncertainty floors and field thresholds remain to be calibrated. These are now
+the Equation (6) gaps—not absent symbol spaces, indexing assumptions, or an
+endpoint-incapable message.
 
 ## Paper-to-package gaps
 
 | Priority | Paper requirement | Current package | Required work |
 |---|---|---|---|
-| P0 | KISS-Matcher coarse registration (Section IV-C, Equation 9) | Implemented with pinned KISS-Matcher, Faster-PFH matching, ROBIN pruning, and robust estimation. | Add bag-level recall/timing evaluation. |
+| P0 | KISS-Matcher coarse registration (Section IV-C, Equation 9) | Implemented with pinned KISS-Matcher, Faster-PFH matching, ROBIN pruning, and robust estimation. Effective default noise bounds are explicit, and validation prevents warning-producing implicit clamping. | Extend the bounded HelmDyn trace into bag-level recall/timing evaluation on real field data. |
 | P0 | Small-GICP fine registration (Figure 2 and Section IV-C) | Implemented with the KISS result as the initial estimate and one tested `target <- source` convention. | Add field-dataset accuracy evaluation. |
-| P0 | KISS correspondence sanity check | Implemented with correspondence, solver-inlier, finite/rigid-transform, and exception gates. Structured bag diagnostics retain every rejection status and detail. | Inspect rejection distributions and calibrate them on multi-robot field runs. |
+| P0 | KISS correspondence sanity check | Implemented with correspondence, solver-inlier, finite/rigid-transform, and exception gates. Structured bag diagnostics retain every rejection status and detail, while expected weak-candidate failures are DEBUG rather than WARN. | Inspect rejection distributions and calibrate them on real multi-robot field runs. |
 | P0 | Truncated MSE measurement gate (Section IV-D.1, Equation 10) | Implemented in squared metres with separate overlap/inlier gates and exact tests. | Calibrate thresholds per dataset. |
-| P0 | Delivery of accepted loop factors | Implemented with one parameter-derived topic and an endpoint-aware typed `LoopConstraint` contract. Every newly PCM-approved registration is sent directly to both endpoint graphs; factor queues and the bridge are sized for clique bursts. | Run the generated synthetic HelmDyn08/09 bag through both pipelines, then add acknowledgement/replay if disconnected peers must recover missed factors. |
+| P0 | Delivery of accepted loop factors | Implemented with one parameter-derived topic and an endpoint-aware typed `LoopConstraint` contract. A registration is published to both endpoint graphs only after repeated membership in a sufficiently large PCM clique; factor queues and the bridge are sized for clique bursts. A 70-second synthetic two-pipeline run delivered the same 37 unique factors to both endpoints. | Complete the fixture, validate on real simultaneous runs, and add acknowledgement/replay if disconnected peers must recover missed factors. |
 | P1 | One SOLiD/registration pipeline for inter- and intra-robot loops | Implemented. Intra-robot loops are detected with SOLiD and registered and gated by the same module map fusion uses; the descriptor distance and the registration parameter set are single-sourced. Map fusion still skips same-robot candidates, which is now the correct division of work rather than a gap. | Calibrate the intra-robot gates on field data and add a bag-level comparison against the Scan Context baseline. |
-| P1 | Distributed keyframe PGO matching Equation 6 | Structurally implemented. Each optimizer has explicit local symbols, sparse peer-keyframe variables, direct full-covariance cross-robot factors, and peer-motion edges; the map-alignment graph is no longer in the factor path. | Exchange revisioned peer corrections or original peer factors/covariances, support PCM factor retraction, and validate the live graph on multi-robot bags and field data. |
+| P1 | Distributed keyframe PGO matching Equation 6 | Structurally implemented. Each optimizer has explicit local symbols, sparse peer-keyframe variables, direct full-covariance cross-robot factors, and peer-motion edges; the map-alignment graph is no longer in the factor path. The live direct-factor route has bounded synthetic two-robot evidence. | Exchange revisioned peer corrections or original peer factors/covariances, support committed-factor retraction, and validate on complete and real multi-robot field runs. |
 | P1 | Lightweight message pool | Implemented. Announcements are descriptor-only; scans transfer on request. Announcement backlogs, the scan cache, outstanding requests, and parked candidates are all bounded, with defined retry, backpressure, and abandonment behaviour, and byte/latency reporting on both channels. | Measure the achieved bandwidth and latency on field bags and calibrate the cache budget against the datasets' revisit horizons. |
 | P1 | Meaningful inter-robot uncertainty | Implemented for registration: Hessian-shaped, physically scaled full covariance is propagated through PCM, the typed loop message, and each direct GTSAM factor. Sparse remote-motion edges have separate angular/linear floors. | Calibrate on field data and replace fixed remote-motion floors with the peer trajectory's propagated covariance. |
 | P2 | ROS + ZeroMQ field communication setup (Section VI-B) | Implemented and compiled on ROS 2 Lyrical. `liorf_zmqBridge` carries the inter-robot topics over a ZeroMQ PUB/SUB mesh through a type-agnostic generic pub/sub bridge; the transport underneath is tested over real sockets. The deployment is in `doc/FIELD_COMMUNICATION.md`. The bridge is optional: a system without ZeroMQ builds everything else. | Bench-verify two bridge nodes across isolated ROS domains, then measure over a real radio. |
 | P2 | Paper dataset configurations | Implemented. GEODE, GRACO, Majang, Moon, Park, and STEAM are ported to ROS 2 parameters with a launch file each, and every parameter file is checked against the declared parameter contract by `validate_config_parameters`. | Verify each against its bag: topic names, `imuRate`, and the Moon sensor/topic pairing noted in that file are unverified against real data. Add cave and planetary field configs if the data are available. |
-| P2 | Paper evaluation harness | Implemented in `evaluation/`: PR curves, RTE/RRE and success rate, ATE/ARE with rigid, Sim(3) or yaw alignment, descriptor memory against a Scan Context baseline, and communication cost read back from the map-fusion diagnostics. `LoopDiagnostic` records every eligible descriptor score, scan outcome, registration result, and PCM decision with keyframe timestamps; `extract_diagnostics_from_bag.py` produces candidate and accepted-registration CSVs. Manifests exist for all six datasets, and the metrics and extraction rules are tested against analytically known cases. | Record a real multi-robot run, inspect the extracted conventions against ground truth, and fill in each manifest's `expected` block once the paper's protocol is confirmed to match. |
-| P2 | Pipeline test coverage | Unit coverage now includes coarse-to-fine registration, truncated MSE, covariance, SE(3) PCM propagation and inversion, endpoint-aware message conversion, SOLiD descriptor construction/retrieval, graph key namespaces, sparse remote trajectories, factor orientation/deduplication, a solver-level two-robot correction graph, communication policy, and the full parameter contract. | Add ROS launch-level factor-delivery tests, disconnect/replay failure injection, and measured multi-robot bag evaluation. |
+| P2 | Paper evaluation harness | Implemented in `evaluation/`: PR curves, RTE/RRE and success rate, ATE/ARE with rigid, Sim(3) or yaw alignment, descriptor memory against a Scan Context baseline, and communication cost read back from the map-fusion diagnostics. `LoopDiagnostic` records every eligible descriptor score, scan outcome, registration result, and provisional/committed PCM decision with original keyframe timestamps; `extract_diagnostics_from_bag.py` produces candidate and accepted-registration CSVs. Manifests exist for all six datasets, and the metrics and extraction rules are tested against analytically known cases. Timestamp conventions were checked in a bounded synthetic two-robot run. | Record a real multi-robot run, resolve the HelmDyn body/LiDAR orientation convention, and fill in each manifest's `expected` block once the paper's protocol is confirmed to match. |
+| P2 | Pipeline test coverage | Unit coverage now includes coarse-to-fine registration, truncated MSE, covariance, SE(3) PCM propagation and inversion, nonidentity PCM direction, delayed commitment policy, endpoint-aware message conversion, SOLiD descriptor construction/retrieval, graph key namespaces, sparse remote trajectories, factor orientation/deduplication, a solver-level two-robot correction graph, communication policy, and the full parameter contract. | Add ROS launch-level assertions around factor content, disconnect/replay failure injection, and measured real multi-robot evaluation. |
 | P2 | Public package identity | The ROS package is still named and described as Liorf and retains upstream maintainer metadata. | Decide whether to rename the ROS package; at minimum correct description, authorship, dependencies, and third-party notices. |
 
 ## Current implementation evidence
@@ -347,8 +375,11 @@ indexing assumptions, or an endpoint-incapable message.
   graph inserts direct local-to-peer factors with full covariance and sparse
   peer-motion edges.
 - `src/liorf-DiSO/mapFusion_so.cpp`, `publishAcceptedDirectFactors()`: every
-  newly PCM-approved registration is sent to both endpoint robots without
+  newly PCM-committed registration is sent to both endpoint robots without
   composing through a map alignment.
+- `include/skid_pcm_commitment.hpp`: minimum clique support, consecutive
+  membership, and monotonic publication authority are isolated from ROS and
+  unit tested.
 - `include/skid_loop_detection.hpp`, `src/skid_loop_detection.cpp`: the SOLiD
   distance, circular-shift yaw, and candidate rules used by both nodes.
 - `include/skid_solid_descriptor.hpp`, `src/skid_solid_descriptor.cpp`: the
@@ -366,8 +397,8 @@ indexing assumptions, or an endpoint-incapable message.
   store, and transfer accounting.
 - `msg/ScanRequest.msg`, `msg/ScanData.msg`: the on-demand scan channel.
 - `src/liorf-DiSO/mapFusion_so.cpp`, `publishContextInfo()`: announcements
-  carry the descriptor; the scan is omitted unless
-  `mapfusion.comms.announce_scans` is set.
+  carry the descriptor and its captured keyframe timestamp; the scan is
+  omitted unless `mapfusion.comms.announce_scans` is set.
 - `src/liorf-DiSO/mapFusion_so.cpp`, `ensureCandidateScans()`,
   `scanDataHandler()`: candidates park until the scans they need arrive.
 - `src/liorf-DiSO/mapFusion_so.cpp`, `gtsamFactorGraph()` and
@@ -441,9 +472,13 @@ Items 1-4 are complete:
 3. Repair the accepted-loop topic contract.
 4. `LoopDiagnostic` publishes every eligible descriptor score (selected or
    rejected), scan acquisition outcome, full registration status/quality/
-   uncertainty/timing record, and PCM maximum-clique decision. Candidate
-   identity includes both robots' keyframe indices and original timestamps so
-   the evaluation inputs can be extracted directly from a bag.
+   uncertainty/timing record, and both provisional and committed PCM state.
+   Candidate identity includes both robots' keyframe indices and original
+   timestamps so the evaluation inputs can be extracted directly from a bag.
+5. Correct Equation (11) measurement direction, explicit matcher bounds,
+   delayed publication commitment, non-mutating dry runs, and runtime-only PCM
+   scratch storage are implemented and covered by the two-robot stabilization
+   record.
 
 ### Phase 3: inter/intra parity and graph semantics
 
@@ -458,7 +493,9 @@ Items 1-4 are complete:
    registration covariance as Equation (6) requires. Peer motion currently
    comes from announced pose snapshots with fixed uncertainty floors rather
    than revisioned original peer factors. See "Equation (6) and the distributed
-   keyframe graph" and its change record.
+   keyframe graph" and its change record. The direct route has been exercised
+   by a bounded synthetic two-pipeline replay; complete and real field runs
+   remain.
 
 ### Phase 4: resource and evaluation parity
 
@@ -468,8 +505,10 @@ Items 1-4 are complete:
    launches and a parameter-contract test. Dataset manifests and ground-truth
    conventions still belong to item 4.
 4. **Partially done:** the harness, structured diagnostic topic, and bag
-   extractors exist and are tested; no representative multi-robot evaluation
-   run or expected figures are recorded. See `evaluation/README.md`.
+   extractors exist and are tested. A bounded synthetic two-robot trace now
+   checks timestamp and factor conventions, but no paper-protocol real
+   multi-robot result or expected figure is recorded. See
+   `evaluation/README.md`.
 
 ## Phase 1 acceptance criteria
 

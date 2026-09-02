@@ -12,6 +12,7 @@ Commits:
 |---|---|
 | `b41a338` | Prepare pose graph for remote keyframe states |
 | `d0ac2e7` | Implement direct distributed keyframe factors |
+| `774594a` | Stabilize PCM publication and matcher diagnostics |
 
 ## Why this change exists
 
@@ -39,11 +40,11 @@ instance:
 - A peer pose uses `(robot_id, keyframe_index)`, represented internally by a
   process-local packed `r` symbol. Peer names remain explicit on the ROS
   contract; their numeric namespaces are not exchanged.
-- Only peer poses that occur in accepted inter-robot closures are inserted.
+- Only peer poses that occur in committed inter-robot closures are inserted.
   This is the partial remote state in Equation (7), not a copy of every peer
   keyframe.
 
-An accepted registration is published as one
+A committed registration is published as one
 `BetweenFactor(from, to, measurement)` with its Hessian-shaped full 6-by-6
 covariance. Both endpoint robots receive the same oriented factor. The
 recipient's local endpoint uses its `x` key and the other endpoint uses its
@@ -79,11 +80,22 @@ same-robot producers set both endpoint IDs to the recipient through the
 original `populate()` helper; new inter-robot producers use
 `populateInterRobot()`.
 
-Map fusion publishes every newly PCM-accepted registration directly to the
-observer and to the peer. Endpoint-pair identities are canonicalized, so the
-same physical registration observed in the opposite direction is not added
-twice. The factor publishers, mapping subscriber, and ZeroMQ bridge use a ROS
-queue depth of 100 because one PCM update can release a clique-sized burst.
+Map fusion publishes every newly PCM-committed registration directly to the
+observer and to the peer. Current maximum-clique membership is provisional: a
+candidate must remain in a clique of at least
+`pcm_min_publish_clique_size` for
+`pcm_min_publish_observations` consecutive recomputations before it can affect
+graph state. Membership accumulated in an undersized clique does not count.
+Commitments are monotonic because the current graph cannot retract a factor.
+
+Endpoint-pair identities are canonicalized, so the same physical registration
+observed in the opposite direction is not added twice. The factor publishers,
+mapping subscriber, and ZeroMQ bridge use a ROS queue depth of 100 because one
+PCM update can release a clique-sized burst. `LoopDiagnostic` independently
+reports current clique membership (`pcm_accepted`) and publication authority
+(`pcm_committed`). Setting `mapfusion.interRobot.publish_factors: false` keeps
+registration, PCM, diagnostics, and map alignment active while preventing both
+the direct and legacy publishers from mutating either keyframe graph.
 
 This is source compatibility for callers using the helper, not ROS wire
 compatibility. Adding fields changes the message type description, so bags or
@@ -119,13 +131,16 @@ paper parity:
 3. The recipient imports neither the peer's GPS factors nor its intra-robot
    loop factors; it holds only the observed spanning tree and direct
    cross-robot registrations.
-4. iSAM2 is add-only here. If a later PCM maximum clique excludes a factor
-   that was accepted earlier, the installed factor is not retracted.
+4. iSAM2 is add-only here. Delayed commitment filters transient and undersized
+   cliques, but a committed factor is still not retracted if a persistent
+   later maximum clique excludes it.
 5. Delivery is reliable while DDS/ZeroMQ peers are connected, but the
    publishers are volatile and there is no acknowledgement/replay protocol
    for a peer that was offline during publication.
-6. The remote-motion floors (`0.05` rad and `0.20` m by default), PCM gates,
-   and registration noise bounds still need dataset calibration.
+6. The remote-motion floors (`0.05` rad and `0.20` m by default), PCM gate,
+   commitment policy, and registration quality gates still need field-data
+   calibration. The KISS-Matcher coarse bounds are now explicit and no longer
+   depend on its warning-producing clamp.
 
 These limits are intentionally visible rather than hidden behind the old
 two-level equivalence argument. The next fidelity step is to exchange
@@ -139,7 +154,7 @@ Completed on ROS 2 Lyrical on 2 September 2026:
 - A full `liorf` configure, compile, interface generation, link, and install
   completed, including `liorf_mapOptmization`, `liorf_mapFusion`, and
   `liorf_zmqBridge`.
-- All 13 non-socket CTest targets passed.
+- All 14 non-socket CTest targets passed.
 - `test_skid_transport` passed all 25 cases with loopback socket access.
 - `test_skid_graph_keys` covers explicit local keys, multiple peer namespaces,
   index bounds, out-of-order sparse trajectories, both factor orientations,
@@ -147,6 +162,9 @@ Completed on ROS 2 Lyrical on 2 September 2026:
   direct factors correct the local trajectory.
 - `test_loop_constraint_utils` covers endpoint identities, owner poses,
   covariance ordering, and same-robot compatibility.
+- `test_skid_pcm_commitment` covers minimum clique support, consecutive
+  membership, streak reset, and monotonic commitment. A nonidentity
+  two-robot covariance test verifies Equation (11)'s measurement direction.
 
 After the graph implementation was committed, the provenance-preserving
 HelmDyn08/09 fixture was generated at
@@ -157,7 +175,20 @@ respectively, plus `PROVENANCE.json` with source and output SHA-256 hashes. The
 generator opened both source databases read-only, completed through its
 partial-directory/atomic-move path, and left no partial directory behind.
 
-Derivation validates the fixture and its timestamp/topic contract, not the
-graph runtime. This change has not yet exercised the direct factor route
-through two live ROS pipelines, RViz, or a field radio, and no
-trajectory-accuracy claim is made.
+The fixture was subsequently replayed through two live estimator/map-fusion
+pipelines. A corrected factor-enabled 70-second segment at 2x delivered all
+1,400 LiDAR and 14,001 IMU messages per robot without a bridge-reported loss or
+mismatch. The structured trace retained 8,566 descriptor candidates and 86
+accepted registrations. PCM produced 23 commitment transitions and published
+37 unique factors; both endpoint `LoopConstraint` topics recorded all 37.
+
+The run also validated the announcement timestamp correction: 122 observed
+robot/keyframe endpoints had conflict-free timestamps and no per-robot
+key-index monotonicity violation. Of the 37 factors, 30 had both endpoint times
+within 30 ms of the retimed mocap trajectory. All 30 had translation RTE below
+1.33 m (0.16 m median and 0.40 m p90). The other seven lie in mocap gaps and
+are excluded from the strict figure. This is runtime evidence for the direct
+factor route on a synthetic same-arena fixture, not a complete-bag, RRE, radio,
+or real simultaneous multi-robot result. See
+[`PCM_COMMITMENT_CHANGE_RECORD.md`](PCM_COMMITMENT_CHANGE_RECORD.md) for the
+failure analysis and full boundary.

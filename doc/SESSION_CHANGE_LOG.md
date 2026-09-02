@@ -20,6 +20,7 @@ what the whole session leaves unverified.
 | [`BOUNDED_COMMUNICATIONS_CHANGE_RECORD.md`](BOUNDED_COMMUNICATIONS_CHANGE_RECORD.md) | P1 — Lightweight message pool |
 | [`MAP_ALIGNMENT_UNCERTAINTY_CHANGE_RECORD.md`](MAP_ALIGNMENT_UNCERTAINTY_CHANGE_RECORD.md) | P1 — Distributed keyframe PGO matching Equation 6 (partial) |
 | [`DISTRIBUTED_KEYFRAME_GRAPH_CHANGE_RECORD.md`](DISTRIBUTED_KEYFRAME_GRAPH_CHANGE_RECORD.md) | P1 — Direct factors and sparse remote keyframes for Equations 6 and 7 |
+| [`PCM_COMMITMENT_CHANGE_RECORD.md`](PCM_COMMITMENT_CHANGE_RECORD.md) | P0/P1 — Correct Equation 11 direction and delay add-only graph publication |
 | [`EVALUATION_HARNESS_CHANGE_RECORD.md`](EVALUATION_HARNESS_CHANGE_RECORD.md) | P2 — Paper dataset configurations, and the evaluation harness |
 | [`FIELD_COMMUNICATION_CHANGE_RECORD.md`](FIELD_COMMUNICATION_CHANGE_RECORD.md) | P2 — ROS + ZeroMQ field communication setup |
 
@@ -40,6 +41,9 @@ what the whole session leaves unverified.
 | `e38dfd8` | Record the field communication commit hash |
 | `b41a338` | Prepare pose graph for remote keyframe states |
 | `d0ac2e7` | Implement direct distributed keyframe factors |
+| `296171f` | Document distributed keyframe graph parity |
+| `f610787` | Record synthetic two-robot bag derivation |
+| `774594a` | Stabilize PCM publication and matcher diagnostics |
 
 ## Audit movement
 
@@ -67,6 +71,7 @@ implementation and the fidelity work that replaces it as the open boundary.
 | `skid_registration_params` | The one registration parameter set both nodes declare | Yes |
 | `skid_comms` | Bounded queues, scan-cache policy, request tracking, transfer accounting | Yes |
 | `skid_transport` | ZeroMQ peer transport and echo suppression | Yes, over real sockets |
+| `skid_pcm_commitment` | Converts provisional PCM membership into monotonic publication authority | Yes |
 | `evaluation/skid_eval` | The paper's metrics | Yes |
 | `test/validate_config_parameters.py` | Parameter and launch contract checking | Yes |
 | `liorf_zmqBridge` | ROS-to-ZeroMQ bridge | No — never compiled |
@@ -90,6 +95,10 @@ build, not by reading the code:
 | An `or {}` coerced a mistyped manifest section | `expected: []` silently accepted | Unit test |
 | A relative-only tolerance could never match an expected value of zero | An exact ATE match reported as a failure | Unit test |
 | Paper-era `z_tollerance`/`rotation_tollerance` are ints where the node declares doubles | rclcpp refuses to construct the node | Parameter validator |
+| PCM consumed `source <- target` registrations where Equation (11) requires `target <- source` | Nonidentity consistency cycles did not represent the paper equation | Nonidentity two-robot cycle test |
+| A background announcement used the latest cloud header instead of the queued keyframe's timestamp | Diagnostics associated valid factors with the wrong ground-truth poses | Two-robot factor audit |
+| Every current maximum-clique member was published into an add-only graph immediately | A transient or undersized clique could become permanent graph state | Two-robot replay and graph-semantics review |
+| Runtime PCM matrices were written beneath the installed package config | A symlink build modified a tracked source file during replay | Working-tree audit |
 
 ## Loose ends recorded nowhere else
 
@@ -174,7 +183,8 @@ than every value in iSAM2. This allows remote values to coexist without being
 mistaken for local point-cloud indices.
 
 Commit `d0ac2e7` then changed the default map-fusion route from algebraically
-eliminated local-only loops to direct PCM-approved cross-robot factors. The
+eliminated local-only loops to direct cross-robot factors. Commit `774594a`
+subsequently restricted that route to PCM-committed registrations. The
 loop contract names both robot/keyframe endpoints and carries each endpoint's
 pose in its owner's map. Every recipient keeps the Equation (7) subset of peer
 poses in a separate symbol namespace and connects those observations with a
@@ -202,13 +212,52 @@ The exact graph semantics, map/Earth separation, compatibility behaviour, and
 remaining fidelity limits are in
 [`DISTRIBUTED_KEYFRAME_GRAPH_CHANGE_RECORD.md`](DISTRIBUTED_KEYFRAME_GRAPH_CHANGE_RECORD.md).
 
+### Post-session PCM stabilization and two-robot replay — 2 September 2026
+
+Commit `774594a` closes the issues exposed by the first HelmDyn08/09 run. The
+default KISS-Matcher noise gains now produce explicit 1.0 m ROBIN and 0.75 m
+solver bounds, and validation prevents a clamping-enabled configuration from
+silently exceeding the library's 1.0 m limit. Expected descriptor/registration
+misses remain in the structured diagnostic stream but no longer flood the WARN
+console. PCM now receives the correct `target <- source` measurement direction.
+
+Because the receiving graph cannot retract a published factor, current
+maximum-clique membership is provisional. A candidate must remain in a
+supported clique for a configured number of consecutive recomputations before
+it becomes a monotonic commitment. Only committed candidates affect map
+alignment or either factor publisher. An evaluation switch can leave the whole
+recognition/registration/PCM path active while disabling graph publication,
+and diagnostics report provisional and committed state separately.
+
+The same replay found that descriptor announcements leaving the background
+FIFO inherited the newest cloud timestamp rather than their own keyframe time.
+That did not change the stored keyframe index or registration geometry, but it
+made earlier factor-to-ground-truth scoring invalid. `ContextInfo` now carries
+the descriptor's captured timestamp. PCM scratch matrices also default to a
+runtime temporary directory instead of the installed/source config directory.
+
+After rebuilding, a corrected factor-enabled 70-second segment ran both
+pipelines at 2x. Each bridge forwarded 1,400 LiDAR and 14,001 IMU messages with
+no reported loss or mismatch. The trace retained 8,566 descriptor candidates,
+86 accepted registrations, and 23 commitment transitions. Thirty-seven unique
+direct factors were delivered symmetrically to both endpoint topics. For the
+30 factors whose two timestamps were each within 30 ms of retimed mocap, the
+translation RTE median was 0.16 m, p90 was 0.40 m, and maximum was 1.33 m. The
+other seven lie in mocap gaps and are excluded from that strict result.
+
+The current ROS 2 Lyrical build passes all 14 non-socket CTest targets. The
+transport target passes all 25 cases with loopback socket access. Detailed
+parameter semantics, evidence, and limitations are in
+[`PCM_COMMITMENT_CHANGE_RECORD.md`](PCM_COMMITMENT_CHANGE_RECORD.md).
+
 ## Suggested next steps
 
-1. Replay the generated HelmDyn08/09 bag through both pipelines and verify
-   direct factor delivery and graph updates.
-2. Bench-verify the ZeroMQ bridge with two bridges on one host.
-3. Calibrate the KISS-Matcher noise bounds and registration gates on field
-   data, along with the new remote-motion uncertainty floors.
+1. Replay the remaining 71.768 seconds of the generated HelmDyn08/09 fixture
+   and preserve a complete diagnostic artifact outside `/tmp`.
+2. Bench-verify the ZeroMQ bridge with two bridges on one host, then over the
+   target radio.
+3. Calibrate registration, PCM-commitment, and remote-motion uncertainty
+   parameters on real simultaneous multi-robot field data.
 4. Fill in each evaluation manifest's `expected` block once the protocol is
    confirmed against the paper.
 5. Exchange revisioned peer corrections or original peer odometry/loop factors
