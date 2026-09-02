@@ -5,7 +5,10 @@ same parameter files; ``robot_id`` selects the topic namespace prefix the node
 uses, mirroring the ROS 1 launch structure.
 """
 
+import copy
 import os
+
+import yaml
 
 from ament_index_python.packages import get_package_share_directory
 
@@ -16,14 +19,62 @@ from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 
+def _deep_merge(destination, source):
+    for key, value in source.items():
+        if (isinstance(value, dict) and
+                isinstance(destination.get(key), dict)):
+            _deep_merge(destination[key], value)
+        else:
+            destination[key] = copy.deepcopy(value)
+
+
+def _load_parameter_files(paths):
+    """Merge wildcard ROS parameter files in their declared order.
+
+    Lyrical's rcl YAML loader does not reliably let a flat dotted launch
+    override replace the equivalent nested key from another file. Producing
+    one parameter tree here removes that ambiguous duplicate representation.
+    """
+    merged = {}
+    for path in paths:
+        with open(path, 'r', encoding='utf-8') as handle:
+            document = yaml.safe_load(handle) or {}
+        wildcard = document.get('/**', {})
+        parameters = wildcard.get('ros__parameters', {})
+        if not isinstance(parameters, dict):
+            raise ValueError(
+                f'{path}: /**.ros__parameters must be a mapping')
+        _deep_merge(merged, parameters)
+    return merged
+
+
+def _with_overrides(parameters, overrides):
+    result = copy.deepcopy(parameters)
+    for dotted_name, value in overrides.items():
+        parts = dotted_name.split('.')
+        target = result
+        for part in parts[:-1]:
+            existing = target.get(part)
+            if existing is None:
+                existing = {}
+                target[part] = existing
+            if not isinstance(existing, dict):
+                raise ValueError(
+                    f'parameter namespace {dotted_name!r} collides with a value')
+            target = existing
+        target[parts[-1]] = value
+    return result
+
+
 def launch_setup(context, *args, **kwargs):
     robot = LaunchConfiguration('robot').perform(context)
     id1 = LaunchConfiguration('id1').perform(context)
     id2 = LaunchConfiguration('id2').perform(context)
     no = int(LaunchConfiguration('no').perform(context))
-    params = [
+    parameter_paths = [
         path for path in
         LaunchConfiguration('params').perform(context).split(':') if path]
+    base_parameters = _load_parameter_files(parameter_paths)
     pcm_matrix_folder = LaunchConfiguration('pcm_matrix_folder').perform(context)
     use_map_fusion = (
         LaunchConfiguration('use_map_fusion').perform(context).lower() in
@@ -61,13 +112,14 @@ def launch_setup(context, *args, **kwargs):
             'liorf.mapDatumYaw': yaw,
         })
     suffix = '_' + robot if robot else ''
+    node_parameters = _with_overrides(base_parameters, common)
 
     nodes = [
         Node(
             package='liorf',
             executable='liorf_imageProjection',
             name='liorf_imageProjection' + suffix,
-            parameters=params + [common],
+            parameters=[node_parameters],
             output='screen',
             respawn=True,
         ),
@@ -75,7 +127,7 @@ def launch_setup(context, *args, **kwargs):
             package='liorf',
             executable='liorf_mapOptmization',
             name='liorf_mapOptmization' + suffix,
-            parameters=params + [common],
+            parameters=[node_parameters],
             output='screen',
             respawn=False,
         ),
@@ -84,7 +136,7 @@ def launch_setup(context, *args, **kwargs):
         Node(
             package='liorf',
             executable='liorf_imuPreintegration',
-            parameters=params + [common],
+            parameters=[node_parameters],
             output='screen',
             respawn=True,
             ros_arguments=[
@@ -99,14 +151,14 @@ def launch_setup(context, *args, **kwargs):
             package='liorf',
             executable='liorf_mapFusion',
             name='liorf_mapFusion' + suffix,
-            parameters=params + [{
+            parameters=[_with_overrides(base_parameters, {
                 **common,
                 'robot_id': robot,
                 'id_1': id1,
                 'id_2': id2,
                 'no': no,
                 'pcm_matrix_folder': pcm_matrix_folder,
-            }],
+            })],
             output='screen',
             respawn=False,
         ))

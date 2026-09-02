@@ -378,6 +378,10 @@ if(BUILD_TESTING)
   add_test(NAME test_skid_eval
     COMMAND ${Python3_EXECUTABLE} -m pytest -q
       ${CMAKE_CURRENT_SOURCE_DIR}/test/test_skid_eval.py)
+
+  add_test(NAME test_launch_parameter_merge
+    COMMAND ${Python3_EXECUTABLE} -m pytest -q
+      ${CMAKE_CURRENT_SOURCE_DIR}/test/test_launch_parameter_merge.py)
 endif()
 
 #############
