@@ -8,6 +8,7 @@
 #include "liorf/msg/cloud_info.hpp"
 #include "liorf/msg/context_info.hpp"
 #include "liorf/msg/loop_constraint.hpp"
+#include "liorf/msg/loop_diagnostic.hpp"
 #include "liorf/msg/scan_data.hpp"
 #include "liorf/msg/scan_request.hpp"
 
@@ -101,6 +102,7 @@ private:
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr _pub_trans_odom2odom;
 
     rclcpp::Publisher<liorf::msg::LoopConstraint>::SharedPtr _pub_loop_info_global;
+    rclcpp::Publisher<liorf::msg::LoopDiagnostic>::SharedPtr _pub_loop_diagnostic;
     rclcpp::Publisher<liorf::msg::ScanRequest>::SharedPtr _pub_scan_request;
     rclcpp::Publisher<liorf::msg::ScanData>::SharedPtr _pub_scan_data;
 
@@ -111,6 +113,7 @@ private:
     std::string _robot_this;//robot id which the thread is now processing
     std::string _solid_topic;
     std::string _loop_topic;
+    std::string _diagnostic_topic;
     std::string _solid_frame;
 	std::string _map_frame;
 	std::string _map_fusion_frame;
@@ -218,7 +221,16 @@ private:
     SOLiD *_solid_factory;
 
     std::vector<int> _robot_received_list;
-    std::vector<std::pair<int, int>> _idx_nearest_list;
+
+    struct DescriptorCandidate {
+        int match_bin = -1;
+        int sector_shift = 0;
+        double descriptor_distance =
+            std::numeric_limits<double>::quiet_NaN();
+        std::size_t rank = 0;
+    };
+
+    std::vector<DescriptorCandidate> _idx_nearest_list;
     std::unordered_map<int, SOLiDBin> _bin_with_id;
 
     struct RegisteredPose {
@@ -237,10 +249,13 @@ private:
         gtsam::Pose3 relative_pose;
         liorf::uncertainty::Matrix6d covariance =
             liorf::uncertainty::Matrix6d::Zero();
+        liorf::msg::LoopDiagnostic registration_diagnostic;
     };
 
     struct RegistrationOutput {
         bool valid = false;
+        std::string failure_reason;
+        liorf::registration::Result registration;
         gtsam::Pose3 aligned_source_pose;
         liorf::uncertainty::Matrix6d covariance =
             liorf::uncertainty::Matrix6d::Zero();
@@ -339,6 +354,8 @@ public:
         _pub_trans_odom2odom = create_publisher<nav_msgs::msg::Odometry>(_solid_topic + "/trans_odom", 1);
         _pub_loop_info_global = create_publisher<liorf::msg::LoopConstraint>(
                 _solid_topic + "/loop_info_global", 1);
+        _pub_loop_diagnostic = create_publisher<liorf::msg::LoopDiagnostic>(
+                prefixTopic(_robot_id, _diagnostic_topic), 50);
         _pub_scan_request = create_publisher<liorf::msg::ScanRequest>(
                 _solid_topic + "/scan_request", 20);
         _pub_scan_data = create_publisher<liorf::msg::ScanData>(
@@ -446,6 +463,8 @@ private:
         _solid_topic = declare_and_get<std::string>("mapfusion.interRobot.solid_topic", "solid");
         _loop_topic = declare_and_get<std::string>(
             "mapfusion.interRobot.loop_topic", "context/loop_info");
+        _diagnostic_topic = declare_and_get<std::string>(
+            "mapfusion.interRobot.diagnostic_topic", "solid/loop_diagnostics");
         _solid_frame = declare_and_get<std::string>("mapfusion.interRobot.solid_frame", "base_link");
         _local_topic = declare_and_get<std::string>("mapfusion.interRobot.local_topic", "liorf/mapping/cloud_info");
         _map_frame = liorf::frames::normalizeFrameId(
@@ -682,6 +701,124 @@ private:
 
     double nowSeconds() const { return this->now().seconds(); }
 
+    liorf::msg::LoopDiagnostic diagnosticFor(
+        int query_bin, const DescriptorCandidate & candidate) {
+        liorf::msg::LoopDiagnostic diagnostic;
+        diagnostic.header.stamp = this->now();
+        diagnostic.header.frame_id = _robot_id;
+        diagnostic.observer_robot_id = _robot_id;
+        diagnostic.query_keyframe_index = -1;
+        diagnostic.match_keyframe_index = -1;
+        diagnostic.candidate_rank = candidate.rank;
+        diagnostic.descriptor_distance = candidate.descriptor_distance;
+        diagnostic.sector_shift = candidate.sector_shift;
+
+        const double nan = std::numeric_limits<double>::quiet_NaN();
+        diagnostic.query_time = nan;
+        diagnostic.match_time = nan;
+        diagnostic.relative_pose.pose.orientation.w = 1.0;
+        diagnostic.relative_pose.covariance.fill(nan);
+        diagnostic.fine_error = nan;
+        diagnostic.overlap_ratio = nan;
+        diagnostic.truncated_mse_m2 = nan;
+        diagnostic.uncertainty_variance_scale = nan;
+        diagnostic.uncertainty_condition_number = nan;
+        diagnostic.coarse_time_ms = nan;
+        diagnostic.fine_time_ms = nan;
+        diagnostic.metric_time_ms = nan;
+
+        const auto query = _bin_with_id.find(query_bin);
+        if (query != _bin_with_id.end()) {
+            diagnostic.query_robot_id = query->second.robotname;
+            diagnostic.query_keyframe_index = keyframeIndexOf(query->second);
+            diagnostic.query_time = query->second.time;
+        }
+        const auto match = _bin_with_id.find(candidate.match_bin);
+        if (match != _bin_with_id.end()) {
+            diagnostic.match_robot_id = match->second.robotname;
+            diagnostic.match_keyframe_index = keyframeIndexOf(match->second);
+            diagnostic.match_time = match->second.time;
+        }
+        return diagnostic;
+    }
+
+    void publishCandidateStage(
+        int query_bin, const DescriptorCandidate & candidate,
+        const std::string & stage, const std::string & decision,
+        const std::string & reason) {
+        liorf::msg::LoopDiagnostic diagnostic =
+            diagnosticFor(query_bin, candidate);
+        diagnostic.stage = stage;
+        diagnostic.decision = decision;
+        diagnostic.reason = reason;
+        _pub_loop_diagnostic->publish(diagnostic);
+    }
+
+    static DescriptorCandidate descriptorCandidateOf(
+        const liorf::comms::DeferredCandidate & deferred) {
+        DescriptorCandidate candidate;
+        candidate.match_bin = deferred.candidate_bin;
+        candidate.sector_shift = deferred.sector_shift;
+        candidate.descriptor_distance = deferred.descriptor_distance;
+        candidate.rank = deferred.candidate_rank;
+        return candidate;
+    }
+
+    static void populateRegistrationFields(
+        liorf::msg::LoopDiagnostic & diagnostic,
+        const RegistrationOutput & output) {
+        const liorf::registration::Result & registration = output.registration;
+        diagnostic.registration_attempted = true;
+        diagnostic.registration_accepted = output.valid;
+        diagnostic.registration_status =
+            liorf::registration::toString(registration.status);
+        diagnostic.registration_detail = registration.detail;
+        diagnostic.source_points = registration.source_points;
+        diagnostic.target_points = registration.target_points;
+        diagnostic.coarse_correspondences = registration.coarse_correspondences;
+        diagnostic.coarse_rotation_inliers = registration.coarse_rotation_inliers;
+        diagnostic.coarse_translation_inliers =
+            registration.coarse_translation_inliers;
+        diagnostic.fine_inliers = registration.fine_inliers;
+        diagnostic.fine_converged = registration.fine_converged;
+        diagnostic.fine_iterations = registration.fine_iterations;
+        diagnostic.fine_error = registration.fine_error;
+        diagnostic.metric_inliers = registration.metric.correspondence_count;
+        diagnostic.overlap_ratio = registration.metric.overlap_ratio;
+        diagnostic.truncated_mse_m2 = registration.metric.value_m2;
+        diagnostic.uncertainty_variance_scale =
+            registration.uncertainty.variance_scale;
+        diagnostic.uncertainty_condition_number =
+            registration.uncertainty.condition_number;
+        diagnostic.uncertainty_clamped_modes =
+            registration.uncertainty.clamped_modes;
+        diagnostic.coarse_time_ms = 1000.0 * registration.coarse_seconds;
+        diagnostic.fine_time_ms = 1000.0 * registration.fine_seconds;
+        diagnostic.metric_time_ms = 1000.0 * registration.metric_seconds;
+    }
+
+    liorf::msg::LoopDiagnostic registrationDiagnostic(
+        int query_bin, const DescriptorCandidate & candidate,
+        const RegistrationOutput & output,
+        const liorf::uncertainty::PoseWithCovariance * query_from_match) {
+        liorf::msg::LoopDiagnostic diagnostic =
+            diagnosticFor(query_bin, candidate);
+        diagnostic.stage = "registration";
+        diagnostic.decision = output.valid ? "accepted" : "rejected";
+        diagnostic.reason = output.valid ? "quality_gates_passed" :
+            (output.failure_reason.empty() ? "registration_failed" :
+                                             output.failure_reason);
+        populateRegistrationFields(diagnostic, output);
+        if (query_from_match != nullptr) {
+            diagnostic.relative_pose.pose =
+                liorf::loop_constraint::poseToMessage(query_from_match->pose);
+            liorf::loop_constraint::covarianceToMessage(
+                query_from_match->covariance,
+                diagnostic.relative_pose.covariance);
+        }
+        return diagnostic;
+    }
+
     // The keyframe index a place occupies in its own robot's trajectory.
     //
     // The mapping node transports it in the pose intensity channel, which is a
@@ -892,14 +1029,24 @@ private:
         if (!msgIn->available) {
             // The owner cannot supply it, so nothing parked on it can ever
             // complete. Release those candidates rather than let them age out.
-            _deferred_candidates->release(key);
+            for (const auto & deferred : _deferred_candidates->release(key)) {
+                publishCandidateStage(
+                    deferred.query_bin, descriptorCandidateOf(deferred),
+                    "scan", "rejected", "scan_unavailable");
+            }
             return;
         }
 
         pcl::PointCloud<PointType>::Ptr cloud(new pcl::PointCloud<PointType>());
         pcl::fromROSMsg(msgIn->scan_cloud, *cloud);
-        if (cloud->empty())
+        if (cloud->empty()) {
+            for (const auto & deferred : _deferred_candidates->release(key)) {
+                publishCandidateStage(
+                    deferred.query_bin, descriptorCandidateOf(deferred),
+                    "scan", "rejected", "scan_empty");
+            }
             return;
+        }
         storeScan(key, cloud);
 
         const auto bin_it = _bin_of_scan_key.find(key);
@@ -911,11 +1058,18 @@ private:
 
         bool new_candidate = false;
         for (const auto & ready : _deferred_candidates->release(key)) {
-            if (!candidateScansHeld(ready.query_bin, ready.candidate_bin))
+            const DescriptorCandidate candidate = descriptorCandidateOf(ready);
+            if (!candidateScansHeld(ready.query_bin, ready.candidate_bin)) {
+                publishCandidateStage(
+                    ready.query_bin, candidate, "scan", "rejected",
+                    "scan_evicted");
                 continue;
+            }
+            publishCandidateStage(
+                ready.query_bin, candidate, "scan", "accepted",
+                "scans_received");
             new_candidate =
-                getInitialGuess(
-                    ready.query_bin, ready.candidate_bin, ready.sector_shift) ||
+                getInitialGuess(ready.query_bin, candidate) ||
                 new_candidate;
         }
         if (new_candidate)
@@ -936,9 +1090,18 @@ private:
             RCLCPP_WARN(get_logger(),
                 "Giving up on scan %s after %zu attempts", key.str().c_str(),
                 _comms_config.max_request_attempts);
-            _deferred_candidates->release(key);
+            for (const auto & deferred : _deferred_candidates->release(key)) {
+                publishCandidateStage(
+                    deferred.query_bin, descriptorCandidateOf(deferred),
+                    "scan", "rejected", "scan_request_abandoned");
+            }
         }
-        _deferred_candidates->expire(now_s);
+        for (const auto & deferred :
+             _deferred_candidates->expireCandidates(now_s)) {
+            publishCandidateStage(
+                deferred.query_bin, descriptorCandidateOf(deferred),
+                "scan", "rejected", "scan_wait_timeout");
+        }
 
         if (now_s - _last_comms_report_s < _comms_report_period_s)
             return;
@@ -1241,6 +1404,7 @@ private:
     void run(SOLiDBin bin){
         //build
 
+        _idx_nearest_list.clear();
         buildKDTree(bin);
         KNNSearch(bin);
 
@@ -1269,7 +1433,17 @@ private:
         sendOdomOutputMessage();
     }
 
+    void selectPositionCandidate(int query_bin, int match_bin) {
+        DescriptorCandidate candidate;
+        candidate.match_bin = match_bin;
+        candidate.rank = 1;
+        _idx_nearest_list.push_back(candidate);
+        publishCandidateStage(
+            query_bin, candidate, "descriptor", "selected", "position_search");
+    }
+
     void distanceSearch(SOLiDBin bin){
+        const int query_bin = _num_bin - 1;
         int id_this = robotID2Number(bin.robotname);
         if(bin.robotname != _robot_id){
             if(_global_map_trans_optimized.find(id_this) == _global_map_trans_optimized.end() )
@@ -1290,7 +1464,7 @@ private:
             _kdtree_pose_to_search->radiusSearch(pt_query, 5, idx_list, dist_list, 0);
             if (!idx_list.empty()){
                 int tmp_id = _cloud_pose_to_search_this->points[idx_list[0]].intensity;
-                _idx_nearest_list.emplace_back(std::make_pair(tmp_id, 0));
+                selectPositionCandidate(query_bin, tmp_id);
             }
         }
         else{
@@ -1322,11 +1496,11 @@ private:
             _kdtree_pose_to_search->setInputCloud(cloud_pose_to_search_other_copy);
             _kdtree_pose_to_search->radiusSearch(pt_query, 10, idx_list, dist_list, 0);
             if (!idx_list.empty()){
-                for (unsigned int i = 0; i< cloud_pose_to_search_other_copy->size(); i++){
+                for (unsigned int i = 0; i < idx_list.size(); i++){
                     int tmp_id = cloud_pose_to_search_other_copy->points[idx_list[i]].intensity;
-                    if(tmp_id == _num_bin)
+                    if(tmp_id == query_bin)
                         continue;
-                    _idx_nearest_list.emplace_back(std::make_pair(tmp_id, 0));
+                    selectPositionCandidate(query_bin, tmp_id);
                     break;
                 }
             }
@@ -1399,10 +1573,6 @@ private:
         //first: dist, second: idx in bin, third: rot_idx
         std::vector<std::tuple<float, int, int>> idx_list;
         for (int i = 0; i < std::min( num_neighbors, int(indices.size()) ); ++i){
-            //check if the searching work normally
-            if ( indices.sum() == 0)
-                continue;
-
             idx_candidate = indices[i];
             if ( idx_candidate >= _num_bin)
                 continue;
@@ -1422,25 +1592,46 @@ private:
             distance_to_query = distBtnSOLiDs(bin.rsolid, _bin_with_id.at(idx_candidate).rsolid, 
                                               bin.asolid, _bin_with_id.at(idx_candidate).asolid, rot_idx);
 
-            if( distance_to_query > _loop_thres)
-                continue;
-
             //add to idx list
             idx_list.emplace_back( std::make_tuple(distance_to_query, idx_candidate, rot_idx) );
         }
 
-        _idx_nearest_list.clear();
-
         if (idx_list.size() == 0)
             return;
 
-        //find nearest solids
+        // Retain the complete eligible KNN set in the diagnostic stream. The
+        // evaluation sweep needs rejected distances too, not just the match
+        // that happened to pass the configured threshold in this run.
         std::sort(idx_list.begin(), idx_list.end());
-        for (int i = 0; i < std::min( _num_match_candidates, int(idx_list.size()) ); i++){
+        int selected_count = 0;
+        for (std::size_t i = 0; i < idx_list.size(); ++i){
             std::tie(distance_to_query, idx_candidate, rot_idx) = idx_list[i];
-            _idx_nearest_list.emplace_back(std::make_pair(idx_candidate, rot_idx));
+            DescriptorCandidate candidate;
+            candidate.match_bin = idx_candidate;
+            candidate.sector_shift = rot_idx;
+            candidate.descriptor_distance = distance_to_query;
+            candidate.rank = i + 1;
+
+            const bool valid_distance = std::isfinite(distance_to_query);
+            const bool within_threshold =
+                valid_distance && distance_to_query <= _loop_thres;
+            const bool selected = within_threshold &&
+                selected_count < _num_match_candidates;
+            if (selected) {
+                ++selected_count;
+                _idx_nearest_list.push_back(candidate);
+                publishCandidateStage(
+                    _num_bin - 1, candidate, "descriptor", "selected",
+                    "within_descriptor_threshold");
+            } else {
+                const std::string reason = !valid_distance ?
+                    "invalid_descriptor" :
+                    (within_threshold ? "candidate_budget" :
+                                        "descriptor_threshold");
+                publishCandidateStage(
+                    _num_bin - 1, candidate, "descriptor", "rejected", reason);
+            }
         }
-        idx_list.clear();
     }
 
     // True when both scans behind a candidate are held right now.
@@ -1457,26 +1648,40 @@ private:
     // missing and parking the candidate until it arrives.
     //
     // Returns true only when the candidate can be registered immediately.
-    bool ensureCandidateScans(int query_bin, int candidate_bin, int min_idx,
-                              double now_s) {
+    bool ensureCandidateScans(
+        int query_bin, const DescriptorCandidate & descriptor_candidate,
+        double now_s) {
+        const int candidate_bin = descriptor_candidate.match_bin;
         const auto query = _bin_with_id.find(query_bin);
         const auto candidate = _bin_with_id.find(candidate_bin);
-        if (query == _bin_with_id.end() || candidate == _bin_with_id.end())
+        if (query == _bin_with_id.end() || candidate == _bin_with_id.end()) {
+            publishCandidateStage(
+                query_bin, descriptor_candidate, "scan", "rejected",
+                "unknown_candidate_bin");
             return false;
+        }
 
         std::vector<liorf::comms::ScanKey> missing;
         for (const SOLiDBin * bin : {&query->second, &candidate->second}) {
             const liorf::comms::ScanKey key = scanKeyOf(*bin);
-            if (!key.valid())
+            if (!key.valid()) {
+                publishCandidateStage(
+                    query_bin, descriptor_candidate, "scan", "rejected",
+                    "invalid_scan_key");
                 return false;
+            }
             if (haveScan(key)) {
                 _scan_cache->touch(key);
                 continue;
             }
             missing.push_back(key);
         }
-        if (missing.empty())
+        if (missing.empty()) {
+            publishCandidateStage(
+                query_bin, descriptor_candidate, "scan", "accepted",
+                "scans_cached");
             return true;
+        }
 
         bool every_request_outstanding = true;
         for (const auto & key : missing)
@@ -1485,16 +1690,26 @@ private:
         if (!every_request_outstanding) {
             // Nothing will arrive for at least one of these scans, so parking
             // the candidate would only occupy a slot until it aged out.
+            publishCandidateStage(
+                query_bin, descriptor_candidate, "scan", "rejected",
+                "scan_request_failed");
             return false;
         }
 
         liorf::comms::DeferredCandidate deferred;
         deferred.query_bin = query_bin;
         deferred.candidate_bin = candidate_bin;
-        deferred.sector_shift = min_idx;
+        deferred.sector_shift = descriptor_candidate.sector_shift;
+        deferred.descriptor_distance =
+            descriptor_candidate.descriptor_distance;
+        deferred.candidate_rank = descriptor_candidate.rank;
         deferred.parked_at_s = now_s;
         deferred.missing = std::move(missing);
-        _deferred_candidates->park(std::move(deferred));
+        const bool parked = _deferred_candidates->park(std::move(deferred));
+        publishCandidateStage(
+            query_bin, descriptor_candidate, "scan",
+            parked ? "deferred" : "rejected",
+            parked ? "scan_requested" : "deferred_queue_rejected");
         return false;
     }
 
@@ -1505,19 +1720,23 @@ private:
         const int query_bin = _num_bin - 1;
         const double now_s = nowSeconds();
         bool new_candidate_signal = false;
-        for (auto it: _idx_nearest_list){
-            if (!ensureCandidateScans(query_bin, it.first, it.second, now_s))
+        for (const auto & candidate : _idx_nearest_list){
+            if (!ensureCandidateScans(query_bin, candidate, now_s))
                 continue;
             // Evaluated first so every candidate is attempted, not just the
             // last one: the previous assignment discarded earlier results.
             new_candidate_signal =
-                getInitialGuess(query_bin, it.first, it.second) ||
+                getInitialGuess(query_bin, candidate) ||
                 new_candidate_signal;
         }
         return new_candidate_signal;
     }
 
-    bool getInitialGuess(int query_bin, int idx_nearest, int min_idx){
+    bool getInitialGuess(
+        int query_bin, const DescriptorCandidate & descriptor_candidate){
+
+        const int idx_nearest = descriptor_candidate.match_bin;
+        const int min_idx = descriptor_candidate.sector_shift;
 
         const auto query_it = _bin_with_id.find(query_bin);
         if (query_it == _bin_with_id.end())
@@ -1525,6 +1744,7 @@ private:
         SOLiDBin bin = query_it->second;
 
         int id0 = idx_nearest, id1 = query_bin;
+        int source_bin = query_bin;
 
         SOLiDBin bin_nearest;
         PointTypePose source_pose_initial, target_pose;
@@ -1550,6 +1770,7 @@ private:
 
             id0 = query_bin;
             id1 = idx_nearest;
+            source_bin = idx_nearest;
 
             solid_pitch = -solid_pitch;
         }
@@ -1602,16 +1823,22 @@ private:
             RCLCPP_DEBUG(get_logger(),
                 "Candidate %d -> %d dropped: a scan is no longer held",
                 id0, id1);
+            publishCandidateStage(
+                query_bin, descriptor_candidate, "scan", "rejected",
+                "scan_evicted");
             return false;
         }
 
-        const RegistrationOutput registered = registerRelativeMotion(
+        RegistrationOutput registered = registerRelativeMotion(
             transformPointCloud(source_scan, &source_pose_initial),
             transformPointCloud(target_scan, &target_pose),
             source_pose_initial);
 
-        if (!registered.valid)
+        if (!registered.valid) {
+            _pub_loop_diagnostic->publish(registrationDiagnostic(
+                query_bin, descriptor_candidate, registered, nullptr));
             return false;
+        }
 
         //1: jackal0, 2: jackal1
         gtsam::Pose3 pose_from =
@@ -1626,10 +1853,37 @@ private:
             registered.aligned_source_pose, registered.covariance,
             pose_target, liorf::uncertainty::Matrix6d::Zero());
         if (!liorf::uncertainty::validCovariance(relative_to_target.covariance)) {
+            registered.valid = false;
+            registered.failure_reason = "relative_pose_covariance_propagation";
             RCLCPP_WARN(get_logger(),
                 "SKiD registration covariance failed relative-pose propagation");
+            _pub_loop_diagnostic->publish(registrationDiagnostic(
+                query_bin, descriptor_candidate, registered, nullptr));
             return false;
         }
+
+        // between(aligned source, target) maps target into source. Orient that
+        // measurement as match -> query regardless of which robot ordering
+        // was chosen for registration.
+        liorf::uncertainty::PoseWithCovariance query_from_match =
+            relative_to_target;
+        if (source_bin != query_bin) {
+            query_from_match = liorf::uncertainty::inverse(
+                query_from_match.pose, query_from_match.covariance);
+        }
+        if (!liorf::uncertainty::validCovariance(
+                query_from_match.covariance)) {
+            registered.valid = false;
+            registered.failure_reason = "diagnostic_pose_covariance_propagation";
+            _pub_loop_diagnostic->publish(registrationDiagnostic(
+                query_bin, descriptor_candidate, registered, nullptr));
+            return false;
+        }
+
+        liorf::msg::LoopDiagnostic registration_diagnostic =
+            registrationDiagnostic(
+                query_bin, descriptor_candidate, registered, &query_from_match);
+        _pub_loop_diagnostic->publish(registration_diagnostic);
 
         _pose_queue[_robot_this_th].push_back(RegisteredPose{
             pose_from,
@@ -1638,8 +1892,14 @@ private:
             registered.truncated_mse_m2,
             registered.overlap_ratio,
             registered.inliers});
-        _loop_queue[_robot_this_th].push_back(LoopCandidate{
-            id0, id1, relative_to_target.pose, relative_to_target.covariance});
+        LoopCandidate loop_candidate;
+        loop_candidate.target_bin = id0;
+        loop_candidate.source_bin = id1;
+        loop_candidate.relative_pose = relative_to_target.pose;
+        loop_candidate.covariance = relative_to_target.covariance;
+        loop_candidate.registration_diagnostic =
+            std::move(registration_diagnostic);
+        _loop_queue[_robot_this_th].push_back(std::move(loop_candidate));
 
         return true;
     }
@@ -1704,10 +1964,12 @@ private:
             target_points.emplace_back(point.x, point.y, point.z);
         }
 
-        const liorf::registration::Result registration =
-            liorf::registration::registerClouds(
-                source_points, target_points, _registration_config);
+        output.registration = liorf::registration::registerClouds(
+            source_points, target_points, _registration_config);
+        const liorf::registration::Result & registration = output.registration;
         if (!registration.accepted()) {
+            output.failure_reason =
+                liorf::registration::toString(registration.status);
             RCLCPP_WARN(
                 get_logger(),
                 "SKiD registration rejected (%s): %s "
@@ -1735,6 +1997,7 @@ private:
             initial_world_from_lidar,
             liorf::uncertainty::Matrix6d::Zero());
         if (!liorf::uncertainty::validCovariance(aligned.covariance)) {
+            output.failure_reason = "pose_covariance_propagation";
             RCLCPP_WARN(get_logger(),
                 "SKiD registration covariance failed pose-composition propagation");
             return output;
@@ -1770,6 +2033,27 @@ private:
 
     }
 
+    void publishPcmDiagnostics(
+        const std::vector<LoopCandidate> & candidates,
+        const std::vector<int> & maximum_clique) {
+        for (std::size_t index = 0; index < candidates.size(); ++index) {
+            liorf::msg::LoopDiagnostic diagnostic =
+                candidates[index].registration_diagnostic;
+            const bool accepted = std::binary_search(
+                maximum_clique.begin(), maximum_clique.end(),
+                static_cast<int>(index));
+            diagnostic.header.stamp = this->now();
+            diagnostic.stage = "pcm";
+            diagnostic.decision = accepted ? "accepted" : "rejected";
+            diagnostic.reason = accepted ?
+                "maximum_clique" : "outside_maximum_clique";
+            diagnostic.pcm_evaluated = true;
+            diagnostic.pcm_accepted = accepted;
+            diagnostic.pcm_clique_size = maximum_clique.size();
+            _pub_loop_diagnostic->publish(diagnostic);
+        }
+    }
+
     bool incrementalPCM() {
         if (_pose_queue[_robot_this_th].size() <
             static_cast<std::size_t>(_pcm_start_threshold))
@@ -1788,6 +2072,8 @@ private:
         FMC::maxCliqueHeu(gio, max_clique_data);
 
         std::sort(max_clique_data.begin(), max_clique_data.end());
+        publishPcmDiagnostics(
+            _loop_queue[_robot_this_th], max_clique_data);
 
         auto loop_accept_queue_this = _loop_accept_queue.find(_robot_this_th);
         if (loop_accept_queue_this == _loop_accept_queue.end()){

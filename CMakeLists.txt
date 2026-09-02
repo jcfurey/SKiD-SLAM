@@ -163,6 +163,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/CloudInfo.msg"
   "msg/ContextInfo.msg"
   "msg/LoopConstraint.msg"
+  "msg/LoopDiagnostic.msg"
   "msg/ScanRequest.msg"
   "msg/ScanData.msg"
   "srv/SaveMap.srv"

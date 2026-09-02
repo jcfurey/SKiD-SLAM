@@ -206,9 +206,9 @@ ARE, descriptor memory against a Scan Context baseline, and communication cost.
 ```
 
 It needs no dependency beyond PyYAML. See
-[`evaluation/README.md`](evaluation/README.md) for the file conventions, what
-can and cannot yet be extracted from a bag, and why each manifest's `expected`
-block is deliberately empty.
+[`evaluation/README.md`](evaluation/README.md) for the file conventions, the
+trajectory and structured loop-diagnostic bag extractors, and why each
+manifest's `expected` block is deliberately empty.
 
 DiSO FEATURES
 ---------------------------------------------------------------------------------------------------------------------------------------------------

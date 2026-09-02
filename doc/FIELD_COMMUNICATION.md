@@ -130,6 +130,7 @@ topic matching, self-traffic suppression, empty and multi-megabyte payloads,
 publishing with no peer attached, and the echo suppressor's loop-breaking
 behaviour.
 
-**The bridge node itself has not been compiled or run.** It needs a ROS 2
-installation, which this repository's development environment does not have.
-Follow the bench verification above before deploying it.
+The `liorf_zmqBridge` node was compiled successfully with the complete package
+on ROS 2 Lyrical on 1 September 2026. It has **not** been run as a bridge or
+tested across two ROS domains/hosts. Follow the bench verification above before
+deploying it.

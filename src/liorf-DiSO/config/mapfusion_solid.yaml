@@ -19,6 +19,9 @@
             # Accepted loop factors use a separate, shared publisher/subscriber
             # contract rather than being inferred from solid_topic.
             loop_topic: "context/loop_info"
+            # Per-observer structured candidate/registration/PCM trace used by
+            # evaluation/extract_diagnostics_from_bag.py.
+            diagnostic_topic: "solid/loop_diagnostics"
             solid_frame: "base_link"
             local_topic: "liorf/mapping/cloud_info"
 

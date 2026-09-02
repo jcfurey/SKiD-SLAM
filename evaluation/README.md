@@ -67,22 +67,34 @@ are cumulative, so the last one in the log is the run total.
 ## Producing the inputs
 
 `extract_from_bag.py` converts an odometry topic in a ROS 2 bag into a TUM
-trajectory. **It has not been executed during development** — this repository's
-development environment has no ROS installation — so treat it as a starting
-point and check its output before trusting a result computed from it.
+trajectory. It has not yet been validated against a representative recorded
+evaluation run, so check its topic and frame convention before trusting a
+metric computed from it.
 
-The other two inputs cannot be extracted from a bag today:
+Map fusion publishes the other two inputs as a structured
+`liorf/msg/LoopDiagnostic` trace. The default per-observer topic is
+`/<robot>/solid/loop_diagnostics`; record the topic from the robot doing the
+fusion, then extract both CSVs in one pass:
 
-- **Loop candidates** need the descriptor distance of each retrieved
-  candidate, including the rejected ones. The nodes log that at debug level but
-  publish it nowhere. `PAPER_V3_GAP_AUDIT.md` tracks the missing structured
-  diagnostic topic under Phase 2 item 4.
-- **Registrations** need a keyframe index to timestamp mapping to turn a
-  `LoopConstraint`'s indices into the times this harness keys on. The
-  `cloud_info` topic carries both, so a bag containing it is sufficient, but no
-  extractor for it is written.
+```bash
+./evaluation/extract_diagnostics_from_bag.py my_recorded_run \
+    --topic /jackal1/solid/loop_diagnostics \
+    --candidates-output results/park/candidates.csv \
+    --registrations-output results/park/registrations.csv
+```
 
-Until those exist, both files have to be produced by instrumenting a run.
+The candidate CSV includes every eligible descriptor comparison in the KNN
+set, including threshold and candidate-budget rejections. Position-search
+fallbacks are not included because they have no descriptor score. The
+registration CSV includes accepted registrations only and writes the estimated
+transform in the documented match-into-query convention. Extra identity,
+quality, uncertainty, and timing columns are retained for auditability; the
+harness ignores columns it does not consume.
+
+The same topic also records scan-request outcomes and PCM maximum-clique
+decisions. Those stages are intentionally excluded from the two CSVs, but stay
+available in the bag for diagnosing why a descriptor candidate did not become
+a factor.
 
 ## Expected values
 

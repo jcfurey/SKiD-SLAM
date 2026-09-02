@@ -293,6 +293,8 @@ TEST(SkidCommsDeferredCandidates, ReleasesOnlyWhenEveryScanHasArrived) {
   candidate.query_bin = 7;
   candidate.candidate_bin = 2;
   candidate.sector_shift = 4;
+  candidate.descriptor_distance = 0.125;
+  candidate.candidate_rank = 3;
   candidate.parked_at_s = 1.0;
   candidate.missing = {key("a", 7), key("b", 2)};
   ASSERT_TRUE(queue.park(candidate));
@@ -305,6 +307,8 @@ TEST(SkidCommsDeferredCandidates, ReleasesOnlyWhenEveryScanHasArrived) {
   EXPECT_EQ(7, ready[0].query_bin);
   EXPECT_EQ(2, ready[0].candidate_bin);
   EXPECT_EQ(4, ready[0].sector_shift);
+  EXPECT_DOUBLE_EQ(0.125, ready[0].descriptor_distance);
+  EXPECT_EQ(3u, ready[0].candidate_rank);
   EXPECT_EQ(0u, queue.size());
 }
 
@@ -365,6 +369,30 @@ TEST(SkidCommsDeferredCandidates, ExpiresStaleCandidates) {
   EXPECT_EQ(1u, queue.expired());
   EXPECT_TRUE(queue.release(key("a", 0)).empty());
   EXPECT_EQ(1u, queue.release(key("a", 1)).size());
+}
+
+TEST(SkidCommsDeferredCandidates, ReturnsExpiredCandidatesForDiagnostics) {
+  Config config = testConfig();
+  config.max_deferred_age_s = 10.0;
+  DeferredCandidateQueue queue(config);
+
+  DeferredCandidate candidate;
+  candidate.query_bin = 8;
+  candidate.candidate_bin = 5;
+  candidate.descriptor_distance = 0.2;
+  candidate.candidate_rank = 2;
+  candidate.parked_at_s = 0.0;
+  candidate.missing = {key("b", 5)};
+  ASSERT_TRUE(queue.park(candidate));
+
+  const auto expired = queue.expireCandidates(11.0);
+  ASSERT_EQ(1u, expired.size());
+  EXPECT_EQ(8, expired[0].query_bin);
+  EXPECT_EQ(5, expired[0].candidate_bin);
+  EXPECT_DOUBLE_EQ(0.2, expired[0].descriptor_distance);
+  EXPECT_EQ(2u, expired[0].candidate_rank);
+  EXPECT_EQ(1u, queue.expired());
+  EXPECT_EQ(0u, queue.size());
 }
 
 // ---------------------------------------------------------------------------

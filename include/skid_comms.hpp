@@ -231,6 +231,8 @@ struct DeferredCandidate {
   int query_bin = -1;
   int candidate_bin = -1;
   int sector_shift = 0;
+  double descriptor_distance = std::numeric_limits<double>::quiet_NaN();
+  std::size_t candidate_rank = 0;
   double parked_at_s = 0.0;
   std::vector<ScanKey> missing;
 };
@@ -255,6 +257,10 @@ class DeferredCandidateQueue {
 
   // Drops candidates parked longer than the configured age. Returns how many.
   std::size_t expire(double now_s);
+
+  // Same expiry policy, but returns the dropped candidates so a caller can
+  // publish a terminal diagnostic for each one.
+  std::vector<DeferredCandidate> expireCandidates(double now_s);
 
   std::size_t size() const noexcept { return parked_.size(); }
   std::size_t dropped() const noexcept { return dropped_; }

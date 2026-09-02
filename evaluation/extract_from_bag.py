@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """Convert an odometry topic in a ROS 2 bag into a TUM trajectory.
 
-NOT EXECUTED DURING DEVELOPMENT. This repository's development environment has
-no ROS installation, so this script is written from the rosbag2_py and
-nav_msgs APIs but has never been run. Check its output against the bag before
-trusting a metric computed from it.
+NOT YET VALIDATED AGAINST A REPRESENTATIVE RECORDED ESTIMATE. Check the topic
+and frame convention in its output before trusting a metric computed from it.
 
     ./evaluation/extract_from_bag.py my_bag \
         --topic /jackal0/liorf/mapping/odometry \
@@ -49,6 +47,12 @@ def main(argv=None):
               f"{', '.join(sorted(types))}", file=sys.stderr)
         return 2
 
+    expected_type = "nav_msgs/msg/Odometry"
+    if types[arguments.topic] != expected_type:
+        print(f"error: {arguments.topic} has type {types[arguments.topic]}, "
+              f"expected {expected_type}", file=sys.stderr)
+        return 2
+
     message_type = get_message(types[arguments.topic])
     reader.set_filter(rosbag2_py.StorageFilter(topics=[arguments.topic]))
 
@@ -58,7 +62,9 @@ def main(argv=None):
     with open(output, "w", encoding="utf-8") as handle:
         handle.write("# timestamp tx ty tz qx qy qz qw\n")
         while reader.has_next():
-            _, data, _ = reader.read_next()
+            record = (reader.read_next_ext()
+                      if hasattr(reader, "read_next_ext") else reader.read_next())
+            data = record[1]
             message = deserialize_message(data, message_type)
             stamp = message.header.stamp
             time = stamp.sec + stamp.nanosec * 1e-9

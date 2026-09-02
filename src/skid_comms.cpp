@@ -297,14 +297,19 @@ std::vector<DeferredCandidate> DeferredCandidateQueue::release(
 }
 
 std::size_t DeferredCandidateQueue::expire(double now_s) {
+  return expireCandidates(now_s).size();
+}
+
+std::vector<DeferredCandidate> DeferredCandidateQueue::expireCandidates(
+  double now_s) {
+  std::vector<DeferredCandidate> removed;
   if (!std::isfinite(now_s)) {
-    return 0;
+    return removed;
   }
-  std::size_t removed = 0;
   for (auto it = parked_.begin(); it != parked_.end();) {
     if (now_s - it->parked_at_s > config_.max_deferred_age_s) {
+      removed.push_back(std::move(*it));
       it = parked_.erase(it);
-      ++removed;
       ++expired_;
     } else {
       ++it;

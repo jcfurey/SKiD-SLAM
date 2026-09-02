@@ -133,10 +133,10 @@ loop with the right position and the wrong heading is not a successful
 registration, and a test asserts that a 45-degree error at zero translation
 scores zero.
 
-## 5. What the node still cannot supply
+## 5. What the node could not supply at this change
 
-Two harness inputs cannot be extracted from a bag today, and this is the
-useful finding from building it:
+At the time of this change, two harness inputs could not be extracted from a
+bag; that was the useful finding from building it:
 
 1. **Loop-candidate scores.** Precision-recall needs the descriptor distance of
    every retrieved candidate, including rejected ones. The nodes log that at
@@ -149,6 +149,17 @@ useful finding from building it:
 
 Both are recorded in `evaluation/README.md` and in the audit row rather than
 left for someone to discover.
+
+### Follow-up — 1 September 2026
+
+Both gaps are now closed. `liorf/msg/LoopDiagnostic` publishes eligible
+descriptor scores (including rejections), keyframe identities/timestamps, scan
+outcomes, full registration results, and PCM decisions.
+`evaluation/extract_diagnostics_from_bag.py` converts that topic into candidate
+and accepted-registration CSVs in one pass. Its filtering and transform
+convention have unit coverage and were exercised through an actual ROS 2 bag
+serialization round trip. A representative multi-robot dataset run is still
+required before any paper comparison can be claimed.
 
 ## 6. Verification
 
@@ -174,7 +185,7 @@ Two real defects were found by these tests rather than by inspection:
   vacuous when the expected value is zero — an ATE of exactly 0.0 could not be
   matched. Each metric now carries a relative and an absolute tolerance.
 
-### What was not verified
+### What was not verified at this change
 
 - **No dataset has been run.** None of the six configurations has been used
   against its bag. Topic names, `imuRate` — a package default, not a
@@ -183,9 +194,9 @@ Two real defects were found by these tests rather than by inspection:
 - **No metric has been computed from a real run.** Every number above comes
   from synthetic data with a known answer. That validates the implementations,
   not their agreement with the paper.
-- **`extract_from_bag.py` has never been executed.** It needs ROS, which this
-  environment does not have. It is marked as such in its own header and in the
-  README.
+- **`extract_from_bag.py` had not been executed.** The original environment had
+  no ROS installation. The later ROS follow-up has still not validated this
+  trajectory extractor against a representative recorded estimate.
 - The `python3-pytest` and `python3-yaml` test dependencies were added to
   `package.xml` but not resolved through rosdep here.
 
@@ -204,6 +215,9 @@ Newly opened:
 - Write the keyframe-index-to-time extractor for registrations.
 - Run each dataset and fill in the `expected` blocks once the protocol is
   confirmed against the paper.
+
+The first two items were completed by the follow-up above. Dataset execution
+and protocol confirmation remain open.
 
 ## 8. Commits
 

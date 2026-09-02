@@ -130,13 +130,43 @@ The tested components are the parts most likely to be subtly wrong — geometry,
 policy, parsing, arithmetic — and the untested parts are mostly thin glue. That
 is the intended shape, but it is not a substitute for a build.
 
+### Post-session verification — 1 September 2026
+
+A later follow-up closed part of the historical boundary above on ROS 2
+Lyrical. The current `v3` working tree, including `LoopDiagnostic` and its bag
+extractor, was built in the workspace with CMake/Make and package parallelism
+capped at two. `liorf`, `benchmark_livox_bridge`, and `skid_slam_playback` all
+completed; every ROS interface was generated, and the map-fusion and ZeroMQ
+bridge executables linked.
+
+All 12 `liorf` test targets pass. Eleven ran in the restricted test sandbox;
+the ZeroMQ transport target was rerun with loopback socket access after its
+only sandbox failure (`Operation not permitted`) and all 25 cases passed. The
+Livox bridge's four conversion cases and the evaluation harness's 54 cases also
+pass.
+
+HelmDyn03 was then replayed in full at 1x, headless, with map fusion enabled and
+a 180-second guard. The bridge forwarded all 3,226 LiDAR messages (32,228,928
+points) and 32,261 IMU messages with no reported middleware losses or point
+count mismatches; estimated odometry sampled at 19.98 Hz. The live ROS graph
+contained `/jackal0/solid/loop_diagnostics` with type
+`liorf/msg/LoopDiagnostic`. Because HelmDyn03 is a single-robot bag and the
+initial robot does not perform inter-robot fusion, this validates construction,
+message generation, topic wiring, and sustained replay—not candidate,
+registration, PCM, scan-transfer, or ZeroMQ behaviour between robots.
+
+The replay repeatedly emitted KISS-Matcher warnings that its ROBIN and solver
+noise bounds were being clamped. Closures continued to be accepted, but those
+warnings are field-calibration debt and should be resolved before treating the
+run as an accuracy result.
+
 ## Suggested next steps
 
-1. **Build the branch on ROS 2 Lyrical.** This is the highest-value action
-   available and gates everything else.
-2. Replay a bag on one of the six restored dataset configurations, then a
-   multi-robot bag.
-3. Bench-verify the ZeroMQ bridge with two bridges on one host.
+1. Record a multi-robot bag with `LoopDiagnostic`, extract candidate and
+   registration CSVs, and validate their ground-truth conventions.
+2. Bench-verify the ZeroMQ bridge with two bridges on one host.
+3. Calibrate the KISS-Matcher noise bounds and registration gates on field
+   data, then measure rather than just smoke-test HelmDyn03.
 4. Fill in each evaluation manifest's `expected` block once the protocol is
    confirmed against the paper.
 5. Only then attempt remote keyframe variables, which need the symbol-space

@@ -7,6 +7,7 @@ that drifts is caught by the value, not by a golden file nobody re-derives.
 import math
 import pathlib
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -14,6 +15,10 @@ sys.path.insert(
     0, str(pathlib.Path(__file__).resolve().parent.parent / "evaluation"))
 
 from skid_eval import linalg, metrics, place_recognition, resources  # noqa: E402
+from skid_eval.diagnostic_extraction import (  # noqa: E402
+    CANDIDATE_FIELDS, REGISTRATION_FIELDS, candidate_row,
+    registration_row, rows_from_messages, write_rows)
+from skid_eval.inputs import read_candidates, read_registrations  # noqa: E402
 from skid_eval.alignment import (  # noqa: E402
     horn_alignment, yaw_only_alignment)
 from skid_eval.manifest import Manifest, ManifestError  # noqa: E402
@@ -23,6 +28,51 @@ from skid_eval.trajectory import (  # noqa: E402
     Pose, Trajectory, associate, parse_tum, write_tum)
 
 IDENTITY = linalg.identity3()
+
+
+def _loop_diagnostic(**changes):
+    """Small ROS-message-shaped object for extraction tests."""
+    pose = SimpleNamespace(
+        position=SimpleNamespace(x=1.0, y=2.0, z=3.0),
+        orientation=SimpleNamespace(x=0.0, y=0.0, z=0.0, w=1.0))
+    values = {
+        "stage": "descriptor",
+        "decision": "selected",
+        "reason": "within_descriptor_threshold",
+        "query_time": 12.5,
+        "match_time": 4.25,
+        "descriptor_distance": 0.125,
+        "query_robot_id": "jackal1",
+        "query_keyframe_index": 42,
+        "match_robot_id": "jackal0",
+        "match_keyframe_index": 7,
+        "candidate_rank": 1,
+        "sector_shift": -2,
+        "registration_accepted": False,
+        "registration_status": "success",
+        "registration_detail": "accepted",
+        "relative_pose": SimpleNamespace(pose=pose),
+        "source_points": 100,
+        "target_points": 120,
+        "coarse_correspondences": 80,
+        "coarse_rotation_inliers": 70,
+        "coarse_translation_inliers": 60,
+        "fine_inliers": 55,
+        "fine_converged": True,
+        "fine_iterations": 9,
+        "fine_error": 0.02,
+        "metric_inliers": 50,
+        "overlap_ratio": 0.5,
+        "truncated_mse_m2": 0.04,
+        "uncertainty_variance_scale": 1.5,
+        "uncertainty_condition_number": 20.0,
+        "uncertainty_clamped_modes": 1,
+        "coarse_time_ms": 3.0,
+        "fine_time_ms": 4.0,
+        "metric_time_ms": 1.0,
+    }
+    values.update(changes)
+    return SimpleNamespace(**values)
 
 
 def rotation_z(angle):
@@ -640,3 +690,72 @@ def test_expected_values_are_compared_when_declared(tmp_path):
     # Measured 0.5 against an expected 0.9 is well outside tolerance.
     assert "outside" in verdicts["Registration success rate"]
     assert "Comparison against expected" in render_text(results)
+
+
+# ---------------------------------------------------------------------------
+# structured diagnostic extraction
+# ---------------------------------------------------------------------------
+
+def test_candidate_extraction_keeps_rejected_descriptor_scores():
+    message = _loop_diagnostic(
+        decision="rejected", reason="descriptor_threshold",
+        descriptor_distance=0.75, candidate_rank=6)
+    row = candidate_row(message)
+
+    assert row["score"] == pytest.approx(0.75)
+    assert row["candidate_rank"] == 6
+    assert row["decision"] == "rejected"
+    assert row["query_time"] == pytest.approx(12.5)
+    assert row["match_time"] == pytest.approx(4.25)
+
+
+def test_candidate_extraction_drops_position_search_without_a_score():
+    message = _loop_diagnostic(
+        descriptor_distance=float("nan"), reason="position_search")
+    assert candidate_row(message) is None
+
+
+def test_registration_extraction_uses_match_into_query_pose():
+    message = _loop_diagnostic(
+        stage="registration", decision="accepted",
+        registration_accepted=True)
+    row = registration_row(message)
+
+    assert (row["tx"], row["ty"], row["tz"]) == (1.0, 2.0, 3.0)
+    assert (row["qx"], row["qy"], row["qz"], row["qw"]) == (
+        0.0, 0.0, 0.0, 1.0)
+    assert row["metric_inliers"] == 50
+    assert row["truncated_mse_m2"] == pytest.approx(0.04)
+
+
+def test_registration_extraction_omits_rejections_and_pcm_copies():
+    rejected = _loop_diagnostic(
+        stage="registration", decision="rejected",
+        registration_accepted=False)
+    pcm = _loop_diagnostic(
+        stage="pcm", decision="accepted", registration_accepted=True)
+    assert registration_row(rejected) is None
+    assert registration_row(pcm) is None
+
+
+def test_extracted_csvs_are_consumed_by_the_existing_readers(tmp_path):
+    descriptor = _loop_diagnostic()
+    registration = _loop_diagnostic(
+        stage="registration", decision="accepted",
+        registration_accepted=True)
+    candidates, registrations = rows_from_messages(
+        [descriptor, registration])
+    candidates_path = tmp_path / "candidates.csv"
+    registrations_path = tmp_path / "registrations.csv"
+
+    assert write_rows(
+        candidates_path, CANDIDATE_FIELDS, candidates) == 1
+    assert write_rows(
+        registrations_path, REGISTRATION_FIELDS, registrations) == 1
+
+    parsed_candidates = read_candidates(candidates_path)
+    parsed_registrations = read_registrations(registrations_path)
+    assert parsed_candidates[0].score == pytest.approx(0.125)
+    assert parsed_registrations[0][0:2] == pytest.approx((12.5, 4.25))
+    assert parsed_registrations[0][2].translation == pytest.approx(
+        (1.0, 2.0, 3.0))
