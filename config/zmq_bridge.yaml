@@ -33,6 +33,8 @@
 
       # How often the bridge drains its subscriber.
       poll_rate_hz: 100.0
+
+      # Both timer periods must be finite and strictly positive.
       report_period_s: 30.0
 
       # Depth of the local ROS publishers and subscriptions.

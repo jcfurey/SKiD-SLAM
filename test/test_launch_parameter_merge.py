@@ -14,6 +14,13 @@ MODULE = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
 SPEC.loader.exec_module(MODULE)
 
+ZMQ_MODULE_PATH = REPO / "launch" / "run_zmq_bridge.launch.py"
+ZMQ_SPEC = importlib.util.spec_from_file_location(
+    "run_zmq_bridge_launch", ZMQ_MODULE_PATH)
+ZMQ_MODULE = importlib.util.module_from_spec(ZMQ_SPEC)
+assert ZMQ_SPEC.loader is not None
+ZMQ_SPEC.loader.exec_module(ZMQ_MODULE)
+
 
 def test_robot_frame_override_replaces_nested_yaml_value():
     shared = {
@@ -93,3 +100,13 @@ def test_boolean_launch_values_accept_true_forms(value):
 @pytest.mark.parametrize("value", ["false", "FALSE", "0", ""])
 def test_boolean_launch_values_reject_other_forms(value):
     assert MODULE._as_bool(value) is False
+
+
+@pytest.mark.parametrize("value", ["true", "TRUE", "1"])
+def test_zmq_respawn_accepts_true_forms(value):
+    assert ZMQ_MODULE._as_bool(value) is True
+
+
+@pytest.mark.parametrize("value", ["false", "FALSE", "0", ""])
+def test_zmq_respawn_rejects_other_forms(value):
+    assert ZMQ_MODULE._as_bool(value) is False

@@ -11,12 +11,10 @@
 // parameter change rather than a code change, and the bridge cannot fall out
 // of step with a message definition.
 //
-// NOT COMPILED OR RUN DURING DEVELOPMENT. The transport underneath it
-// (include/skid_transport.hpp) is tested over real sockets, but this file
-// needs a ROS 2 installation, which this repository's development environment
-// does not have. Treat it as unverified glue: build it, run two of them on one
-// host first, and confirm with `ros2 topic hz` before trusting a field
-// deployment.
+// This node is compiled on ROS 2 Lyrical and has been exercised in both
+// directions between isolated ROS domains on one host. That verifies the ROS
+// generic pub/sub glue and the ZeroMQ path together. A two-host run over the
+// target radio is still required before a field deployment.
 
 #include <chrono>
 #include <cmath>
@@ -147,6 +145,9 @@ class ZmqBridge : public rclcpp::Node {
       std::bind(&ZmqBridge::pollPeers, this));
 
     _report_period_s = declare_and_get<double>("zmq.report_period_s", 30.0);
+    if (!std::isfinite(_report_period_s) || _report_period_s <= 0.0) {
+      throw std::invalid_argument("zmq.report_period_s must be positive");
+    }
     _report_timer = create_wall_timer(
       std::chrono::duration<double>(_report_period_s),
       std::bind(&ZmqBridge::report, this));

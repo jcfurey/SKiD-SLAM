@@ -19,12 +19,17 @@ from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 
+def _as_bool(value):
+    return value.lower() in ('true', '1')
+
+
 def launch_setup(context, *args, **kwargs):
     share = get_package_share_directory('liorf')
     robot = LaunchConfiguration('robot').perform(context)
     bind_endpoint = LaunchConfiguration('bind_endpoint').perform(context)
     peers = [peer for peer in
              LaunchConfiguration('peers').perform(context).split(',') if peer]
+    respawn = _as_bool(LaunchConfiguration('respawn').perform(context))
 
     overrides = {'robot_id': robot, 'zmq.peer_endpoints': peers}
     if bind_endpoint:
@@ -40,7 +45,7 @@ def launch_setup(context, *args, **kwargs):
             overrides,
         ],
         output='screen',
-        respawn=True,
+        respawn=respawn,
     )]
 
 
@@ -51,5 +56,8 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'peers', default_value='',
             description='comma-separated peer bind endpoints'),
+        DeclareLaunchArgument(
+            'respawn', default_value='true',
+            description='Restart the bridge after an unexpected exit'),
         OpaqueFunction(function=launch_setup),
     ])

@@ -403,6 +403,9 @@ install(DIRECTORY launch config src/liorf-DiSO/config evaluation
   PATTERN "doc" EXCLUDE
   PATTERN "__pycache__" EXCLUDE
 )
+install(PROGRAMS scripts/bench_zmq_bridge.py
+  DESTINATION lib/${PROJECT_NAME}
+)
 
 # Runtime dependency of the generated interfaces; it is an exec_depend, so
 # ament_auto_package() does not pick it up on its own.
