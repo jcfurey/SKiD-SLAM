@@ -1,0 +1,131 @@
+# ROS 2 parameter file for the Park dataset.
+#
+# Ported from config/params_park.yaml at commit 0611f71, the paper-era
+# ROS 1 tree. The "/**" wildcard applies these values to every liorf node
+# regardless of the node name the launch file assigns.
+#
+# Dropped from the original because the ROS 2 port no longer reads them: the
+# LOAM feature-extraction thresholds (edgeThreshold, surfThreshold,
+# edgeFeatureMinValidNum, surfFeatureMinValidNum), mappingCornerLeafSize and
+# odometrySurfLeafSize, which belonged to the corner/surface split liorf
+# removed, and timeField, which the ROS 2 deskew step derives from the sensor
+# type. The navsat and ekf_gps blocks are omitted because no launch file in
+# this package starts those nodes.
+#
+# Added because they have no paper-era counterpart: imuRate,
+# point_filter_num, surroundingKeyframeMapLeafSize, loopClosureICPSurfLeafSize,
+# the geographic frame settings, and the loopClosure block. Their values here
+# are this package's defaults, not measurements from the dataset.
+/**:
+  ros__parameters:
+    liorf:
+
+      # Topics
+      pointCloudTopic: "points_raw"
+      imuTopic: "imu_raw"
+      odomTopic: "odometry/imu"
+      gpsTopic: "odometry/gpsz"
+
+      # Frames
+      lidarFrame: "base_link"
+      baselinkFrame: "base_link"
+      odometryFrame: "odom"
+      mapFrame: "map"
+      earthFrame: "earth"
+
+      # This dataset has no surveyed datum, so no earth -> map transform is
+      # fabricated. Set ecef_anchored and fill the datum in to georeference it.
+      geographicFrameMode: "local_only"
+      mapDatumConfigured: false
+      mapDatumLatitude: 0.0
+      mapDatumLongitude: 0.0
+      mapDatumAltitude: 0.0
+      mapDatumYaw: 0.0
+
+      mapFusionFrame: ""
+      mapFusionAnchor: false
+
+      # GPS Settings. The paper-era file pointed gpsTopic at a topic the bags
+      # do not publish, which is how GPS was disabled; that is preserved.
+      useImuHeadingInitialization: false
+      useGpsElevation: false
+      gpsCovThreshold: 2.0
+      poseCovThreshold: 25.0
+
+      # Export settings
+      savePCD: false
+      savePCDDirectory: "/Downloads/LOAM/"
+
+      # Sensor Settings
+      sensor: velodyne
+      N_SCAN: 16
+      Horizon_SCAN: 1800
+      downsampleRate: 1
+      point_filter_num: 1                           # no paper-era counterpart
+      lidarMinRange: 1.0
+      lidarMaxRange: 1000.0
+
+      # IMU Settings
+      imuType: 1                                    # 0: 6-axis  1: 9-axis
+      imuRate: 400.0                                # no paper-era counterpart; check against the bag
+      imuAccNoise: 3.9939570888238808e-03
+      imuGyrNoise: 1.5636343949698187e-03
+      imuAccBiasN: 6.4356659353532566e-05
+      imuGyrBiasN: 3.5640318696367613e-05
+      imuGravity: 9.80511
+      imuRPYWeight: 0.01
+
+      # Extrinsics: T_lb (lidar -> imu)
+      extrinsicTrans: [0.0, 0.0, 0.0]
+      extrinsicRot: [-1.0,  0.0,  0.0,
+                     0.0,  1.0,  0.0,
+                     0.0,  0.0, -1.0]
+      extrinsicRPY: [0.0,  1.0,  0.0,
+                     -1.0,  0.0,  0.0,
+                     0.0,  0.0,  1.0]
+
+      # voxel filter params
+      mappingSurfLeafSize: 0.4
+
+      # robot motion constraint (in case you are using a 2D robot)
+      z_tollerance: 1000.0
+      rotation_tollerance: 1000.0
+
+      # CPU Params
+      numberOfCores: 4
+      mappingProcessInterval: 0.15
+
+      # Surrounding map
+      surroundingkeyframeAddingDistThreshold: 1.0
+      surroundingkeyframeAddingAngleThreshold: 0.2
+      surroundingKeyframeDensity: 2.0
+      surroundingKeyframeSearchRadius: 50.0
+      surroundingKeyframeMapLeafSize: 0.5           # no paper-era counterpart
+
+      # Loop closure
+      loopClosureEnableFlag: true
+      loopClosureFrequency: 1.0
+      surroundingKeyframeSize: 50
+      historyKeyframeSearchRadius: 15.0
+      historyKeyframeSearchTimeDiff: 30.0
+      historyKeyframeSearchNum: 25
+      loopClosureICPSurfLeafSize: 0.5               # no paper-era counterpart
+      historyKeyframeFitnessScore: 0.3              # default gate on the truncated MSE, in m^2
+
+      # Intra-robot loop closure. Registration parameters are inherited from
+      # mapfusion.registration unless overridden here, and the truncated-MSE
+      # gate defaults to historyKeyframeFitnessScore above. Both are dataset
+      # calibration targets, not values the paper supplies.
+      loopClosure:
+        enableRadiusSearch: true
+        enableSolidSearch: true
+        solidMinPoints: 100
+        minKeyframeGap: 30
+        minTimeGap: 30.0
+        robustKernel: true
+        robustKernelScale: 1.0
+
+      # Visualization
+      globalMapVisualizationSearchRadius: 1000.0
+      globalMapVisualizationPoseDensity: 10.0
+      globalMapVisualizationLeafSize: 1.0

@@ -91,6 +91,13 @@ the compiler being OOM-killed.
   `run_lio_sam_livox.launch.py`. Each accepts `rviz:=false` to skip RViz, and
   `robot:=<id>` to change the robot namespace prefix.
 
+  The paper's field datasets have their own launches and configurations,
+  ported from the paper-era ROS 1 tree: `run_geode.launch.py`,
+  `run_graco.launch.py`, `run_majang_rover.launch.py`, `run_moon.launch.py`,
+  `run_park.launch.py`, `run_steam_legged.launch.py`. Each configuration's
+  header records what the port dropped, what it added, and any value that
+  differs from the original.
+
 2. Play existing bag files:
   ```
     ros2 bag play your_bag       # ROS 2 bag

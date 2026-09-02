@@ -331,6 +331,15 @@ if(BUILD_TESTING)
   ament_add_gtest(test_skid_comms
     test/test_skid_comms.cpp)
   target_link_libraries(test_skid_comms skid_comms)
+
+  # A parameter no node declares is ignored silently, and one declared with a
+  # different type stops the node from starting. Both are caught here rather
+  # than on the robot.
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  add_test(NAME validate_config_parameters
+    COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/test/validate_config_parameters.py
+      --repo ${CMAKE_CURRENT_SOURCE_DIR})
 endif()
 
 #############

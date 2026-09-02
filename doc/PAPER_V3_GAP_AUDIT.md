@@ -2,7 +2,7 @@
 
 Status: living audit and implementation record for the `v3` branch
 
-Last updated: 1 September 2026 (intra-robot pipeline reuse; bounded on-demand communications; map-alignment uncertainty)
+Last updated: 1 September 2026 (intra-robot pipeline reuse; bounded on-demand communications; map-alignment uncertainty; paper dataset configurations)
 
 Audit baseline: commit `475b59f`, before the paper-registration work below.
 The gap table records that baseline so the provenance problem remains visible;
@@ -347,9 +347,9 @@ robot. None of that is attempted here.
 | P1 | Lightweight message pool | Implemented. Announcements are descriptor-only; scans transfer on request. Announcement backlogs, the scan cache, outstanding requests, and parked candidates are all bounded, with defined retry, backpressure, and abandonment behaviour, and byte/latency reporting on both channels. | Measure the achieved bandwidth and latency on field bags and calibrate the cache budget against the datasets' revisit horizons. |
 | P1 | Meaningful inter-robot uncertainty | Implemented for the SOLiD paper pipeline: Hessian-shaped, physically calibrated full covariance is propagated through PCM, map alignment, the typed loop message, and the GTSAM factor. | Calibrate on field data and extend trajectory uncertainty beyond the configured PCM floor. |
 | P2 | ROS + ZeroMQ field communication setup (Section VI-B) | No ZeroMQ transport or reproducible network setup is present. The message contract is now transport-agnostic: announcements and scans are separate, bounded topics, so a bridge carries descriptors and scans independently. | Add an optional transport adapter or document the external component used by the paper. |
-| P2 | Paper dataset configurations | GEODE, GRACO, Majang, Moon, Park, and STEAM configs from `0611f71` are absent. | Port them to ROS 2 parameters and add sensor/topic validation. Add cave and planetary field configs if the data are available. |
+| P2 | Paper dataset configurations | Implemented. GEODE, GRACO, Majang, Moon, Park, and STEAM are ported to ROS 2 parameters with a launch file each, and every parameter file is checked against the declared parameter contract by `validate_config_parameters`. | Verify each against its bag: topic names, `imuRate`, and the Moon sensor/topic pairing noted in that file are unverified against real data. Add cave and planetary field configs if the data are available. |
 | P2 | Paper evaluation harness | No reproducible PR, RTE/RRE, success-rate, ATE/ARE, descriptor-memory, or communication-latency pipeline is included. | Add scripts, manifests, ground-truth conventions, and expected result summaries. |
-| P2 | Pipeline test coverage | Unit coverage now includes coarse-to-fine registration, truncated MSE, covariance, SE(3) PCM propagation, message conversion, SOLiD descriptor construction, descriptor retrieval, and the shared registration parameter contract, in addition to frame tests. | Add topic/launch routing, failure injection, and multi-robot graph tests. |
+| P2 | Pipeline test coverage | Unit coverage now includes coarse-to-fine registration, truncated MSE, covariance, SE(3) PCM propagation and inversion, message conversion, SOLiD descriptor construction, descriptor retrieval, the shared registration parameter contract, the communication policy, and a parameter-contract check over every configuration and launch file. | Add failure injection and multi-robot graph tests. |
 | P2 | Public package identity | The ROS package is still named and described as Liorf and retains upstream maintainer metadata. | Decide whether to rename the ROS package; at minimum correct description, authorship, dependencies, and third-party notices. |
 
 ## Current implementation evidence
@@ -390,6 +390,11 @@ robot. None of that is attempted here.
 - `src/liorf-DiSO/mapFusion_so.cpp`, `gtsamExpressionGraph()`, `mapAlignment()`,
   `sendLoopThis()`: the map alignment's marginal is recovered, floored, and
   propagated into cross-peer loop factors.
+- `config/{geode,graco,majang_rover,moon,park,steam_legged}.yaml` and their
+  launch files: the paper's field datasets, ported from `0611f71`.
+- `test/validate_config_parameters.py`: every parameter file is checked
+  against the parameters the sources declare, including the prefixed
+  registration sets built at runtime, and against the declared types.
 - `third_party/` and `CMakeLists.txt`: KISS-Matcher, Small-GICP, ROBIN, PMC,
   and xenium are pinned and built locally. ZeroMQ remains absent.
 
@@ -466,7 +471,9 @@ Items 1-3 are complete; item 4 is partially complete:
 
 1. **Completed:** split descriptor announcements from requested scan payloads.
 2. **Completed:** bound all queues and scan caches.
-3. Restore ROS 2 field configurations and dataset manifests.
+3. **Partially done:** the six paper field configurations are restored with
+   launches and a parameter-contract test. Dataset manifests and ground-truth
+   conventions still belong to item 4.
 4. Reproduce the paper's place-recognition, registration, mapping, memory, and
    communication metrics.
 
