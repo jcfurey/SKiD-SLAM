@@ -1,7 +1,7 @@
 # Field Communication
 
 The paper deploys over ROS plus ZeroMQ (Section VI-B) rather than over a single
-shared DDS domain. This document is the deployment that corresponds to.
+shared DDS domain. This document describes the corresponding deployment.
 
 ## Why not just share a DDS domain
 
@@ -79,23 +79,45 @@ the robots; nothing else needs to be reachable.
 `config/zmq_bridge.yaml` holds the rest, and is the file to edit for
 high-water marks, payload bounds and poll rate.
 
+The launch file respawns a failed bridge by default. Use `respawn:=false` for
+bounded tests or supervised deployments whose process manager owns restart
+policy.
+
 ## Verifying a deployment
 
-Do this on a bench before a field trial:
+Do this on a bench before a field trial. The installed integration driver
+requires two explicit, distinct domain IDs and two explicit, distinct ports so
+a validation run cannot silently collapse into one DDS graph:
 
-1. **Two bridges on one host.** Run both with different `ROS_DOMAIN_ID`s,
-   binding to `tcp://127.0.0.1:7447` and `tcp://127.0.0.1:7448` and pointing
-   at each other. `ros2 topic hz /solid/context_info` in each domain should
-   show the other's announcements.
-2. **Check the bridge's own report.** Every `report_period_s` it logs messages
+```bash
+# Replace all four values with domains and ports that are not in use.
+ros2 run liorf bench_zmq_bridge.py \
+    --domain-a 211 --domain-b 212 \
+    --port-a 17453 --port-b 17454
+```
+
+The driver starts one bridge in each ROS domain, verifies that both instantiate
+the complete default topic/type set, exchanges a real `liorf/msg/ScanRequest`
+in each direction, checks the exact payload at the opposite ROS graph, and
+requires clean bridge counters with one echo suppressed per direction. It
+writes bridge, publisher, and subscriber logs to a new directory under `/tmp`
+unless `--artifact-dir` names a new directory explicitly.
+
+Then check the deployment-specific behavior:
+
+1. **Check the bridge's own report.** Every `report_period_s` it logs messages
    and bytes each way, plus what it dropped and why. `dropped own` climbing is
    normal in a full mesh; `topic mismatch` climbing means a peer is publishing
    a topic that only prefix-matches a subscription; `send failures` climbing
    means the send high-water mark is being hit.
-3. **Confirm the loop is broken.** `echoes suppressed` should climb roughly in
+2. **Confirm the loop is broken.** `echoes suppressed` should climb roughly in
    step with received messages. If it stays at zero while both robots are
    publishing, the suppression window is too short and traffic is amplifying.
-4. **Then separate the hosts** and repeat with the real radio.
+3. **Exercise real traffic.** Run the SLAM publishers long enough to include
+   descriptor announcements, requested scans, and a committed-factor burst;
+   the one-message driver is a wiring check, not a throughput test.
+4. **Then separate the hosts** and repeat over the target radio, including a
+   disconnect/reconnect interval.
 
 ## Design notes
 
@@ -130,7 +152,15 @@ topic matching, self-traffic suppression, empty and multi-megabyte payloads,
 publishing with no peer attached, and the echo suppressor's loop-breaking
 behaviour.
 
-The `liorf_zmqBridge` node was compiled successfully with the complete package
-on ROS 2 Lyrical on 1 September 2026. It has **not** been run as a bridge or
-tested across two ROS domains/hosts. Follow the bench verification above before
-deploying it.
+The `liorf_zmqBridge` node builds with the complete package on ROS 2 Lyrical.
+On 2 September 2026 it passed bidirectional one-host tests across isolated ROS
+domains twice: a generic `std_msgs/msg/String` smoke test on domains 207/208,
+then the checked-in production-contract driver on domains 209/210. The latter
+instantiated all five default topic types and transferred one
+`liorf/msg/ScanRequest` each way. Each bridge finished at one message sent, one
+received, no transport drops or failures, and one local echo suppressed.
+
+This closes the one-host/two-domain wiring check. A two-host test, target-radio
+throughput/latency measurement, link-loss recovery run, and sustained real SLAM
+traffic remain unverified; do not infer those properties from the loopback
+result.

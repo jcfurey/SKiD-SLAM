@@ -1,8 +1,8 @@
 # Change Record: ZeroMQ Field Communication
 
-Date: 1 September 2026
+Date: 1 September 2026; validation continuation 2 September 2026
 
-Branch: `claude/v3-paper-parity-wha23w`
+Branch: `v3` (continued from `claude/v3-paper-parity-wha23w`)
 
 Baseline: commit `90aa278`, *Record the evaluation harness commit hash*
 
@@ -50,6 +50,14 @@ step with a message definition.
 `config/zmq_bridge.yaml`, `launch/run_zmq_bridge.launch.py`, and
 `doc/FIELD_COMMUNICATION.md` — the topology, a three-robot worked example, the
 bench verification to do before a field trial, and the design notes.
+
+The continuation adds `scripts/bench_zmq_bridge.py`, installed as a package
+executable. It requires the caller to choose two distinct ROS domains and two
+distinct TCP ports, starts and tears down both sides, verifies all five default
+generic publisher/subscription types, exchanges a real `ScanRequest` both
+ways, and rejects any run whose payload or final transport counters disagree.
+`run_zmq_bridge.launch.py` also exposes `respawn` so bounded tests can disable
+automatic restart without changing the field default.
 
 ## 3. Design decisions
 
@@ -123,7 +131,7 @@ package's configuration, **this file differs per robot**: `bind_endpoint` and
 | `linger_ms` | `0` | Discard unsent messages on shutdown |
 | `poll_rate_hz` | `100.0` | How often the subscriber is drained |
 | `report_period_s` | `30.0` | Diagnostics interval |
-| `qos_depth` | `20` | Local ROS publisher and subscription depth |
+| `qos_depth` | `100` | Local ROS publisher and subscription depth |
 | `echo_suppressor_capacity` | `256` | Remembered injections |
 | `echo_suppressor_window_s` | `5.0` | How long one is remembered |
 | `topics`, `topic_types` | `[]` | Override the carried set; same length |
@@ -135,7 +143,9 @@ package's configuration, **this file differs per robot**: `bind_endpoint` and
 | Suite | Result | Covers |
 |---|---|---|
 | `test_skid_transport` | pass (25 cases) | Configuration validation including malformed endpoints and non-positive bounds; a misconfigured transport being inert rather than half-working; binding and reporting a concrete port; a payload carried between two peers over real TCP; delivery of only subscribed topics; rejection of a prefix-colliding topic; suppression of a robot's own traffic in a full mesh; empty and 4 MiB payloads; refusal of an oversize payload; publishing with no peer neither blocking nor failing; prompt return when nothing arrives; batch draining and the batch limit; and seven echo-suppressor cases including the two-way loop it exists to break |
-| The other nine suites | pass | Unchanged |
+| Complete ROS 2 Lyrical build | pass | `liorf_zmqBridge` and the installed bench driver |
+| Complete `liorf` CTest run | pass (15 targets) | All 12 C++ suites, parameter/launch contracts, evaluation, and the socket transport |
+| Cross-domain production-contract bench | pass | ROS domains 209 and 210; TCP 17451 and 17452; all five default topic types constructed; one `liorf/msg/ScanRequest` delivered exactly in each direction; final counters on each bridge were sent 1, received 1, all failure/drop classes 0, echoes suppressed 1 |
 
 The socket tests use real TCP on `127.0.0.1` with an OS-assigned port. PUB/SUB
 discards anything published before the subscriber finishes connecting, so a
@@ -146,33 +156,33 @@ committed, because a flaky socket test is worse than none.
 
 `skid_transport.cpp` compiles clean under `-Wall -Wextra -Wpedantic`.
 
+The definitive run is under the parent workspace at
+`build/skid_validation/zmq_bridge_bench_production_20260902_domains209_210`.
+Both subscriber stderr files are empty. The earlier generic-message run is in
+`build/skid_validation/zmq_bridge_bench_driver_20260902_domains207_208`.
+
 ### What was not verified
 
-- **The bridge node has never been compiled or run.** It needs `rclcpp`, which
-  this environment does not have. This is the largest gap in this change: the
-  transport is well tested, but the glue that uses it is unexercised. The
-  generic pub/sub API calls, the serialised-message buffer handling, and the
-  parameter plumbing are all written from the API and reviewed, not run.
-- No two hosts have been bridged. The bench procedure in
-  `doc/FIELD_COMMUNICATION.md` exists precisely because none of it has been
-  done.
-- No measurement over a real radio, so the default high-water marks and poll
-  rate are reasoned defaults, not calibrated ones.
-- The `libzmq3-dev` and `cppzmq` rosdep keys were added to `package.xml` but
-  not resolved through rosdep here.
+- No two physical hosts have been bridged.
+- No throughput, latency, high-water-mark, or disconnect/reconnect measurement
+  has been made over the target field radio.
+- The bounded bench transfers one small production message each way. It
+  constructs every default generic type but does not drive sustained SOLiD
+  announcements, scan payloads, odometry, or clique-sized factor bursts.
 
 ## 6. Follow-up work
 
-Still open:
+The former structural Equation (6) blocker is closed: remote keyframe
+variables and direct distributed factors were added later on `v3`. Its
+remaining work is fidelity—revisioned peer corrections or original peer
+factors/covariances, committed-factor retraction, and real multi-robot
+validation—not part of the bridge transport itself.
 
-- **P1** — Remote keyframe variables for full Equation (6) parity, blocked on
-  the symbol-space refactor named in the audit. This is now the only
-  outstanding parity item.
+Communications follow-up:
 
-Newly opened:
-
-- Compile and bench-verify the bridge, following §"Verifying a deployment".
-- Measure achieved throughput and latency over a field radio and calibrate the
+- Repeat the checked-in bench on two hosts over the target radio, including a
+  controlled disconnect/reconnect interval.
+- Measure achieved throughput and latency and calibrate the
   high-water marks against it.
 - Consider carrying the bridge's own statistics into the evaluation harness's
   communication section, which currently reads only the map-fusion node's
@@ -183,3 +193,5 @@ Newly opened:
 | Commit | Contents |
 |---|---|
 | `b71198b` | Add the ZeroMQ peer transport and inter-robot bridge |
+| `b526be5` | Add the repeatable cross-domain bench and bridge lifecycle hardening |
+| `8f7f0aa` | Exercise the production bridge topic contract |

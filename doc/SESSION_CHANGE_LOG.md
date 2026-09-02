@@ -49,8 +49,11 @@ what the whole session leaves unverified.
 | `44e07df` | Add distributed factor audit tooling |
 | `2a01982` | Fix map-fusion replay bookkeeping |
 | `f70c7df` | Bound covariance-aware PCM cycle residuals |
+| `775e9f6` | Document covariance-bounded PCM validation |
+| `b526be5` | Add reproducible cross-domain bridge bench |
+| `8f7f0aa` | Exercise the production bridge topic contract |
 
-## Audit movement
+## Audit movement at the original 1 September boundary
 
 | Item | Before | After |
 |---|---|---|
@@ -67,7 +70,7 @@ remained: **remote keyframe variables**, blocked on the symbol-space refactor
 named in the audit. The 2 September continuation below records its
 implementation and the fidelity work that replaces it as the open boundary.
 
-## New components
+## New components at the original 1 September boundary
 
 | Component | Purpose | Tested here |
 |---|---|---|
@@ -121,7 +124,7 @@ build, not by reading the code:
   and restored in `b3aa857` at the user's instruction. They remain in the tree
   and are built by nothing.
 
-## Verification boundary for the whole session
+## Historical verification boundary before ROS validation
 
 This is the part worth reading before trusting any of the above.
 
@@ -312,10 +315,29 @@ associated registrations before PCM, 76 were wrong by more than 0.25 m and
 none of those reached a graph. Full evidence and limitations are in
 [`PCM_ABSOLUTE_GATE_CHANGE_RECORD.md`](PCM_ABSOLUTE_GATE_CHANGE_RECORD.md).
 
+### Post-session isolated-domain ZeroMQ validation — 2 September 2026
+
+The field bridge is no longer compiled-only glue. A manual generic-message
+smoke test first transferred `std_msgs/msg/String` in both directions between
+ROS domains 205 and 206. A checked-in bounded driver repeated that result on
+domains 207/208 and was then tightened to exercise the production contract on
+fresh domains 209/210 and TCP ports 17451/17452.
+
+The definitive run instantiated all five default topic/type pairs on both
+bridges and delivered a real `liorf/msg/ScanRequest` exactly once in each
+direction. Both nodes reported sent 1, received 1, every drop/failure class 0,
+and echoes suppressed 1; subscriber stderr was empty. The driver requires
+explicit distinct domains and ports, disables the shared ROS CLI daemon, uses
+bounded waits, tears down process groups, and preserves logs. The launch file
+now permits `respawn:=false`, and the node rejects a non-finite or non-positive
+diagnostics period. See
+[`FIELD_COMMUNICATION_CHANGE_RECORD.md`](FIELD_COMMUNICATION_CHANGE_RECORD.md).
+
 ## Suggested next steps
 
-1. Bench-verify the ZeroMQ bridge with two bridges on one host, then over the
-   target radio.
+1. Repeat the ZeroMQ bridge bench on two physical hosts over the target radio,
+   including throughput/latency measurement and disconnect/reconnect behavior
+   under sustained SLAM traffic.
 2. Calibrate registration, absolute PCM ceilings, commitment policy, and
    remote-motion uncertainty on real simultaneous multi-robot field data.
 3. Fill in each evaluation manifest's `expected` block once the protocol is
