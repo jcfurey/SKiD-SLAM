@@ -119,7 +119,22 @@ The command fails when the two topics do not contain the same unique
 measurement, when a factor was not addressed to both endpoint robots, when a
 duplicate factor appears, when one keyframe index acquires conflicting times,
 or when timestamps regress with keyframe index. Optional RTE/RRE limits make
-the same command usable as a regression gate.
+the same command usable as a regression gate. For a dataset that supplies
+positions but no trustworthy orientation convention, make that limitation
+explicit and gate only the invariant endpoint separation:
+
+```bash
+./evaluation/score_loop_factors_from_bag.py diagnostics \
+    --factor-topic /jackal0/context/loop_info \
+    --factor-topic /jackal1/context/loop_info \
+    --diagnostic-topic /jackal1/solid/loop_diagnostics \
+    --ground-truth jackal0=jackal0_ground_truth.txt \
+    --ground-truth jackal1=jackal1_ground_truth.txt \
+    --max-time-difference 0.03 \
+    --position-only-ground-truth \
+    --max-separation 0.25 \
+    --output factor_report_position_only.json
+```
 
 Endpoint times come from the accepted registration diagnostic associated with
 the factor, never from the later publication time. Factors are put into one
@@ -127,9 +142,11 @@ canonical endpoint order before their values are compared, so a legitimate
 opposite message orientation is normalized but an incorrect inverse is still
 detected. The JSON report includes every associated and rejected factor,
 nearest-ground-truth time gaps, standard RTE/RRE, and the difference in
-endpoint separation. Separation error is orientation independent and is a
-useful secondary diagnostic when a dataset's body-to-sensor rotation
-convention is unresolved; it is not a substitute for RTE/RRE.
+endpoint separation. Separation error is orientation independent. It is a
+secondary diagnostic when full SE(3) ground truth is valid; with
+`--position-only-ground-truth`, RTE/RRE are deliberately `null` and separation
+is the only scored geometric quantity. Do not infer vector translation or
+rotation accuracy from that mode.
 
 ## Expected values
 

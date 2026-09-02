@@ -104,6 +104,8 @@ or per-robot key-index monotonicity violations.
 |---|---:|---:|---|
 | `mapfusion.interRobot.pcm_min_publish_clique_size` | 5 | 12 | Minimum supported current clique |
 | `mapfusion.interRobot.pcm_min_publish_observations` | 3 | 3 | Consecutive supported memberships before commitment |
+| `mapfusion.interRobot.pcm_max_translation_residual_m` | 0.0 | 1.0 m | Covariance-independent cycle-translation ceiling; zero disables it |
+| `mapfusion.interRobot.pcm_max_rotation_residual_rad` | 0.0 | 0.0 | Covariance-independent cycle-rotation ceiling; zero disables it |
 | `mapfusion.interRobot.publish_factors` | `true` | `true` | Allow committed measurements to mutate endpoint graphs |
 | `mapfusion.interRobot.diagnostic_qos_depth` | 1000 | 1000 | Audit-message queue depth for a PCM recomputation burst |
 | `mapfusion.registration.coarse_robin_noise_bound_gain` | 0.5 | 0.5 | ROBIN bound divided by coarse voxel size |
@@ -113,7 +115,11 @@ The HelmDyn profile also requests five SOLiD candidates, starts PCM after ten
 registrations, uses a 1.0 Mahalanobis-distance PCM gate, and retains a
 1.5 m² truncated-MSE limit. A 1.0 m² trial removed an early partial-overlap
 anchor and allowed a coherent alias mode to bootstrap, so delayed commitment
-is the primary protection against transient modes.
+remains protection against transient modes. A later complete-run audit found
+that covariance inflation let one 2.9 m cycle inconsistency satisfy the
+normalized gate. The independent 1.0 m translation ceiling closes that route
+without changing factor covariance. See
+[`PCM_ABSOLUTE_GATE_CHANGE_RECORD.md`](PCM_ABSOLUTE_GATE_CHANGE_RECORD.md).
 
 ## Verification
 
@@ -158,8 +164,8 @@ and follow-up runtime fixes are recorded in
 The complete synthetic fixture has now run, but it is still two independently
 recorded trajectories made simultaneous in one arena, not real multi-robot
 field data, and it does not exercise the radio transport. The HelmDyn
-ground-truth orientations contain discontinuities and an unresolved body/LiDAR
-convention, so RRE and ARE are intentionally not claimed. Committed factors
-still cannot be retracted if a persistent false mode later displaces them;
-revisioned peer state/factor exchange and graph factor removal remain the
-robust long-term fix.
+ground-truth orientations contain sign-invariant near-180-degree discontinuities
+and are now explicitly treated as position-only, so RRE and ARE are not
+claimed. Committed factors still cannot be retracted if a persistent false
+mode later displaces them; revisioned peer state/factor exchange and graph
+factor removal remain the robust long-term fix.

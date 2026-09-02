@@ -92,11 +92,29 @@ accuracy result. The strict set contains two RTE values above 2 m. Factor
 `jackal0/164 <-> jackal1/59` also has 2.735 m endpoint-separation error and is
 a genuine geometry outlier worth investigating. Factor
 `jackal0/457 <-> jackal1/258` has 2.208 m RTE but only 0.021 m separation
-error; its vector error is therefore sensitive to the unresolved HelmDyn
-body/LiDAR orientation convention. Several otherwise position-consistent
-factors cross discontinuities in the supplied ground-truth orientation and
-produce near-180-degree RRE. RRE is reported for diagnosis but is not claimed
-as a calibrated result.
+error; its vector error is therefore sensitive to the invalid HelmDyn
+orientation channel. Several otherwise position-consistent factors cross
+sign-invariant near-180-degree discontinuities in the supplied quaternions.
+HelmDyn08/09 is consequently treated as position-only ground truth: RTE/RRE
+remain forensic output but are not calibrated results.
+
+## Outlier follow-up
+
+The `164 <-> 59` measurement was a real scan-registration alias, not a
+timestamp, extrinsic-translation, or local-odometry defect. Its conservative
+registration covariance gave translation principal standard deviations as
+large as 8.82 m, allowing the 2.9 m Equation (11) cycle residual to pass the
+Mahalanobis gate. Factor covariance should remain conservative for graph
+weighting, so PCM now has a separate optional absolute cycle-residual ceiling.
+
+The HelmDyn profile enables a 1.0 m translation ceiling. Replaying the
+original 111-factor PCM graph retains a 108-factor maximum clique while
+excluding the alias. A subsequent full 2x replay on isolated domain 200
+delivered 89 factors symmetrically; 77 associate to position ground truth
+within 30 ms, with 0.054 m median, 0.167 m p90, and 0.214 m maximum endpoint-
+separation error. Full findings, parameter semantics, and artifact details are
+in
+[`PCM_ABSOLUTE_GATE_CHANGE_RECORD.md`](PCM_ABSOLUTE_GATE_CHANGE_RECORD.md).
 
 ## Runtime corrections
 
@@ -125,8 +143,9 @@ launch tests contain 71 passing Python cases. The ZeroMQ socket suite was not
 rerun because this slice does not change the transport.
 
 This remains a synthetic pairing of independently recorded trajectories, not
-a simultaneous multi-robot or radio result. The next accuracy work is to
-resolve the ground-truth body/LiDAR convention, investigate the persistent
-`164 <-> 59` geometry outlier, and support revision or retraction when a later
-PCM clique invalidates an already committed factor. Field evaluation and
-ZeroMQ radio measurements remain open.
+a simultaneous multi-robot or radio result. HelmDyn's orientation channel is
+now excluded rather than left as an unresolved calibration problem, and the
+known `164 <-> 59` failure mechanism is bounded in the HelmDyn profile. The
+next robustness work is revision or retraction when a later PCM clique
+invalidates an already committed factor. Field evaluation and ZeroMQ radio
+measurements remain open.

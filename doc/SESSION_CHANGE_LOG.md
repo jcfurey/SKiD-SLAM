@@ -22,6 +22,7 @@ what the whole session leaves unverified.
 | [`DISTRIBUTED_KEYFRAME_GRAPH_CHANGE_RECORD.md`](DISTRIBUTED_KEYFRAME_GRAPH_CHANGE_RECORD.md) | P1 — Direct factors and sparse remote keyframes for Equations 6 and 7 |
 | [`PCM_COMMITMENT_CHANGE_RECORD.md`](PCM_COMMITMENT_CHANGE_RECORD.md) | P0/P1 — Correct Equation 11 direction and delay add-only graph publication |
 | [`FULL_TWO_ROBOT_REPLAY_CHANGE_RECORD.md`](FULL_TWO_ROBOT_REPLAY_CHANGE_RECORD.md) | P1/P2 — Complete synthetic replay, graph-facing factor audit, and runtime bookkeeping |
+| [`PCM_ABSOLUTE_GATE_CHANGE_RECORD.md`](PCM_ABSOLUTE_GATE_CHANGE_RECORD.md) | P0/P2 — Bound covariance-normalized PCM and formalize position-only scoring |
 | [`EVALUATION_HARNESS_CHANGE_RECORD.md`](EVALUATION_HARNESS_CHANGE_RECORD.md) | P2 — Paper dataset configurations, and the evaluation harness |
 | [`FIELD_COMMUNICATION_CHANGE_RECORD.md`](FIELD_COMMUNICATION_CHANGE_RECORD.md) | P2 — ROS + ZeroMQ field communication setup |
 
@@ -47,6 +48,7 @@ what the whole session leaves unverified.
 | `774594a` | Stabilize PCM publication and matcher diagnostics |
 | `44e07df` | Add distributed factor audit tooling |
 | `2a01982` | Fix map-fusion replay bookkeeping |
+| `f70c7df` | Bound covariance-aware PCM cycle residuals |
 
 ## Audit movement
 
@@ -105,6 +107,8 @@ build, not by reading the code:
 | Every keyframe entered absent and receive-only announcement queues | Communication reports claimed drops on links that did not exist | Complete two-robot replay |
 | A late optimized fleet-map transform reused an older keyframe stamp | TF rejected a valid alignment update as old data | Complete two-robot replay |
 | Replay teardown retained respawning children after their launch parent exited | Old validation processes survived until explicitly cleaned up | Host process audit |
+| A highly uncertain false registration could buy several metres of Mahalanobis PCM tolerance | A 2.735 m endpoint-separation alias remained in the committed clique | Complete-run factor forensics and offline PCM reconstruction |
+| HelmDyn mocap quaternions were treated as an SE(3) reference despite sign-invariant near-180-degree jumps | RTE/RRE mixed registration quality with an invalid orientation channel | Adjacent-orientation audit of both retimed trajectories |
 
 ## Loose ends recorded nowhere else
 
@@ -281,15 +285,40 @@ domain 195 produced zero queue drops and no stale-TF, oversized-noise, ERROR,
 or FATAL log entry. See
 [`FULL_TWO_ROBOT_REPLAY_CHANGE_RECORD.md`](FULL_TWO_ROBOT_REPLAY_CHANGE_RECORD.md).
 
+### Post-session covariance-bounded PCM audit — 2 September 2026
+
+The complete factor trace resolved the earlier HelmDyn ambiguity. Its readme
+provides only a translation correction, while the two quaternion streams have
+20 and 43 sign-invariant adjacent jumps above 90 degrees. They are now treated
+as position-only ground truth. The factor auditor has an explicit mode that
+suppresses invalid RTE/RRE, reports endpoint-separation error, and can enforce
+that quantity as a regression gate.
+
+The `jackal0/164 <-> jackal1/59` failure was a real scan alias. Its estimated
+endpoint separation was 3.495 m against a 0.760 m mocap separation, and its
+2.9 m cycle inconsistency was normalized by translation uncertainty as large
+as 8.82 m. Honest factor uncertainty was therefore weakening outlier
+selection. PCM retains its covariance-normalized Equation (11) test and now
+optionally applies independent absolute translation and rotation ceilings to
+the same residual. Both are disabled by default; the HelmDyn profile enables
+a 1.0 m translation ceiling.
+
+An offline replay of the original 111-factor graph yields a 108-factor maximum
+clique at that ceiling and excludes the alias. A fresh complete 2x replay on
+isolated ROS domain 200 recorded 89 factors on each endpoint topic with exact
+delivery symmetry. Seventy-seven associate to mocap positions within 30 ms:
+separation error is 0.054 m median, 0.167 m p90, and 0.214 m maximum. Of 165
+associated registrations before PCM, 76 were wrong by more than 0.25 m and
+none of those reached a graph. Full evidence and limitations are in
+[`PCM_ABSOLUTE_GATE_CHANGE_RECORD.md`](PCM_ABSOLUTE_GATE_CHANGE_RECORD.md).
+
 ## Suggested next steps
 
-1. Resolve the HelmDyn ground-truth body/LiDAR orientation convention and
-   investigate the persistent `jackal0/164 <-> jackal1/59` geometry outlier.
-2. Bench-verify the ZeroMQ bridge with two bridges on one host, then over the
+1. Bench-verify the ZeroMQ bridge with two bridges on one host, then over the
    target radio.
-3. Calibrate registration, PCM-commitment, and remote-motion uncertainty
-   parameters on real simultaneous multi-robot field data.
-4. Fill in each evaluation manifest's `expected` block once the protocol is
+2. Calibrate registration, absolute PCM ceilings, commitment policy, and
+   remote-motion uncertainty on real simultaneous multi-robot field data.
+3. Fill in each evaluation manifest's `expected` block once the protocol is
    confirmed against the paper.
-5. Exchange revisioned peer corrections or original peer odometry/loop factors
+4. Exchange revisioned peer corrections or original peer odometry/loop factors
    with covariance, and add factor retraction when a later PCM clique changes.
