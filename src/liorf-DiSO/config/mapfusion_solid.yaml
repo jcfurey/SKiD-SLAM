@@ -43,6 +43,14 @@
             loop_frame_threshold: 10 #frames
             pcm_start_threshold: 5   # 5 for best result, 2 for work in harsh environment
 
+            # Publish PCM-approved registrations directly between local and
+            # sparse peer keyframes (paper Equation 6). The peer's accepted
+            # keyframes are joined by relative constraints derived from its
+            # announced trajectory; these floors model that trajectory error.
+            direct_keyframe_factors: true
+            remote_odometry_rotation_stddev_rad: 0.05
+            remote_odometry_translation_stddev_m: 0.20
+
             robot_initial: jackal0
             use_position_search: false #use position search may introduce more global loop closure, but spend more time for candidate checking
 

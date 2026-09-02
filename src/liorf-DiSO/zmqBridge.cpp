@@ -118,7 +118,7 @@ class ZmqBridge : public rclcpp::Node {
     _echo = std::make_unique<liorf::transport::EchoSuppressor>(
       static_cast<std::size_t>(echo_capacity), echo_window);
 
-    const int qos_depth = declare_and_get<int>("zmq.qos_depth", 20);
+    const int qos_depth = declare_and_get<int>("zmq.qos_depth", 100);
     if (qos_depth < 1) {
       throw std::invalid_argument("zmq.qos_depth must be at least 1");
     }

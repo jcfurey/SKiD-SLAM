@@ -88,8 +88,38 @@ inline void populate(
   double overlap_ratio,
   std::uint64_t registration_inliers) {
   message.robot_id = robot_id;
+  message.from_robot_id = robot_id;
   message.index_from = index_from;
+  message.to_robot_id = robot_id;
   message.index_to = index_to;
+  message.relative_pose.pose = poseToMessage(measurement.pose);
+  covarianceToMessage(
+    measurement.covariance, message.relative_pose.covariance);
+  message.registration_error_m2 = registration_error_m2;
+  message.overlap_ratio = overlap_ratio;
+  message.registration_inliers = registration_inliers;
+}
+
+inline void populateInterRobot(
+  liorf::msg::LoopConstraint& message,
+  const std::string& recipient_robot_id,
+  const std::string& from_robot_id,
+  std::int64_t index_from,
+  const gtsam::Pose3& from_owner_frame_pose,
+  const std::string& to_robot_id,
+  std::int64_t index_to,
+  const gtsam::Pose3& to_owner_frame_pose,
+  const uncertainty::PoseWithCovariance& measurement,
+  double registration_error_m2,
+  double overlap_ratio,
+  std::uint64_t registration_inliers) {
+  message.robot_id = recipient_robot_id;
+  message.from_robot_id = from_robot_id;
+  message.index_from = index_from;
+  message.from_pose = poseToMessage(from_owner_frame_pose);
+  message.to_robot_id = to_robot_id;
+  message.index_to = index_to;
+  message.to_pose = poseToMessage(to_owner_frame_pose);
   message.relative_pose.pose = poseToMessage(measurement.pose);
   covarianceToMessage(
     measurement.covariance, message.relative_pose.covariance);

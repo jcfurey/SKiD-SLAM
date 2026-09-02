@@ -36,7 +36,8 @@
       report_period_s: 30.0
 
       # Depth of the local ROS publishers and subscriptions.
-      qos_depth: 20
+      # A PCM update can release several direct graph factors in one burst.
+      qos_depth: 100
 
       # A topic bridged both ways loops, so the bridge remembers what it
       # injected locally and drops the echo. The window only has to cover a

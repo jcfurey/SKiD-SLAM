@@ -6,6 +6,7 @@
 #include "loop_constraint_utils.hpp"
 #include "observable_scan_match.hpp"
 #include "skid_graph_keys.hpp"
+#include "skid_remote_graph.hpp"
 // <!-- liorf_yjz_lucky_boy -->
 #include <sensor_msgs/msg/nav_sat_fix.hpp>
 #include <gtsam/geometry/Rot3.h>
@@ -28,6 +29,7 @@
 #include <Eigen/QR>
 
 #include <limits>
+#include <set>
 
 #include <GeographicLib/Geocentric.hpp>
 #include <GeographicLib/LocalCartesian.hpp>
@@ -200,6 +202,15 @@ public:
     // indices are not interchangeable.
     std::vector<int> solidKeyframeOf;
 
+    // Equation (6) graph state. Locally owned poses use X(index); peer poses
+    // use a separate packed symbol namespace and are tied together by sparse
+    // relative-motion constraints derived in the peer's own map frame.
+    std::unique_ptr<liorf::graph_keys::KeySpace> distributedGraphKeys;
+    liorf::remote_graph::TrajectoryStore remoteTrajectories;
+    double remoteOdometryRotationStddevRad = 0.05;
+    double remoteOdometryTranslationStddevM = 0.20;
+    std::set<liorf::remote_graph::FactorIdentity> distributedFactors;
+
     explicit mapOptimization(const rclcpp::NodeOptions & options)
     : ParamServer("liorf_mapOptmization", options), timeLaserInfoStamp(0, 0, RCL_ROS_TIME)
     {
@@ -209,6 +220,8 @@ public:
         isam = new ISAM2(parameters);
 
         declareLoopClosureParameters();
+        distributedGraphKeys =
+            std::make_unique<liorf::graph_keys::KeySpace>(robot_id);
 
         if (geographicFrameMode == liorf::frames::GeographicFrameMode::ECEF_ANCHORED)
         {
@@ -334,66 +347,169 @@ public:
 
     }
 
-    void contextLoopInfoHandler(const liorf::msg::LoopConstraint::ConstSharedPtr& msgIn){
-        //close global loop by do nothing
-        //        return;
+    gtsam::SharedNoiseModel remoteOdometryNoise() const
+    {
+        const double rotationVariance =
+            remoteOdometryRotationStddevRad * remoteOdometryRotationStddevRad;
+        const double translationVariance =
+            remoteOdometryTranslationStddevM * remoteOdometryTranslationStddevM;
+        gtsam::Vector6 variances;
+        variances << rotationVariance, rotationVariance, rotationVariance,
+            translationVariance, translationVariance, translationVariance;
+        return gtsam::noiseModel::Diagonal::Variances(variances);
+    }
 
-        if(msgIn->robot_id != robot_id)
+    void contextLoopInfoHandler(
+        const liorf::msg::LoopConstraint::ConstSharedPtr& msgIn)
+    {
+        if (msgIn->robot_id != robot_id)
             return;
 
-        if (msgIn->index_from < 0 || msgIn->index_to < 0 ||
-            msgIn->index_from > std::numeric_limits<int>::max() ||
-            msgIn->index_to > std::numeric_limits<int>::max()) {
+        std::lock_guard<std::mutex> lock(mtx);
+
+        // Messages recorded before the endpoint-aware contract are still
+        // interpreted as local-only factors.
+        const std::string fromRobot = msgIn->from_robot_id.empty() ?
+            msgIn->robot_id : msgIn->from_robot_id;
+        const std::string toRobot = msgIn->to_robot_id.empty() ?
+            msgIn->robot_id : msgIn->to_robot_id;
+        if (msgIn->index_from < 0 || msgIn->index_to < 0) {
             RCLCPP_WARN(get_logger(),
-                "Rejected loop constraint with out-of-range keyframe indices");
+                "Rejected loop constraint with negative keyframe index");
             return;
         }
-        const int indexFrom = static_cast<int>(msgIn->index_from);
-        const int indexTo = static_cast<int>(msgIn->index_to);
+
+        const bool fromLocal = fromRobot == robot_id;
+        const bool toLocal = toRobot == robot_id;
+        if (!fromLocal && !toLocal) {
+            RCLCPP_WARN(get_logger(),
+                "Rejected loop constraint for %s with endpoints %s and %s",
+                robot_id.c_str(), fromRobot.c_str(), toRobot.c_str());
+            return;
+        }
+        if (fromRobot != toRobot && fromLocal == toLocal) {
+            RCLCPP_WARN(get_logger(),
+                "Rejected inter-robot loop without exactly one local endpoint");
+            return;
+        }
+
+        const std::uint64_t indexFrom =
+            static_cast<std::uint64_t>(msgIn->index_from);
+        const std::uint64_t indexTo =
+            static_cast<std::uint64_t>(msgIn->index_to);
+        const std::size_t localPoseCount = cloudKeyPoses3D->size();
+        if ((fromLocal && indexFrom >= localPoseCount) ||
+            (toLocal && indexTo >= localPoseCount)) {
+            RCLCPP_WARN(get_logger(),
+                "Rejected loop constraint whose local keyframe is not available");
+            return;
+        }
 
         if (!liorf::loop_constraint::validPoseMessage(
                 msgIn->relative_pose.pose)) {
             RCLCPP_WARN(get_logger(),
-                "Rejected loop constraint (%d, %d) with invalid pose",
-                indexFrom, indexTo);
+                "Rejected loop constraint with invalid relative pose");
             return;
         }
-        const gtsam::Pose3 poseBetween = liorf::loop_constraint::poseFromMessage(
-            msgIn->relative_pose.pose);
+        const gtsam::Pose3 poseBetween =
+            liorf::loop_constraint::poseFromMessage(msgIn->relative_pose.pose);
         const auto covariance = liorf::loop_constraint::covarianceFromMessage(
             msgIn->relative_pose.covariance);
         if (!liorf::uncertainty::positiveDefiniteCovariance(covariance)) {
             RCLCPP_WARN(get_logger(),
-                "Rejected loop constraint (%d, %d) with invalid covariance",
-                indexFrom, indexTo);
+                "Rejected loop constraint with invalid covariance");
             return;
         }
-        auto noiseBetween = gtsam::noiseModel::Gaussian::Covariance(covariance);
 
-        gtSAMgraph.add(BetweenFactor<Pose3>(
-            liorf::graph_keys::localPose(indexFrom),
-            liorf::graph_keys::localPose(indexTo),
-            poseBetween, noiseBetween));
-        isam->update(gtSAMgraph);
-        isam->update();
-        isam->update();
-        isam->update();
-        isam->update();
-        isam->update();
-        isamCurrentEstimate = isam->calculateEstimate();
+        const auto identity = liorf::remote_graph::canonicalFactorIdentity(
+            fromRobot, msgIn->index_from, toRobot, msgIn->index_to);
+        if (distributedFactors.find(identity) != distributedFactors.end())
+            return;
 
+        gtsam::Key keyFrom;
+        gtsam::Key keyTo;
+        try {
+            keyFrom = distributedGraphKeys->pose(fromRobot, indexFrom);
+            keyTo = distributedGraphKeys->pose(toRobot, indexTo);
+        } catch (const std::exception & error) {
+            RCLCPP_WARN(get_logger(),
+                "Rejected loop constraint with unusable graph key: %s",
+                error.what());
+            return;
+        }
+
+        gtsam::NonlinearFactorGraph updateGraph;
+        gtsam::Values newValues;
+
+        if (fromRobot != toRobot) {
+            const std::string & remoteRobot = fromLocal ? toRobot : fromRobot;
+            const std::uint64_t remoteIndex = fromLocal ? indexTo : indexFrom;
+            const geometry_msgs::msg::Pose & remotePoseMessage =
+                fromLocal ? msgIn->to_pose : msgIn->from_pose;
+            if (!liorf::loop_constraint::validPoseMessage(remotePoseMessage)) {
+                RCLCPP_WARN(get_logger(),
+                    "Rejected inter-robot loop with invalid peer pose");
+                return;
+            }
+            const gtsam::Pose3 remoteOwnerPose =
+                liorf::loop_constraint::poseFromMessage(remotePoseMessage);
+            const gtsam::Key remoteKey = fromLocal ? keyTo : keyFrom;
+            const gtsam::Key localKey = fromLocal ? keyFrom : keyTo;
+
+            if (!isam->valueExists(localKey)) {
+                RCLCPP_WARN(get_logger(),
+                    "Rejected inter-robot loop whose local graph key is absent");
+                return;
+            }
+            if (!isam->valueExists(remoteKey)) {
+                const gtsam::Pose3 localEstimate =
+                    isam->calculateEstimate<gtsam::Pose3>(localKey);
+                const gtsam::Pose3 remoteInitial =
+                    liorf::remote_graph::initialRemotePose(
+                        localEstimate, poseBetween, fromLocal);
+                newValues.insert(remoteKey, remoteInitial);
+            }
+
+            const auto remoteEdge = remoteTrajectories.insert(
+                remoteRobot, remoteIndex, remoteOwnerPose);
+            if (remoteEdge.has_value()) {
+                const gtsam::Key edgeFrom = distributedGraphKeys->pose(
+                    remoteEdge->robot_id, remoteEdge->index_from);
+                const gtsam::Key edgeTo = distributedGraphKeys->pose(
+                    remoteEdge->robot_id, remoteEdge->index_to);
+                updateGraph.add(BetweenFactor<Pose3>(
+                    edgeFrom, edgeTo, remoteEdge->measurement,
+                    remoteOdometryNoise()));
+            }
+        }
+
+        updateGraph.add(BetweenFactor<Pose3>(
+            keyFrom, keyTo, poseBetween,
+            gtsam::noiseModel::Gaussian::Covariance(covariance)));
+        try {
+            isam->update(updateGraph, newValues);
+            for (int iteration = 0; iteration < 5; ++iteration)
+                isam->update();
+            isamCurrentEstimate = isam->calculateEstimate();
+        } catch (const std::exception & error) {
+            RCLCPP_ERROR(get_logger(),
+                "Failed to add distributed loop factor: %s", error.what());
+            return;
+        }
+
+        distributedFactors.insert(identity);
         aLoopIsClosed = true;
 
         RCLCPP_INFO(get_logger(),
-            "Accepted loop factor %d -> %d: error=%.6f m^2 overlap=%.3f inliers=%zu",
-            indexFrom, indexTo, msgIn->registration_error_m2,
-            msgIn->overlap_ratio,
+            "Accepted loop factor %s/%ld -> %s/%ld: error=%.6f m^2 "
+            "overlap=%.3f inliers=%zu",
+            fromRobot.c_str(), static_cast<long>(msgIn->index_from),
+            toRobot.c_str(), static_cast<long>(msgIn->index_to),
+            msgIn->registration_error_m2, msgIn->overlap_ratio,
             static_cast<std::size_t>(msgIn->registration_inliers));
 
         correctPoses();
-
         publishFrames();
-
     }
 
     void laserCloudInfoHandler(const liorf::msg::CloudInfo::ConstSharedPtr& msgIn)
@@ -788,6 +904,18 @@ public:
     // registration parameters come from the same helper both nodes use.
     void declareLoopClosureParameters()
     {
+        remoteOdometryRotationStddevRad = declare_and_get<double>(
+            "mapfusion.interRobot.remote_odometry_rotation_stddev_rad", 0.05);
+        remoteOdometryTranslationStddevM = declare_and_get<double>(
+            "mapfusion.interRobot.remote_odometry_translation_stddev_m", 0.20);
+        if (!std::isfinite(remoteOdometryRotationStddevRad) ||
+            remoteOdometryRotationStddevRad <= 0.0 ||
+            !std::isfinite(remoteOdometryTranslationStddevM) ||
+            remoteOdometryTranslationStddevM <= 0.0) {
+            throw std::invalid_argument(
+                "remote odometry standard deviations must be finite and positive");
+        }
+
         radiusLoopDetectionEnabled =
             declare_and_get<bool>("liorf.loopClosure.enableRadiusSearch", true);
         solidLoopDetectionEnabled =

@@ -1,13 +1,25 @@
-# Accepted loop factor for one platform's keyframe graph.
+# Accepted loop factor delivered to one platform's distributed keyframe graph.
 #
-# The relative pose maps index_to into index_from, matching the GTSAM
-# BetweenFactor(index_from, index_to, measurement) convention used by the
-# consumer. PoseWithCovariance uses the standard ROS row-major order:
-# [x, y, z, rotation about X, rotation about Y, rotation about Z].
+# robot_id is the recipient. The endpoint robot IDs distinguish locally owned
+# poses from the sparse remote poses in paper Equation (6). Legacy same-robot
+# producers set both endpoint IDs to robot_id.
 std_msgs/Header header
 string robot_id
+string from_robot_id
 int64 index_from
+string to_robot_id
 int64 index_to
+
+# Endpoint estimates in each endpoint owner's own map frame. Their absolute
+# frames generally differ; only relative motion between poses belonging to the
+# same robot is used to build the partial remote odometry graph.
+geometry_msgs/Pose from_pose
+geometry_msgs/Pose to_pose
+
+# The relative pose maps the to endpoint into the from endpoint, matching the
+# GTSAM BetweenFactor(from, to, measurement) convention used by the consumer.
+# PoseWithCovariance uses the standard ROS row-major order:
+# [x, y, z, rotation about X, rotation about Y, rotation about Z].
 geometry_msgs/PoseWithCovariance relative_pose
 
 # Registration diagnostics. A non-paper legacy pipeline may set unsupported

@@ -23,6 +23,7 @@
 #include "skid_loop_detection.hpp"
 #include "skid_registration.hpp"
 #include "skid_registration_params.hpp"
+#include "skid_remote_graph.hpp"
 
 //ros
 #include <rclcpp/rclcpp.hpp>
@@ -65,6 +66,7 @@
 #include <chrono>
 #include <limits>
 #include <memory>
+#include <set>
 #include <unordered_map>
 #include <thread>
 #include <mutex>
@@ -124,6 +126,7 @@ private:
     bool _signal_1;
     bool _signal_2;
     bool _use_position_search;
+    bool _direct_keyframe_factors = true;
 
     int _num_bin;
     int _robot_id_th;
@@ -246,9 +249,12 @@ private:
     struct LoopCandidate {
         int target_bin = -1;
         int source_bin = -1;
+        int query_bin = -1;
+        int match_bin = -1;
         gtsam::Pose3 relative_pose;
         liorf::uncertainty::Matrix6d covariance =
             liorf::uncertainty::Matrix6d::Zero();
+        liorf::uncertainty::PoseWithCovariance query_from_match;
         liorf::msg::LoopDiagnostic registration_diagnostic;
     };
 
@@ -272,6 +278,7 @@ private:
 
     //first: robot pair id, second: effective loop id in _loop_queue
     std::unordered_map< int, std::vector<int> > _loop_accept_queue;
+    std::set<liorf::remote_graph::FactorIdentity> _published_direct_factors;
 
     std::unordered_map< int, std::vector<PointTypePose> > _global_map_trans;
     std::unordered_map< int, PointTypePose> _global_map_trans_optimized;
@@ -348,12 +355,12 @@ public:
 
         _pub_context_info = create_publisher<liorf::msg::ContextInfo>(_solid_topic + "/context_info", 1);
         _pub_loop_info = create_publisher<liorf::msg::LoopConstraint>(
-                prefixTopic(_robot_id, _loop_topic), 1);
+                prefixTopic(_robot_id, _loop_topic), rclcpp::QoS(100));
         _pub_cloud = create_publisher<sensor_msgs::msg::PointCloud2>(_robot_id + "/" + _solid_topic + "/cloud", 1);
         _pub_trans_odom2map = create_publisher<nav_msgs::msg::Odometry>(_robot_id + "/" + _solid_topic + "/trans_map", 1);
         _pub_trans_odom2odom = create_publisher<nav_msgs::msg::Odometry>(_solid_topic + "/trans_odom", 1);
         _pub_loop_info_global = create_publisher<liorf::msg::LoopConstraint>(
-                _solid_topic + "/loop_info_global", 1);
+                _solid_topic + "/loop_info_global", rclcpp::QoS(100));
         _pub_loop_diagnostic = create_publisher<liorf::msg::LoopDiagnostic>(
                 prefixTopic(_robot_id, _diagnostic_topic), 50);
         _pub_scan_request = create_publisher<liorf::msg::ScanRequest>(
@@ -459,6 +466,8 @@ private:
             declare_and_get<double>("mapfusion.interRobot.icp_threshold", 3.0);
         _robot_initial = declare_and_get<std::string>("mapfusion.interRobot.robot_initial", "jackal0");
         _loop_frame_thres = declare_and_get<int>("mapfusion.interRobot.loop_frame_threshold", 10);
+        _direct_keyframe_factors = declare_and_get<bool>(
+            "mapfusion.interRobot.direct_keyframe_factors", true);
 
         _solid_topic = declare_and_get<std::string>("mapfusion.interRobot.solid_topic", "solid");
         _loop_topic = declare_and_get<std::string>(
@@ -1426,6 +1435,9 @@ private:
             return;
         }
 
+        if (_direct_keyframe_factors)
+            publishAcceptedDirectFactors();
+
         //perform optimization
         gtsamExpressionGraph();
 
@@ -1895,8 +1907,11 @@ private:
         LoopCandidate loop_candidate;
         loop_candidate.target_bin = id0;
         loop_candidate.source_bin = id1;
+        loop_candidate.query_bin = query_bin;
+        loop_candidate.match_bin = idx_nearest;
         loop_candidate.relative_pose = relative_to_target.pose;
         loop_candidate.covariance = relative_to_target.covariance;
+        loop_candidate.query_from_match = query_from_match;
         loop_candidate.registration_diagnostic =
             std::move(registration_diagnostic);
         _loop_queue[_robot_this_th].push_back(std::move(loop_candidate));
@@ -2087,6 +2102,109 @@ private:
         _loop_accept_queue[_robot_this_th].clear();
         _loop_accept_queue[_robot_this_th] = max_clique_data;
         return true;
+    }
+
+    static gtsam::Pose3 ownerPose(const SOLiDBin & bin) {
+        return gtsam::Pose3(
+            gtsam::Rot3::RzRyRx(
+                bin.pose.roll, bin.pose.pitch, bin.pose.yaw),
+            gtsam::Point3(bin.pose.x, bin.pose.y, bin.pose.z));
+    }
+
+    static liorf::remote_graph::FactorIdentity directFactorIdentity(
+        const SOLiDBin & from, const SOLiDBin & to) {
+        return liorf::remote_graph::canonicalFactorIdentity(
+            from.robotname, keyframeIndexOf(from),
+            to.robotname, keyframeIndexOf(to));
+    }
+
+    void publishDirectFactor(
+        const LoopCandidate & candidate,
+        const SOLiDBin & query,
+        const SOLiDBin & match,
+        const std::string & recipient) {
+        liorf::msg::LoopConstraint message;
+        message.header = candidate.registration_diagnostic.header;
+        liorf::loop_constraint::populateInterRobot(
+            message,
+            recipient,
+            query.robotname,
+            keyframeIndexOf(query),
+            ownerPose(query),
+            match.robotname,
+            keyframeIndexOf(match),
+            ownerPose(match),
+            candidate.query_from_match,
+            candidate.registration_diagnostic.truncated_mse_m2,
+            candidate.registration_diagnostic.overlap_ratio,
+            candidate.registration_diagnostic.metric_inliers);
+
+        if (recipient == _robot_id)
+            _pub_loop_info->publish(message);
+        else
+            _pub_loop_info_global->publish(message);
+    }
+
+    // Publish one direct query-to-match factor for every newly PCM-accepted
+    // registration. Each endpoint robot receives the same measurement and
+    // represents the other endpoint as a sparse remote state. Previously the
+    // node waited for two registrations and algebraically eliminated the peer
+    // states before publishing a local-only factor.
+    void publishAcceptedDirectFactors() {
+        const auto accepted = _loop_accept_queue.find(_robot_this_th);
+        const auto candidates = _loop_queue.find(_robot_this_th);
+        if (accepted == _loop_accept_queue.end() ||
+            candidates == _loop_queue.end())
+            return;
+
+        for (const int accepted_index : accepted->second) {
+            if (accepted_index < 0 ||
+                static_cast<std::size_t>(accepted_index) >=
+                    candidates->second.size()) {
+                RCLCPP_WARN(get_logger(),
+                    "PCM returned out-of-range loop index %d",
+                    accepted_index);
+                continue;
+            }
+
+            const LoopCandidate & candidate =
+                candidates->second[static_cast<std::size_t>(accepted_index)];
+            const auto query_it = _bin_with_id.find(candidate.query_bin);
+            const auto match_it = _bin_with_id.find(candidate.match_bin);
+            if (query_it == _bin_with_id.end() ||
+                match_it == _bin_with_id.end()) {
+                RCLCPP_WARN(get_logger(),
+                    "PCM-accepted loop %d has no endpoint metadata",
+                    accepted_index);
+                continue;
+            }
+            const SOLiDBin & query = query_it->second;
+            const SOLiDBin & match = match_it->second;
+            if (query.robotname == match.robotname)
+                continue;
+            if (query.robotname != _robot_id && match.robotname != _robot_id) {
+                RCLCPP_WARN(get_logger(),
+                    "PCM-accepted loop does not involve observer %s",
+                    _robot_id.c_str());
+                continue;
+            }
+
+            const auto identity =
+                directFactorIdentity(query, match);
+            if (!_published_direct_factors.insert(identity).second)
+                continue;
+
+            const std::string peer = query.robotname == _robot_id ?
+                match.robotname : query.robotname;
+            publishDirectFactor(candidate, query, match, _robot_id);
+            publishDirectFactor(candidate, query, match, peer);
+            RCLCPP_INFO(get_logger(),
+                "Published direct inter-robot factor %s/%ld -> %s/%ld",
+                query.robotname.c_str(),
+                static_cast<long>(keyframeIndexOf(query)),
+                match.robotname.c_str(),
+                static_cast<long>(keyframeIndexOf(match)));
+        }
     }
 
     Eigen::MatrixXi computePCMMatrix(const std::vector<LoopCandidate>& loop_queue_this){
@@ -2496,7 +2614,8 @@ private:
              _global_map_trans_optimized[_robot_this_th].yaw);
         _pub_trans_odom2odom->publish(odom2odom);
 
-        sendGlobalLoopMessageKDTree();
+        if (!_direct_keyframe_factors)
+            sendGlobalLoopMessageKDTree();
 
     }
 };
