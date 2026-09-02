@@ -56,4 +56,8 @@ float64 metric_time_ms
 # PCM event whenever the clique is recomputed.
 bool pcm_evaluated
 bool pcm_accepted
+# True once the candidate has satisfied the configured publication policy.
+# Commitments are monotonic because the current back-end cannot retract a
+# factor that was already published.
+bool pcm_committed
 uint64 pcm_clique_size

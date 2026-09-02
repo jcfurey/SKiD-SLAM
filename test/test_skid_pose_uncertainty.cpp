@@ -54,6 +54,49 @@ TEST(PcmUncertainty, UsesSeparateAngularAndLinearUnits) {
   EXPECT_NEAR(rotation.mahalanobis_distance, 2.0, 1.0e-10);
 }
 
+TEST(PcmUncertainty, ClosesANonIdentityTwoRobotCycle) {
+  const gtsam::Pose3 world_from_a_i(
+    gtsam::Rot3::RzRyRx(0.04, -0.02, 0.3),
+    gtsam::Point3(1.0, -0.5, 0.2));
+  const gtsam::Pose3 world_from_a_j(
+    gtsam::Rot3::RzRyRx(0.02, 0.01, 0.8),
+    gtsam::Point3(4.0, 1.0, 0.4));
+  const gtsam::Pose3 b_from_b_k(
+    gtsam::Rot3::RzRyRx(-0.03, 0.02, -0.4),
+    gtsam::Point3(-2.0, 0.5, 0.1));
+  const gtsam::Pose3 b_from_b_l(
+    gtsam::Rot3::RzRyRx(0.01, -0.04, 0.2),
+    gtsam::Point3(0.5, 3.0, -0.2));
+  const gtsam::Pose3 world_from_b(
+    gtsam::Rot3::RzRyRx(0.1, -0.15, 1.2),
+    gtsam::Point3(8.0, -3.0, 1.0));
+
+  const gtsam::Pose3 world_from_b_k = world_from_b * b_from_b_k;
+  const gtsam::Pose3 world_from_b_l = world_from_b * b_from_b_l;
+  const gtsam::Pose3 inter_jk = world_from_a_j.between(world_from_b_k);
+  const gtsam::Pose3 inter_il = world_from_a_i.between(world_from_b_l);
+  const gtsam::Pose3 inner_ij = world_from_a_i.between(world_from_a_j);
+  const gtsam::Pose3 inner_kl = b_from_b_k.between(b_from_b_l);
+  const Matrix6d covariance = 0.01 * Matrix6d::Identity();
+
+  const auto result = liorf::uncertainty::pcmResidual(
+    inter_jk, covariance, inter_il, covariance,
+    inner_ij, inner_kl, 0.05, 0.20);
+
+  ASSERT_TRUE(result.valid);
+  EXPECT_TRUE(result.pose.equals(gtsam::Pose3(), 1.0e-9));
+  EXPECT_NEAR(result.mahalanobis_distance, 0.0, 1.0e-8);
+
+  // Supplying source <- target (the registration helper's legacy storage
+  // direction) does not close this cycle and must not be mistaken for PCM's
+  // target <- source measurements.
+  const auto reversed = liorf::uncertainty::pcmResidual(
+    inter_jk.inverse(), covariance, inter_il.inverse(), covariance,
+    inner_ij, inner_kl, 0.05, 0.20);
+  ASSERT_TRUE(reversed.valid);
+  EXPECT_GT(reversed.mahalanobis_distance, 1.0);
+}
+
 }  // namespace
 
 namespace {

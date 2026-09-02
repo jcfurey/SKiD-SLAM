@@ -42,12 +42,26 @@
             icp_threshold: 3.0
             loop_frame_threshold: 10 #frames
             pcm_start_threshold: 5   # 5 for best result, 2 for work in harsh environment
+            # PCM membership is provisional as new registrations arrive, but
+            # the current graph transport cannot retract a published factor.
+            # Require a supported clique and repeated membership before a
+            # candidate may affect alignment or either factor publisher.
+            pcm_min_publish_clique_size: 5
+            pcm_min_publish_observations: 3
 
             # Publish PCM-approved registrations directly between local and
             # sparse peer keyframes (paper Equation 6). The peer's accepted
             # keyframes are joined by relative constraints derived from its
             # announced trajectory; these floors model that trajectory error.
             direct_keyframe_factors: true
+            # Evaluation-only kill switch for both the direct and legacy loop
+            # publishers. PCM and map-alignment estimation continue to run,
+            # but no provisional inter-robot match can mutate either robot's
+            # local factor graph while thresholds are being calibrated.
+            publish_factors: true
+            # PCM emits one audit record per candidate when recomputed. This
+            # depth holds a complete medium-scale recomputation burst.
+            diagnostic_qos_depth: 1000
             remote_odometry_rotation_stddev_rad: 0.05
             remote_odometry_translation_stddev_m: 0.20
 
@@ -95,8 +109,9 @@
             coarse_max_correspondences: 5000
             coarse_normal_radius_gain: 3.5
             coarse_fpfh_radius_gain: 5.0
-            coarse_robin_noise_bound_gain: 1.0
-            coarse_solver_noise_bound_gain: 0.75
+            # Effective bounds are voxel size times gain: 1.0 m / 0.75 m.
+            coarse_robin_noise_bound_gain: 0.5
+            coarse_solver_noise_bound_gain: 0.375
             coarse_clamp_noise_bounds: true
             min_coarse_correspondences: 5
             min_coarse_inliers: 3

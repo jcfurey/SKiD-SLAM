@@ -140,6 +140,20 @@ std::string validate(const Config& config) {
       config.coarse_robin_noise_bound_gain) {
     return "coarse_solver_noise_bound_gain cannot exceed coarse_robin_noise_bound_gain";
   }
+  if (config.coarse_clamp_noise_bounds) {
+    const double robin_noise_bound_m =
+      static_cast<double>(config.coarse_voxel_size_m) *
+      static_cast<double>(config.coarse_robin_noise_bound_gain);
+    const double solver_noise_bound_m =
+      static_cast<double>(config.coarse_voxel_size_m) *
+      static_cast<double>(config.coarse_solver_noise_bound_gain);
+    if (robin_noise_bound_m > 1.0 + 1.0e-6 ||
+        solver_noise_bound_m > 1.0 + 1.0e-6) {
+      return "effective KISS-Matcher noise bounds exceed its 1.0 m clamp; "
+             "reduce coarse_*_noise_bound_gain or explicitly disable "
+             "coarse_clamp_noise_bounds";
+    }
+  }
   if (config.min_coarse_correspondences < 3 || config.min_coarse_inliers < 3) {
     return "coarse correspondence and inlier minima must be at least 3";
   }

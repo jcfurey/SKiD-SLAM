@@ -1,6 +1,7 @@
 """Regression tests for multi-file launch parameter composition."""
 
 import importlib.util
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -74,3 +75,11 @@ def test_parameter_file_requires_wildcard_mapping(tmp_path):
 
     with pytest.raises(ValueError, match="must be a mapping"):
         MODULE._load_parameter_files([str(invalid)])
+
+
+def test_default_pcm_directory_is_runtime_storage():
+    default = MODULE._default_pcm_directory()
+
+    assert Path(default).parent == Path(tempfile.gettempdir())
+    assert default.endswith("skid_slam_pcm")
+    assert str(REPO / "config") != default

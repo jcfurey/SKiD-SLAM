@@ -44,8 +44,11 @@ struct Config {
   int coarse_max_correspondences = 5000;
   float coarse_normal_radius_gain = 3.5F;
   float coarse_fpfh_radius_gain = 5.0F;
-  float coarse_robin_noise_bound_gain = 1.0F;
-  float coarse_solver_noise_bound_gain = 0.75F;
+  // KISS-Matcher multiplies these gains by coarse_voxel_size_m. Keep the
+  // default effective bounds at 1.0 m and 0.75 m without relying on its
+  // warning-producing implicit clamp.
+  float coarse_robin_noise_bound_gain = 0.5F;
+  float coarse_solver_noise_bound_gain = 0.375F;
   bool coarse_clamp_noise_bounds = true;
   std::size_t min_coarse_correspondences = 5;
   std::size_t min_coarse_inliers = 3;

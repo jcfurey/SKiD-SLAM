@@ -7,6 +7,7 @@ uses, mirroring the ROS 1 launch structure.
 
 import copy
 import os
+import tempfile
 
 import yaml
 
@@ -66,6 +67,10 @@ def _with_overrides(parameters, overrides):
     return result
 
 
+def _default_pcm_directory():
+    return os.path.join(tempfile.gettempdir(), 'skid_slam_pcm')
+
+
 def launch_setup(context, *args, **kwargs):
     robot = LaunchConfiguration('robot').perform(context)
     id1 = LaunchConfiguration('id1').perform(context)
@@ -76,6 +81,7 @@ def launch_setup(context, *args, **kwargs):
         LaunchConfiguration('params').perform(context).split(':') if path]
     base_parameters = _load_parameter_files(parameter_paths)
     pcm_matrix_folder = LaunchConfiguration('pcm_matrix_folder').perform(context)
+    os.makedirs(pcm_matrix_folder, exist_ok=True)
     use_map_fusion = (
         LaunchConfiguration('use_map_fusion').perform(context).lower() in
         ('true', '1'))
@@ -167,7 +173,10 @@ def launch_setup(context, *args, **kwargs):
 
 
 def generate_launch_description():
-    default_pcm = os.path.join(get_package_share_directory('liorf'), 'config')
+    # The maximum-clique implementation exchanges its graph through a file.
+    # Keep that runtime artifact away from the installed (and, with symlink
+    # installs, source-controlled) package config directory.
+    default_pcm = _default_pcm_directory()
 
     return LaunchDescription([
         DeclareLaunchArgument('robot', default_value='jackal0'),

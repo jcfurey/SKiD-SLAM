@@ -342,6 +342,10 @@ if(BUILD_TESTING)
   target_include_directories(test_skid_graph_keys PRIVATE include)
   target_link_libraries(test_skid_graph_keys gtsam)
 
+  ament_add_gtest(test_skid_pcm_commitment
+    test/test_skid_pcm_commitment.cpp)
+  target_include_directories(test_skid_pcm_commitment PRIVATE include)
+
   ament_add_gtest(test_loop_constraint_utils
     test/test_loop_constraint_utils.cpp)
   target_link_libraries(test_loop_constraint_utils

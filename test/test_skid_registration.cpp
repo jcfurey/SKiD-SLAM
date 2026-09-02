@@ -79,6 +79,20 @@ TEST(RegistrationConfig, RejectsDimensionallyInvalidValues) {
   EXPECT_FALSE(liorf::registration::validate(config).empty());
 }
 
+TEST(RegistrationConfig, DoesNotPermitSilentKissNoiseBoundClamping) {
+  liorf::registration::Config config;
+  ASSERT_TRUE(liorf::registration::validate(config).empty());
+
+  config.coarse_robin_noise_bound_gain = 0.75F;
+  config.coarse_solver_noise_bound_gain = 0.5F;
+  EXPECT_NE(
+    liorf::registration::validate(config).find("1.0 m clamp"),
+    std::string::npos);
+
+  config.coarse_clamp_noise_bounds = false;
+  EXPECT_TRUE(liorf::registration::validate(config).empty());
+}
+
 TEST(RegistrationUncertainty, GivesIsotropicHessianConfiguredPhysicalUnits) {
   liorf::registration::Config config;
   config.nominal_rotation_stddev_rad = 0.1;

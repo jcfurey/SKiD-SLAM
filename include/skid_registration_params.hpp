@@ -37,9 +37,9 @@ Config declareConfig(
   config.coarse_fpfh_radius_gain =
     static_cast<float>(declare(prefix + "coarse_fpfh_radius_gain", 5.0));
   config.coarse_robin_noise_bound_gain = static_cast<float>(
-    declare(prefix + "coarse_robin_noise_bound_gain", 1.0));
+    declare(prefix + "coarse_robin_noise_bound_gain", 0.5));
   config.coarse_solver_noise_bound_gain = static_cast<float>(
-    declare(prefix + "coarse_solver_noise_bound_gain", 0.75));
+    declare(prefix + "coarse_solver_noise_bound_gain", 0.375));
   config.coarse_clamp_noise_bounds =
     declare(prefix + "coarse_clamp_noise_bounds", true);
 

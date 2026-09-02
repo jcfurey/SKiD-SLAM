@@ -21,6 +21,7 @@
 #include "skid_pose_uncertainty.hpp"
 #include "skid_comms.hpp"
 #include "skid_loop_detection.hpp"
+#include "skid_pcm_commitment.hpp"
 #include "skid_registration.hpp"
 #include "skid_registration_params.hpp"
 #include "skid_remote_graph.hpp"
@@ -127,6 +128,8 @@ private:
     bool _signal_2;
     bool _use_position_search;
     bool _direct_keyframe_factors = true;
+    bool _publish_factors = true;
+    int _diagnostic_qos_depth = 1000;
 
     int _num_bin;
     int _robot_id_th;
@@ -144,6 +147,7 @@ private:
     int _num_match_candidates;
 
     int _pcm_start_threshold;
+    liorf::pcm::CommitmentConfig _pcm_commitment_config;
 
     float _loop_thres;
     float _pcm_thres;
@@ -251,6 +255,9 @@ private:
         int source_bin = -1;
         int query_bin = -1;
         int match_bin = -1;
+        // Legacy local-factor composition uses source <- target. PCM must
+        // invert this to target <- source before closing Equation (11)'s
+        // target_i -> target_j -> source_k -> source_l cycle.
         gtsam::Pose3 relative_pose;
         liorf::uncertainty::Matrix6d covariance =
             liorf::uncertainty::Matrix6d::Zero();
@@ -276,8 +283,12 @@ private:
 
     std::unordered_map< std::string, std::vector<PointTypePose> > _global_odom_trans;
 
-    //first: robot pair id, second: effective loop id in _loop_queue
-    std::unordered_map< int, std::vector<int> > _loop_accept_queue;
+    // First: robot-pair id; second: effective loop ids in _loop_queue. This
+    // set is monotonic and is the only set allowed to affect map alignment or
+    // either factor publisher.
+    std::unordered_map< int, std::vector<int> > _loop_commit_queue;
+    std::unordered_map<int, liorf::pcm::CommitmentTracker>
+        _pcm_commitment_trackers;
     std::set<liorf::remote_graph::FactorIdentity> _published_direct_factors;
 
     std::unordered_map< int, std::vector<PointTypePose> > _global_map_trans;
@@ -302,6 +313,12 @@ public:
     explicit MapFusion(const rclcpp::NodeOptions & options)
     : Node("liorf_mapFusion", options) {
         ParamLoader();
+        if (!_publish_factors) {
+            RCLCPP_WARN(
+                get_logger(),
+                "Inter-robot factor publication is disabled; registrations, "
+                "PCM, and map alignment are running in evaluation-only mode");
+        }
         initialization();
 
         // ROS 1 spun this node single-threaded; keep callbacks serialised.
@@ -362,7 +379,8 @@ public:
         _pub_loop_info_global = create_publisher<liorf::msg::LoopConstraint>(
                 _solid_topic + "/loop_info_global", rclcpp::QoS(100));
         _pub_loop_diagnostic = create_publisher<liorf::msg::LoopDiagnostic>(
-                prefixTopic(_robot_id, _diagnostic_topic), 50);
+                prefixTopic(_robot_id, _diagnostic_topic),
+                rclcpp::QoS(_diagnostic_qos_depth));
         _pub_scan_request = create_publisher<liorf::msg::ScanRequest>(
                 _solid_topic + "/scan_request", 20);
         _pub_scan_data = create_publisher<liorf::msg::ScanData>(
@@ -468,6 +486,10 @@ private:
         _loop_frame_thres = declare_and_get<int>("mapfusion.interRobot.loop_frame_threshold", 10);
         _direct_keyframe_factors = declare_and_get<bool>(
             "mapfusion.interRobot.direct_keyframe_factors", true);
+        _publish_factors = declare_and_get<bool>(
+            "mapfusion.interRobot.publish_factors", true);
+        _diagnostic_qos_depth = declare_and_get<int>(
+            "mapfusion.interRobot.diagnostic_qos_depth", 1000);
 
         _solid_topic = declare_and_get<std::string>("mapfusion.interRobot.solid_topic", "solid");
         _loop_topic = declare_and_get<std::string>(
@@ -481,6 +503,19 @@ private:
         _map_fusion_frame = liorf::frames::normalizeFrameId(
             declare_and_get<std::string>("liorf.mapFusionFrame", ""));
         _pcm_start_threshold = declare_and_get<int>("mapfusion.interRobot.pcm_start_threshold", 5);
+        const int pcm_min_publish_clique_size = declare_and_get<int>(
+            "mapfusion.interRobot.pcm_min_publish_clique_size", 5);
+        const int pcm_min_publish_observations = declare_and_get<int>(
+            "mapfusion.interRobot.pcm_min_publish_observations", 3);
+        if (pcm_min_publish_clique_size < 0 ||
+            pcm_min_publish_observations < 0) {
+            throw std::invalid_argument(
+                "mapfusion PCM publication policy values must be non-negative");
+        }
+        _pcm_commitment_config.min_clique_size =
+            static_cast<std::size_t>(pcm_min_publish_clique_size);
+        _pcm_commitment_config.min_consecutive_acceptances =
+            static_cast<std::size_t>(pcm_min_publish_observations);
         _use_position_search = declare_and_get<bool>("mapfusion.interRobot.use_position_search", false);
 
         // Communication policy. The descriptor is what the paper exchanges
@@ -562,6 +597,15 @@ private:
             _pcm_local_translation_stddev_m <= 0.0) {
             throw std::invalid_argument(
                 "mapfusion PCM threshold/uncertainty values are invalid");
+        }
+        const std::string commitment_error =
+            liorf::pcm::validate(_pcm_commitment_config);
+        if (!commitment_error.empty() || _diagnostic_qos_depth < 1) {
+            throw std::invalid_argument(
+                "invalid mapfusion PCM publication policy: " +
+                (commitment_error.empty() ?
+                    std::string("diagnostic_qos_depth must be positive") :
+                    commitment_error));
         }
 
         if (!std::isfinite(_map_alignment_rotation_stddev_rad) ||
@@ -893,8 +937,11 @@ private:
         context_info.asolid.assign(_num_sectors, 0);
         context_info.rsolid.assign(_knn_feature_dim, 0);
         context_info.header = _cloud_header;
-
-        int cnt = 0;
+        // Announcements leave a bounded FIFO on a background thread. Using
+        // the node's latest cloud header here silently re-timestamped older
+        // keyframes and made loop diagnostics point at the wrong ground-truth
+        // poses. Preserve the timestamp captured with this descriptor.
+        context_info.header.stamp = sec2Stamp(bin.time);
 
         // SOLiD
         for (int i=0; i<_num_sectors; i++){
@@ -1398,7 +1445,6 @@ private:
         // SOLiD
         bin.asolid = Eigen::VectorXf::Zero(_num_sectors);
         bin.rsolid = Eigen::VectorXf::Zero(_knn_feature_dim);
-        int cnt = 0;
         for (int i=0; i<msgIn->num_sector; i++){
             bin.asolid(i) = msgIn->asolid[i];
         }
@@ -1435,7 +1481,7 @@ private:
             return;
         }
 
-        if (_direct_keyframe_factors)
+        if (_publish_factors && _direct_keyframe_factors)
             publishAcceptedDirectFactors();
 
         //perform optimization
@@ -1985,7 +2031,9 @@ private:
         if (!registration.accepted()) {
             output.failure_reason =
                 liorf::registration::toString(registration.status);
-            RCLCPP_WARN(
+            // Descriptor false positives are expected and are retained in the
+            // structured diagnostic stream. They are not node-level faults.
+            RCLCPP_DEBUG(
                 get_logger(),
                 "SKiD registration rejected (%s): %s "
                 "[corr=%zu, coarse_inliers=%zu, fine_inliers=%zu, overlap=%.3f, tMSE=%.6f m^2]",
@@ -2050,20 +2098,28 @@ private:
 
     void publishPcmDiagnostics(
         const std::vector<LoopCandidate> & candidates,
-        const std::vector<int> & maximum_clique) {
+        const std::vector<int> & maximum_clique,
+        const std::vector<int> & committed_candidates) {
         for (std::size_t index = 0; index < candidates.size(); ++index) {
             liorf::msg::LoopDiagnostic diagnostic =
                 candidates[index].registration_diagnostic;
             const bool accepted = std::binary_search(
                 maximum_clique.begin(), maximum_clique.end(),
                 static_cast<int>(index));
+            const bool committed = std::binary_search(
+                committed_candidates.begin(), committed_candidates.end(),
+                static_cast<int>(index));
             diagnostic.header.stamp = this->now();
             diagnostic.stage = "pcm";
             diagnostic.decision = accepted ? "accepted" : "rejected";
             diagnostic.reason = accepted ?
-                "maximum_clique" : "outside_maximum_clique";
+                (committed ? "maximum_clique_committed" :
+                             "maximum_clique_provisional") :
+                (committed ? "outside_maximum_clique_after_commitment" :
+                             "outside_maximum_clique");
             diagnostic.pcm_evaluated = true;
             diagnostic.pcm_accepted = accepted;
+            diagnostic.pcm_committed = committed;
             diagnostic.pcm_clique_size = maximum_clique.size();
             _pub_loop_diagnostic->publish(diagnostic);
         }
@@ -2087,21 +2143,30 @@ private:
         FMC::maxCliqueHeu(gio, max_clique_data);
 
         std::sort(max_clique_data.begin(), max_clique_data.end());
+        auto tracker = _pcm_commitment_trackers.try_emplace(
+            _robot_this_th, _pcm_commitment_config).first;
+        const std::vector<int> committed = tracker->second.update(
+            _loop_queue[_robot_this_th].size(), max_clique_data);
         publishPcmDiagnostics(
-            _loop_queue[_robot_this_th], max_clique_data);
+            _loop_queue[_robot_this_th], max_clique_data, committed);
 
-        auto loop_accept_queue_this = _loop_accept_queue.find(_robot_this_th);
-        if (loop_accept_queue_this == _loop_accept_queue.end()){
-            _loop_accept_queue.emplace(std::make_pair(_robot_this_th, max_clique_data));
-            return true;
-        }
-
-        if(max_clique_data == loop_accept_queue_this->second)
+        std::vector<int> & previous_commitments =
+            _loop_commit_queue[_robot_this_th];
+        if (committed == previous_commitments)
             return false;
-
-        _loop_accept_queue[_robot_this_th].clear();
-        _loop_accept_queue[_robot_this_th] = max_clique_data;
-        return true;
+        const std::size_t previous_count = previous_commitments.size();
+        previous_commitments = committed;
+        const std::size_t new_count = previous_commitments.size() > previous_count ?
+            previous_commitments.size() - previous_count : 0;
+        RCLCPP_INFO(
+            get_logger(),
+            "PCM committed %zu new inter-robot registration(s), %zu total "
+            "[clique=%zu, minimum=%zu, observations=%zu]",
+            new_count,
+            previous_commitments.size(), max_clique_data.size(),
+            _pcm_commitment_config.min_clique_size,
+            _pcm_commitment_config.min_consecutive_acceptances);
+        return !previous_commitments.empty();
     }
 
     static gtsam::Pose3 ownerPose(const SOLiDBin & bin) {
@@ -2145,15 +2210,15 @@ private:
             _pub_loop_info_global->publish(message);
     }
 
-    // Publish one direct query-to-match factor for every newly PCM-accepted
+    // Publish one direct query-to-match factor for every newly PCM-committed
     // registration. Each endpoint robot receives the same measurement and
     // represents the other endpoint as a sparse remote state. Previously the
     // node waited for two registrations and algebraically eliminated the peer
     // states before publishing a local-only factor.
     void publishAcceptedDirectFactors() {
-        const auto accepted = _loop_accept_queue.find(_robot_this_th);
+        const auto accepted = _loop_commit_queue.find(_robot_this_th);
         const auto candidates = _loop_queue.find(_robot_this_th);
-        if (accepted == _loop_accept_queue.end() ||
+        if (accepted == _loop_commit_queue.end() ||
             candidates == _loop_queue.end())
             return;
 
@@ -2215,6 +2280,8 @@ private:
 
         for (unsigned int i = 0; i < loop_queue_this.size(); i++){
             const auto& first_loop = loop_queue_this[i];
+            const auto inter_jk = liorf::uncertainty::inverse(
+                first_loop.relative_pose, first_loop.covariance);
             PointTypePose tmp_pose_0 = _bin_with_id.at(first_loop.target_bin).pose;
             PointTypePose tmp_pose_1 = _bin_with_id.at(first_loop.source_bin).pose;
             t_aj = gtsam::Pose3(gtsam::Rot3::RzRyRx(tmp_pose_0.roll, tmp_pose_0.pitch, tmp_pose_0.yaw),
@@ -2224,6 +2291,8 @@ private:
 
             for (unsigned int j = i + 1; j < loop_queue_this.size(); j++){
                 const auto& second_loop = loop_queue_this[j];
+                const auto inter_il = liorf::uncertainty::inverse(
+                    second_loop.relative_pose, second_loop.covariance);
                 PointTypePose tmp_pose_0 = _bin_with_id.at(second_loop.target_bin).pose;
                 PointTypePose tmp_pose_1 = _bin_with_id.at(second_loop.source_bin).pose;
                 t_ai = gtsam::Pose3(gtsam::Rot3::RzRyRx(tmp_pose_0.roll, tmp_pose_0.pitch, tmp_pose_0.yaw),
@@ -2233,8 +2302,8 @@ private:
                 z_ai_aj = t_ai.between(t_aj);
                 z_bk_bl = t_bk.between(t_bl);
                 const auto residual = liorf::uncertainty::pcmResidual(
-                    first_loop.relative_pose, first_loop.covariance,
-                    second_loop.relative_pose, second_loop.covariance,
+                    inter_jk.pose, inter_jk.covariance,
+                    inter_il.pose, inter_il.covariance,
                     z_ai_aj, z_bk_bl,
                     _pcm_local_rotation_stddev_rad,
                     _pcm_local_translation_stddev_m);
@@ -2317,12 +2386,12 @@ private:
     }
 
     void gtsamExpressionGraph(){
-        if (_loop_accept_queue[_robot_this_th].size()<2)
+        if (_loop_commit_queue[_robot_this_th].size()<2)
             return;
 
         gtsam::Pose3 initial_pose_0, initial_pose_1;
         const auto& latest = _pose_queue[_robot_this_th][
-            _loop_accept_queue[_robot_this_th].back()];
+            _loop_commit_queue[_robot_this_th].back()];
         initial_pose_0 = latest.source_pose;
         initial_pose_1 = latest.aligned_source_pose;
 
@@ -2334,7 +2403,7 @@ private:
         initial.insert(0, initial_pose_1 * initial_pose_0.inverse());
         //initial.print();
 
-        for (auto i:_loop_accept_queue[_robot_this_th]){
+        for (auto i:_loop_commit_queue[_robot_this_th]){
             const auto& registration = _pose_queue[_robot_this_th][i];
 
             gtsam::Pose3_ predicted = transformTo(
@@ -2441,8 +2510,12 @@ private:
 
     void sendGlobalLoopMessageKDTree(){
 
+        const auto committed = _loop_commit_queue.find(_robot_this_th);
+        if (committed == _loop_commit_queue.end() ||
+            committed->second.empty())
+            return;
         auto loop_list = _loop_queue[_robot_this_th];
-        int len_loop_list = loop_list.size() - 1;
+        int len_loop_list = committed->second.back();
         auto loop_this = loop_list[len_loop_list];
         int id_bin_this = loop_this.source_bin;
 
@@ -2614,7 +2687,7 @@ private:
              _global_map_trans_optimized[_robot_this_th].yaw);
         _pub_trans_odom2odom->publish(odom2odom);
 
-        if (!_direct_keyframe_factors)
+        if (_publish_factors && !_direct_keyframe_factors)
             sendGlobalLoopMessageKDTree();
 
     }
