@@ -178,6 +178,22 @@ for outlier detection.
 To run against a different dataset, point the launch file at the matching
 parameter file in `config/` (each `run_*.launch.py` selects one), or pass your
 own with the `params` argument of `launch/include/module_loam.launch.py`.
+## Evaluation
+
+`evaluation/` computes the metrics the paper reports: place-recognition
+precision and recall, registration RTE/RRE and success rate, trajectory ATE and
+ARE, descriptor memory against a Scan Context baseline, and communication cost.
+
+```
+./evaluation/run_evaluation.py evaluation/manifests/park.yaml \
+    --results-root results/park
+```
+
+It needs no dependency beyond PyYAML. See
+[`evaluation/README.md`](evaluation/README.md) for the file conventions, what
+can and cannot yet be extracted from a bag, and why each manifest's `expected`
+block is deliberately empty.
+
 DiSO FEATURES
 ---------------------------------------------------------------------------------------------------------------------------------------------------
 - Uses KISS-Matcher coarse registration followed by Small-GICP fine

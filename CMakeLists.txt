@@ -340,6 +340,12 @@ if(BUILD_TESTING)
     COMMAND ${Python3_EXECUTABLE}
       ${CMAKE_CURRENT_SOURCE_DIR}/test/validate_config_parameters.py
       --repo ${CMAKE_CURRENT_SOURCE_DIR})
+
+  # The evaluation harness computes the paper's metrics; its tests check them
+  # against cases whose answers are known analytically.
+  add_test(NAME test_skid_eval
+    COMMAND ${Python3_EXECUTABLE} -m pytest -q
+      ${CMAKE_CURRENT_SOURCE_DIR}/test/test_skid_eval.py)
 endif()
 
 #############
@@ -347,9 +353,10 @@ endif()
 #############
 
 # Not INSTALL_TO_SHARE: config/doc holds the README media and must be excluded.
-install(DIRECTORY launch config src/liorf-DiSO/config
+install(DIRECTORY launch config src/liorf-DiSO/config evaluation
   DESTINATION share/${PROJECT_NAME}
   PATTERN "doc" EXCLUDE
+  PATTERN "__pycache__" EXCLUDE
 )
 
 # Runtime dependency of the generated interfaces; it is an exec_depend, so

@@ -2,7 +2,7 @@
 
 Status: living audit and implementation record for the `v3` branch
 
-Last updated: 1 September 2026 (intra-robot pipeline reuse; bounded on-demand communications; map-alignment uncertainty; paper dataset configurations)
+Last updated: 1 September 2026 (intra-robot pipeline reuse; bounded on-demand communications; map-alignment uncertainty; paper dataset configurations; evaluation harness)
 
 Audit baseline: commit `475b59f`, before the paper-registration work below.
 The gap table records that baseline so the provenance problem remains visible;
@@ -20,6 +20,7 @@ boundary:
 - [`UNIFIED_LOOP_CLOSURE_CHANGE_RECORD.md`](UNIFIED_LOOP_CLOSURE_CHANGE_RECORD.md)
 - [`BOUNDED_COMMUNICATIONS_CHANGE_RECORD.md`](BOUNDED_COMMUNICATIONS_CHANGE_RECORD.md)
 - [`MAP_ALIGNMENT_UNCERTAINTY_CHANGE_RECORD.md`](MAP_ALIGNMENT_UNCERTAINTY_CHANGE_RECORD.md)
+- [`EVALUATION_HARNESS_CHANGE_RECORD.md`](EVALUATION_HARNESS_CHANGE_RECORD.md)
 
 ## Executive summary
 
@@ -51,6 +52,8 @@ contract, and contains correctness issues that need tests and reimplementation.
 - REP-105 local frame separation and optional ECEF geographic anchoring.
 - Descriptor-only announcements with on-demand scan transfer, bounded queues
   and caches, and byte/latency reporting.
+- The six paper dataset configurations, with a parameter-contract test.
+- A dependency-free evaluation harness for the paper's metrics.
 
 The last two items are post-paper extensions and should be retained while
 paper parity is restored.
@@ -348,7 +351,7 @@ robot. None of that is attempted here.
 | P1 | Meaningful inter-robot uncertainty | Implemented for the SOLiD paper pipeline: Hessian-shaped, physically calibrated full covariance is propagated through PCM, map alignment, the typed loop message, and the GTSAM factor. | Calibrate on field data and extend trajectory uncertainty beyond the configured PCM floor. |
 | P2 | ROS + ZeroMQ field communication setup (Section VI-B) | No ZeroMQ transport or reproducible network setup is present. The message contract is now transport-agnostic: announcements and scans are separate, bounded topics, so a bridge carries descriptors and scans independently. | Add an optional transport adapter or document the external component used by the paper. |
 | P2 | Paper dataset configurations | Implemented. GEODE, GRACO, Majang, Moon, Park, and STEAM are ported to ROS 2 parameters with a launch file each, and every parameter file is checked against the declared parameter contract by `validate_config_parameters`. | Verify each against its bag: topic names, `imuRate`, and the Moon sensor/topic pairing noted in that file are unverified against real data. Add cave and planetary field configs if the data are available. |
-| P2 | Paper evaluation harness | No reproducible PR, RTE/RRE, success-rate, ATE/ARE, descriptor-memory, or communication-latency pipeline is included. | Add scripts, manifests, ground-truth conventions, and expected result summaries. |
+| P2 | Paper evaluation harness | Implemented in `evaluation/`: PR curves, RTE/RRE and success rate, ATE/ARE with rigid, Sim(3) or yaw alignment, descriptor memory against a Scan Context baseline, and communication cost read back from the map-fusion diagnostics. Manifests exist for all six datasets, and the metrics are tested against analytically known cases. | Two inputs cannot yet be produced from a bag: loop-candidate scores need the structured diagnostic topic Phase 2 item 4 tracks, and registrations need a keyframe-index-to-time extractor. Fill in each manifest's `expected` block once the paper's protocol is confirmed to match. |
 | P2 | Pipeline test coverage | Unit coverage now includes coarse-to-fine registration, truncated MSE, covariance, SE(3) PCM propagation and inversion, message conversion, SOLiD descriptor construction, descriptor retrieval, the shared registration parameter contract, the communication policy, and a parameter-contract check over every configuration and launch file. | Add failure injection and multi-robot graph tests. |
 | P2 | Public package identity | The ROS package is still named and described as Liorf and retains upstream maintainer metadata. | Decide whether to rename the ROS package; at minimum correct description, authorship, dependencies, and third-party notices. |
 
@@ -392,6 +395,8 @@ robot. None of that is attempted here.
   propagated into cross-peer loop factors.
 - `config/{geode,graco,majang_rover,moon,park,steam_legged}.yaml` and their
   launch files: the paper's field datasets, ported from `0611f71`.
+- `evaluation/`: the metric implementations, dataset manifests, CLI runner,
+  and the conventions the inputs must follow.
 - `test/validate_config_parameters.py`: every parameter file is checked
   against the parameters the sources declare, including the prefixed
   registration sets built at runtime, and against the declared types.
@@ -474,8 +479,9 @@ Items 1-3 are complete; item 4 is partially complete:
 3. **Partially done:** the six paper field configurations are restored with
    launches and a parameter-contract test. Dataset manifests and ground-truth
    conventions still belong to item 4.
-4. Reproduce the paper's place-recognition, registration, mapping, memory, and
-   communication metrics.
+4. **Partially done:** the harness that computes those metrics exists and is
+   tested; nothing has been run against a bag, and no expected figures are
+   recorded. See `evaluation/README.md`.
 
 ## Phase 1 acceptance criteria
 

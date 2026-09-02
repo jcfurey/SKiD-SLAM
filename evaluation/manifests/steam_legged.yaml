@@ -1,0 +1,65 @@
+# Evaluation manifest for the STEAM legged platform dataset.
+#
+# Paths are relative to this file unless --results-root is given. Every
+# section is optional: a missing input is reported as a gap in the run, not an
+# error, so a partial evaluation still produces the parts it can.
+#
+# See evaluation/README.md for the file conventions.
+
+dataset: steam_legged
+title: STEAM legged platform
+description: >-
+  Legged platform in a confined, conduit-like environment.
+config: config/steam_legged.yaml
+launch: launch/run_steam_legged.launch.py
+
+# Trajectory alignment before absolute error is measured. rigid is right when
+# the estimate is metric; sim3 only when its scale is genuinely unobserved.
+alignment: rigid
+association_max_time_difference_s: 0.02
+relative_pose_delta: 1
+
+place_recognition:
+  # A candidate counts as a true loop when the two ground-truth positions are
+  # this close and the observations are far enough apart in time.
+  revisit_distance_m: 5.0
+  min_time_gap_s: 30.0
+  # Number of revisits that genuinely exist in the run. Leave unset and recall
+  # is measured over what retrieval proposed, which flatters it.
+  total_positives: null
+
+registration:
+  translation_threshold_m: 2.0
+  rotation_threshold_deg: 5.0
+
+resources:
+  # Must match mapfusion.solid in the parameter file actually used.
+  knn_feature_dim: 40
+  num_sectors: 60
+  # Baseline for the descriptor-size comparison.
+  scan_context_rings: 20
+
+robots:
+  - id: jackal0
+    # Fill these in for a real run. bag is recorded for provenance; the
+    # metrics read the extracted files.
+    bag: null
+    ground_truth: null      # TUM: timestamp tx ty tz qx qy qz qw
+    estimate: null          # TUM, same convention
+    candidates: null        # CSV: query_time,match_time,score[,is_true_loop]
+    registrations: null     # CSV: query_time,match_time,tx,ty,tz,qx,qy,qz,qw
+    comms_log: null         # map-fusion stdout, for the diagnostics lines
+
+# Published figures to compare a run against. These are NOT filled in: the
+# numbers in the paper are reported over the authors' runs and their exact
+# evaluation protocol is not reproduced here, so copying them in would assert
+# a comparison that has not been established. Fill them from the paper once
+# the protocol above is confirmed to match, and the runner will check each
+# measurement against its value.
+expected:
+  ate_rmse_m: null
+  are_rmse_deg: null
+  rte_rmse_m: null
+  rre_rmse_deg: null
+  success_rate: null
+  max_f1: null
