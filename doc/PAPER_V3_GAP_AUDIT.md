@@ -14,6 +14,10 @@ Environments* (30 July 2025)
 
 ## Change records
 
+[`SESSION_CHANGE_LOG.md`](SESSION_CHANGE_LOG.md) indexes the 1 September 2026
+session as a whole, including the defects it found and the verification
+boundary for all of it.
+
 Per-change records, each with the decisions behind it and its verification
 boundary:
 

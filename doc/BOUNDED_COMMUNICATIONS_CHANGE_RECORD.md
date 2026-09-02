@@ -92,6 +92,12 @@ the node as the single owner of the data.
 - `commsMaintenance()` runs on a timer: resend timed-out requests, abandon
   those past budget, expire stale parked candidates, and log the byte, latency,
   drop, eviction, retry, and abandonment counters.
+- `getInitialGuesses()` now accumulates each candidate's outcome instead of
+  overwriting it. The previous `new_candidate_signal = getInitialGuess(...)`
+  kept only the last candidate's result, so with
+  `mapfusion.solid.num_match_candidates` above 1 an accepted loop could be
+  discarded whenever a later candidate in the same batch failed. The default is
+  1, which is why this was invisible.
 
 ### 2.4 Build and configuration
 
