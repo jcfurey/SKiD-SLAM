@@ -18,6 +18,9 @@ from skid_eval import linalg, metrics, place_recognition, resources  # noqa: E40
 from skid_eval.diagnostic_extraction import (  # noqa: E402
     CANDIDATE_FIELDS, REGISTRATION_FIELDS, candidate_row,
     registration_row, rows_from_messages, write_rows)
+from skid_eval.factor_scoring import (  # noqa: E402
+    Endpoint, EndpointTimestamp, Factor, collect_endpoint_timestamps,
+    compare_factor_deliveries, score_factors)
 from skid_eval.inputs import read_candidates, read_registrations  # noqa: E402
 from skid_eval.alignment import (  # noqa: E402
     horn_alignment, yaw_only_alignment)
@@ -759,3 +762,121 @@ def test_extracted_csvs_are_consumed_by_the_existing_readers(tmp_path):
     assert parsed_registrations[0][0:2] == pytest.approx((12.5, 4.25))
     assert parsed_registrations[0][2].translation == pytest.approx(
         (1.0, 2.0, 3.0))
+
+
+# ---------------------------------------------------------------------------
+# distributed-factor scoring
+# ---------------------------------------------------------------------------
+
+def test_factor_delivery_comparison_normalizes_opposite_orientations():
+    first = Endpoint("jackal0", 4)
+    second = Endpoint("jackal1", 9)
+    transform = Pose(0.0, (2.0, -1.0, 0.5), rotation_z(0.4))
+    deliveries = {
+        "/jackal0/context/loop_info": [
+            Factor("jackal0", first, second, transform)],
+        "/jackal1/context/loop_info": [
+            Factor("jackal1", second, first, transform.inverse())],
+    }
+
+    report, canonical = compare_factor_deliveries(deliveries)
+
+    assert report["symmetric"] is True
+    assert len(canonical) == 1
+    assert canonical[(first, second)].translation == pytest.approx(
+        transform.translation)
+
+
+def test_factor_delivery_comparison_exposes_measurement_disagreement():
+    first = Endpoint("jackal0", 4)
+    second = Endpoint("jackal1", 9)
+    deliveries = {
+        "left": [Factor(
+            "jackal0", first, second,
+            Pose(0.0, (1.0, 0.0, 0.0), IDENTITY))],
+        "right": [Factor(
+            "jackal1", first, second,
+            Pose(0.0, (1.1, 0.0, 0.0), IDENTITY))],
+    }
+
+    report, _ = compare_factor_deliveries(deliveries)
+
+    assert report["symmetric"] is False
+    assert report["measurement_mismatches"][0][
+        "translation_difference_m"] == pytest.approx(0.1)
+
+
+def test_factor_delivery_comparison_requires_both_endpoint_recipients():
+    first = Endpoint("jackal0", 4)
+    second = Endpoint("jackal1", 9)
+    transform = Pose(0.0, (1.0, 0.0, 0.0), IDENTITY)
+    deliveries = {
+        "left": [Factor("jackal0", first, second, transform)],
+        "right": [Factor("jackal0", first, second, transform)],
+    }
+
+    report, _ = compare_factor_deliveries(deliveries)
+
+    assert report["symmetric"] is False
+    assert any(
+        error["reason"] == "factor_not_delivered_to_both_endpoints"
+        for error in report["recipient_errors"])
+
+
+def test_endpoint_timestamp_audit_exposes_conflicts_and_regressions():
+    observations = [
+        EndpointTimestamp(Endpoint("jackal0", 1), 10.0),
+        EndpointTimestamp(Endpoint("jackal0", 1), 10.0),
+        EndpointTimestamp(Endpoint("jackal0", 2), 9.0),
+        EndpointTimestamp(Endpoint("jackal0", 2), 9.5),
+    ]
+
+    timestamps, conflicts, regressions = collect_endpoint_timestamps(
+        observations)
+
+    assert len(timestamps) == 2
+    assert conflicts[0]["endpoint"] == "jackal0/2"
+    assert conflicts[0]["difference_s"] == pytest.approx(0.5)
+    assert regressions[0]["previous_keyframe_index"] == 1
+    assert regressions[0]["keyframe_index"] == 2
+
+
+def test_factor_scoring_uses_original_endpoint_times_and_relative_pose():
+    first = Endpoint("jackal0", 4)
+    second = Endpoint("jackal1", 9)
+    first_pose = Pose(5.0, (1.0, 2.0, 0.0), rotation_z(0.5))
+    second_pose = Pose(8.0, (4.0, 4.0, 0.0), rotation_z(0.8))
+    reference = first_pose.between(second_pose)
+    factors = {(first, second): reference}
+    endpoint_times = {first: 5.001, second: 7.999}
+    ground_truth = {
+        "jackal0": Trajectory([first_pose]),
+        "jackal1": Trajectory([second_pose]),
+    }
+
+    report = score_factors(
+        factors, endpoint_times, ground_truth, max_time_difference_s=0.01)
+
+    assert report["associated_factors"] == 1
+    assert report["unassociated_factors"] == 0
+    assert report["translation"]["max"] == pytest.approx(0.0, abs=1e-12)
+    assert report["rotation"]["max"] == pytest.approx(0.0, abs=1e-12)
+    assert report["separation"]["max"] == pytest.approx(0.0, abs=1e-12)
+
+
+def test_factor_scoring_reports_ground_truth_gaps_without_reusing_bad_poses():
+    first = Endpoint("jackal0", 4)
+    second = Endpoint("jackal1", 9)
+    factors = {(first, second): Pose(0.0, (1.0, 0.0, 0.0), IDENTITY)}
+    endpoint_times = {first: 1.0, second: 2.0}
+    ground_truth = {
+        "jackal0": Trajectory([Pose(0.0, (0.0, 0.0, 0.0), IDENTITY)]),
+        "jackal1": Trajectory([Pose(0.0, (1.0, 0.0, 0.0), IDENTITY)]),
+    }
+
+    report = score_factors(
+        factors, endpoint_times, ground_truth, max_time_difference_s=0.1)
+
+    assert report["associated_factors"] == 0
+    assert report["translation"] is None
+    assert report["unassociated"][0]["reason"] == "ground_truth_time_gap"

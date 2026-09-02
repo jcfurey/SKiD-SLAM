@@ -96,6 +96,41 @@ decisions. Those stages are intentionally excluded from the two CSVs, but stay
 available in the bag for diagnosing why a descriptor candidate did not become
 a factor.
 
+### Auditing published distributed factors
+
+`score_loop_factors_from_bag.py` checks the final graph-facing contract rather
+than every accepted registration. Give it the factor topic recorded from each
+endpoint robot, the observer's diagnostic topic, and one retimed TUM trajectory
+per robot:
+
+```bash
+./evaluation/score_loop_factors_from_bag.py diagnostics \
+    --factor-topic /jackal0/context/loop_info \
+    --factor-topic /jackal1/context/loop_info \
+    --diagnostic-topic /jackal1/solid/loop_diagnostics \
+    --ground-truth jackal0=jackal0_ground_truth.txt \
+    --ground-truth jackal1=jackal1_ground_truth.txt \
+    --max-time-difference 0.03 \
+    --max-rte 2.0 \
+    --output factor_report.json
+```
+
+The command fails when the two topics do not contain the same unique
+measurement, when a factor was not addressed to both endpoint robots, when a
+duplicate factor appears, when one keyframe index acquires conflicting times,
+or when timestamps regress with keyframe index. Optional RTE/RRE limits make
+the same command usable as a regression gate.
+
+Endpoint times come from the accepted registration diagnostic associated with
+the factor, never from the later publication time. Factors are put into one
+canonical endpoint order before their values are compared, so a legitimate
+opposite message orientation is normalized but an incorrect inverse is still
+detected. The JSON report includes every associated and rejected factor,
+nearest-ground-truth time gaps, standard RTE/RRE, and the difference in
+endpoint separation. Separation error is orientation independent and is a
+useful secondary diagnostic when a dataset's body-to-sensor rotation
+convention is unresolved; it is not a substitute for RTE/RRE.
+
 ## Expected values
 
 Each manifest has an `expected` block. It is deliberately **not** filled in.
