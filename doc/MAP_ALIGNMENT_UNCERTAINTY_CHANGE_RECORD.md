@@ -196,4 +196,4 @@ Newly opened:
 
 | Commit | Contents |
 |---|---|
-| this commit | Propagate map-alignment uncertainty into cross-peer loop factors |
+| `78edde3` | Propagate map-alignment uncertainty into cross-peer loop factors |
