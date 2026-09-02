@@ -210,4 +210,4 @@ Newly opened:
 | Commit | Contents |
 |---|---|
 | `52ceb5f` | Restore the paper dataset configurations and check the contract |
-| this commit | Add the paper evaluation harness |
+| `ed6c4e8` | Add the paper evaluation harness |
