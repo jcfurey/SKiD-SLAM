@@ -21,6 +21,7 @@ what the whole session leaves unverified.
 | [`MAP_ALIGNMENT_UNCERTAINTY_CHANGE_RECORD.md`](MAP_ALIGNMENT_UNCERTAINTY_CHANGE_RECORD.md) | P1 — Distributed keyframe PGO matching Equation 6 (partial) |
 | [`DISTRIBUTED_KEYFRAME_GRAPH_CHANGE_RECORD.md`](DISTRIBUTED_KEYFRAME_GRAPH_CHANGE_RECORD.md) | P1 — Direct factors and sparse remote keyframes for Equations 6 and 7 |
 | [`PCM_COMMITMENT_CHANGE_RECORD.md`](PCM_COMMITMENT_CHANGE_RECORD.md) | P0/P1 — Correct Equation 11 direction and delay add-only graph publication |
+| [`FULL_TWO_ROBOT_REPLAY_CHANGE_RECORD.md`](FULL_TWO_ROBOT_REPLAY_CHANGE_RECORD.md) | P1/P2 — Complete synthetic replay, graph-facing factor audit, and runtime bookkeeping |
 | [`EVALUATION_HARNESS_CHANGE_RECORD.md`](EVALUATION_HARNESS_CHANGE_RECORD.md) | P2 — Paper dataset configurations, and the evaluation harness |
 | [`FIELD_COMMUNICATION_CHANGE_RECORD.md`](FIELD_COMMUNICATION_CHANGE_RECORD.md) | P2 — ROS + ZeroMQ field communication setup |
 
@@ -44,6 +45,8 @@ what the whole session leaves unverified.
 | `296171f` | Document distributed keyframe graph parity |
 | `f610787` | Record synthetic two-robot bag derivation |
 | `774594a` | Stabilize PCM publication and matcher diagnostics |
+| `44e07df` | Add distributed factor audit tooling |
+| `2a01982` | Fix map-fusion replay bookkeeping |
 
 ## Audit movement
 
@@ -99,6 +102,9 @@ build, not by reading the code:
 | A background announcement used the latest cloud header instead of the queued keyframe's timestamp | Diagnostics associated valid factors with the wrong ground-truth poses | Two-robot factor audit |
 | Every current maximum-clique member was published into an add-only graph immediately | A transient or undersized clique could become permanent graph state | Two-robot replay and graph-semantics review |
 | Runtime PCM matrices were written beneath the installed package config | A symlink build modified a tracked source file during replay | Working-tree audit |
+| Every keyframe entered absent and receive-only announcement queues | Communication reports claimed drops on links that did not exist | Complete two-robot replay |
+| A late optimized fleet-map transform reused an older keyframe stamp | TF rejected a valid alignment update as old data | Complete two-robot replay |
+| Replay teardown retained respawning children after their launch parent exited | Old validation processes survived until explicitly cleaned up | Host process audit |
 
 ## Loose ends recorded nowhere else
 
@@ -250,10 +256,35 @@ transport target passes all 25 cases with loopback socket access. Detailed
 parameter semantics, evidence, and limitations are in
 [`PCM_COMMITMENT_CHANGE_RECORD.md`](PCM_COMMITMENT_CHANGE_RECORD.md).
 
+### Post-session complete two-robot audit — 2 September 2026
+
+The full 141.768-second HelmDyn08/09 timeline was replayed on isolated domains
+193 and 194. Domain 193 delivered every one of the fixture's 61,157 sensor
+messages through the two bridges without reported loss or mismatch. Domain 194
+preserved a 43.8 MiB diagnostic MCAP containing 53,964 diagnostics, 209
+accepted registrations, and 111 factors on each endpoint topic.
+
+Commit `44e07df` adds a repeatable graph-facing audit. It verifies factor
+identity, orientation, measurement equality, recipient coverage, duplicates,
+and endpoint timestamp consistency before scoring RTE/RRE against original
+keyframe times. The full artifact has exact two-sided delivery. Ninety-six of
+111 factors associate within 30 ms of retimed mocap; RTE is 0.145 m median and
+0.306 m p90, but one clear separation outlier and the unresolved orientation
+convention prevent calling this a final accuracy result.
+
+The long run also exposed fictitious drop counts from unused announcement
+queues and an old timestamp on a newly optimized fleet-map transform. Commit
+`2a01982` gates both sides of each announcement route with the same one-producer
+policy, stamps alignment state when published, and makes respawn configurable
+for deterministic replay shutdown. A post-fix complete-timeline smoke test on
+domain 195 produced zero queue drops and no stale-TF, oversized-noise, ERROR,
+or FATAL log entry. See
+[`FULL_TWO_ROBOT_REPLAY_CHANGE_RECORD.md`](FULL_TWO_ROBOT_REPLAY_CHANGE_RECORD.md).
+
 ## Suggested next steps
 
-1. Replay the remaining 71.768 seconds of the generated HelmDyn08/09 fixture
-   and preserve a complete diagnostic artifact outside `/tmp`.
+1. Resolve the HelmDyn ground-truth body/LiDAR orientation convention and
+   investigate the persistent `jackal0/164 <-> jackal1/59` geometry outlier.
 2. Bench-verify the ZeroMQ bridge with two bridges on one host, then over the
    target radio.
 3. Calibrate registration, PCM-commitment, and remote-motion uncertainty

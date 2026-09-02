@@ -188,7 +188,9 @@ key-index monotonicity violation. Of the 37 factors, 30 had both endpoint times
 within 30 ms of the retimed mocap trajectory. All 30 had translation RTE below
 1.33 m (0.16 m median and 0.40 m p90). The other seven lie in mocap gaps and
 are excluded from the strict figure. This is runtime evidence for the direct
-factor route on a synthetic same-arena fixture, not a complete-bag, RRE, radio,
-or real simultaneous multi-robot result. See
-[`PCM_COMMITMENT_CHANGE_RECORD.md`](PCM_COMMITMENT_CHANGE_RECORD.md) for the
-failure analysis and full boundary.
+factor route on a synthetic same-arena fixture, not an RRE, radio, or real
+simultaneous multi-robot result. A later complete-timeline capture verified
+111 factors measurement-for-measurement on both endpoint topics; see
+[`FULL_TWO_ROBOT_REPLAY_CHANGE_RECORD.md`](FULL_TWO_ROBOT_REPLAY_CHANGE_RECORD.md).
+The earlier failure analysis is in
+[`PCM_COMMITMENT_CHANGE_RECORD.md`](PCM_COMMITMENT_CHANGE_RECORD.md).

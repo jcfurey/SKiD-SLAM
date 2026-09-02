@@ -2,10 +2,10 @@
 
 Status: living audit and implementation record for the `v3` branch
 
-Last updated: 2 September 2026 (two-robot runtime verification, corrected PCM
-direction, delayed factor commitment, and keyframe timestamp provenance;
-previous registration, communications, evaluation, graph, and frame work
-retained)
+Last updated: 2 September 2026 (complete synthetic two-robot factor audit,
+corrected PCM direction, delayed factor commitment, communication routing,
+and TF timestamp provenance; previous registration, evaluation, graph, and
+frame work retained)
 
 Audit baseline: commit `475b59f`, before the paper-registration work below.
 The gap table records that baseline so the provenance problem remains visible;
@@ -29,6 +29,7 @@ boundary:
 - [`MAP_ALIGNMENT_UNCERTAINTY_CHANGE_RECORD.md`](MAP_ALIGNMENT_UNCERTAINTY_CHANGE_RECORD.md)
 - [`DISTRIBUTED_KEYFRAME_GRAPH_CHANGE_RECORD.md`](DISTRIBUTED_KEYFRAME_GRAPH_CHANGE_RECORD.md)
 - [`PCM_COMMITMENT_CHANGE_RECORD.md`](PCM_COMMITMENT_CHANGE_RECORD.md)
+- [`FULL_TWO_ROBOT_REPLAY_CHANGE_RECORD.md`](FULL_TWO_ROBOT_REPLAY_CHANGE_RECORD.md)
 - [`EVALUATION_HARNESS_CHANGE_RECORD.md`](EVALUATION_HARNESS_CHANGE_RECORD.md)
 - [`FIELD_COMMUNICATION_CHANGE_RECORD.md`](FIELD_COMMUNICATION_CHANGE_RECORD.md)
 
@@ -175,6 +176,15 @@ within 30 ms of retimed mocap, and all 30 had translation RTE below 1.33 m
 included in that strict result. This remains a bounded synthetic test rather
 than a paper-comparable field evaluation.
 
+A complete-timeline diagnostic capture subsequently preserved 111 factors on
+each endpoint topic. The factor auditor found no missing, additional,
+duplicate, differently oriented, or numerically different delivery, and no
+endpoint timestamp conflicts. Ninety-six factors associate with both retimed
+mocap trajectories within 30 ms: RTE is 0.145 m median and 0.306 m p90, with
+two values above 2 m. One has a corresponding 2.735 m separation error and is
+an unresolved geometry outlier. The orientation convention remains unresolved,
+so the reported RRE distribution is diagnostic rather than a parity claim.
+
 The communication path is now bounded and on-demand:
 
 - Announcements carry the SOLiD descriptor only. A scan crosses the link when a
@@ -189,11 +199,12 @@ The communication path is now bounded and on-demand:
 - Bytes, message counts, and round-trip latency are reported for both channels,
   alongside drop, eviction, retry, and abandonment counters.
 
-The structural Equation (6)/(7) path is now implemented and has bounded
-two-pipeline runtime evidence. Remaining P1/P2 work is fidelity and stronger
-evidence: revisioned peer corrections or peer factor exchange, complete-bag
-and real simultaneous multi-robot evaluation, remote-motion covariance
-calibration, ZeroMQ bench/radio results, and paper-protocol evaluation.
+The structural Equation (6)/(7) path is now implemented and has
+complete-timeline synthetic two-pipeline runtime evidence. Remaining P1/P2
+work is fidelity and stronger evidence: revisioned peer corrections or peer
+factor exchange, real simultaneous multi-robot evaluation, remote-motion
+covariance calibration, ZeroMQ bench/radio results, and paper-protocol
+evaluation.
 
 ### Registration covariance model
 
@@ -341,14 +352,14 @@ endpoint-incapable message.
 | P0 | Small-GICP fine registration (Figure 2 and Section IV-C) | Implemented with the KISS result as the initial estimate and one tested `target <- source` convention. | Add field-dataset accuracy evaluation. |
 | P0 | KISS correspondence sanity check | Implemented with correspondence, solver-inlier, finite/rigid-transform, and exception gates. Structured bag diagnostics retain every rejection status and detail, while expected weak-candidate failures are DEBUG rather than WARN. | Inspect rejection distributions and calibrate them on real multi-robot field runs. |
 | P0 | Truncated MSE measurement gate (Section IV-D.1, Equation 10) | Implemented in squared metres with separate overlap/inlier gates and exact tests. | Calibrate thresholds per dataset. |
-| P0 | Delivery of accepted loop factors | Implemented with one parameter-derived topic and an endpoint-aware typed `LoopConstraint` contract. A registration is published to both endpoint graphs only after repeated membership in a sufficiently large PCM clique; factor queues and the bridge are sized for clique bursts. A 70-second synthetic two-pipeline run delivered the same 37 unique factors to both endpoints. | Complete the fixture, validate on real simultaneous runs, and add acknowledgement/replay if disconnected peers must recover missed factors. |
+| P0 | Delivery of accepted loop factors | Implemented with one parameter-derived topic and an endpoint-aware typed `LoopConstraint` contract. A registration is published to both endpoint graphs only after repeated membership in a sufficiently large PCM clique; factor queues and the bridge are sized for clique bursts. A complete synthetic trace delivered the same 111 unique factors to both endpoints, verified measurement-for-measurement. | Validate on real simultaneous runs, and add acknowledgement/replay if disconnected peers must recover missed factors. |
 | P1 | One SOLiD/registration pipeline for inter- and intra-robot loops | Implemented. Intra-robot loops are detected with SOLiD and registered and gated by the same module map fusion uses; the descriptor distance and the registration parameter set are single-sourced. Map fusion still skips same-robot candidates, which is now the correct division of work rather than a gap. | Calibrate the intra-robot gates on field data and add a bag-level comparison against the Scan Context baseline. |
-| P1 | Distributed keyframe PGO matching Equation 6 | Structurally implemented. Each optimizer has explicit local symbols, sparse peer-keyframe variables, direct full-covariance cross-robot factors, and peer-motion edges; the map-alignment graph is no longer in the factor path. The live direct-factor route has bounded synthetic two-robot evidence. | Exchange revisioned peer corrections or original peer factors/covariances, support committed-factor retraction, and validate on complete and real multi-robot field runs. |
-| P1 | Lightweight message pool | Implemented. Announcements are descriptor-only; scans transfer on request. Announcement backlogs, the scan cache, outstanding requests, and parked candidates are all bounded, with defined retry, backpressure, and abandonment behaviour, and byte/latency reporting on both channels. | Measure the achieved bandwidth and latency on field bags and calibrate the cache budget against the datasets' revisit horizons. |
+| P1 | Distributed keyframe PGO matching Equation 6 | Structurally implemented. Each optimizer has explicit local symbols, sparse peer-keyframe variables, direct full-covariance cross-robot factors, and peer-motion edges; the map-alignment graph is no longer in the factor path. The live direct-factor route has complete-timeline synthetic two-robot evidence. | Exchange revisioned peer corrections or original peer factors/covariances, support committed-factor retraction, and validate on real multi-robot field runs. |
+| P1 | Lightweight message pool | Implemented. Announcements are descriptor-only; scans transfer on request. Announcement backlogs, the scan cache, outstanding requests, and parked candidates are all bounded, with defined retry, backpressure, and abandonment behaviour, and byte/latency reporting on both channels. Enqueue and dequeue share the same one-producer routing rule, and a complete post-fix replay reported no backlog drops. | Measure the achieved bandwidth and latency on field bags and calibrate the cache budget against the datasets' revisit horizons. |
 | P1 | Meaningful inter-robot uncertainty | Implemented for registration: Hessian-shaped, physically scaled full covariance is propagated through PCM, the typed loop message, and each direct GTSAM factor. Sparse remote-motion edges have separate angular/linear floors. | Calibrate on field data and replace fixed remote-motion floors with the peer trajectory's propagated covariance. |
 | P2 | ROS + ZeroMQ field communication setup (Section VI-B) | Implemented and compiled on ROS 2 Lyrical. `liorf_zmqBridge` carries the inter-robot topics over a ZeroMQ PUB/SUB mesh through a type-agnostic generic pub/sub bridge; the transport underneath is tested over real sockets. The deployment is in `doc/FIELD_COMMUNICATION.md`. The bridge is optional: a system without ZeroMQ builds everything else. | Bench-verify two bridge nodes across isolated ROS domains, then measure over a real radio. |
 | P2 | Paper dataset configurations | Implemented. GEODE, GRACO, Majang, Moon, Park, and STEAM are ported to ROS 2 parameters with a launch file each, and every parameter file is checked against the declared parameter contract by `validate_config_parameters`. | Verify each against its bag: topic names, `imuRate`, and the Moon sensor/topic pairing noted in that file are unverified against real data. Add cave and planetary field configs if the data are available. |
-| P2 | Paper evaluation harness | Implemented in `evaluation/`: PR curves, RTE/RRE and success rate, ATE/ARE with rigid, Sim(3) or yaw alignment, descriptor memory against a Scan Context baseline, and communication cost read back from the map-fusion diagnostics. `LoopDiagnostic` records every eligible descriptor score, scan outcome, registration result, and provisional/committed PCM decision with original keyframe timestamps; `extract_diagnostics_from_bag.py` produces candidate and accepted-registration CSVs. Manifests exist for all six datasets, and the metrics and extraction rules are tested against analytically known cases. Timestamp conventions were checked in a bounded synthetic two-robot run. | Record a real multi-robot run, resolve the HelmDyn body/LiDAR orientation convention, and fill in each manifest's `expected` block once the paper's protocol is confirmed to match. |
+| P2 | Paper evaluation harness | Implemented in `evaluation/`: PR curves, RTE/RRE and success rate, ATE/ARE with rigid, Sim(3) or yaw alignment, descriptor memory against a Scan Context baseline, and communication cost read back from the map-fusion diagnostics. `LoopDiagnostic` records every eligible descriptor score, scan outcome, registration result, and provisional/committed PCM decision with original keyframe timestamps; the bag tools extract CSVs and audit graph-facing factors symmetrically against ground truth. Manifests exist for all six datasets, and the metrics and extraction rules are tested against analytically known cases. Timestamp and delivery conventions were checked over the complete synthetic two-robot fixture. | Record a real multi-robot run, resolve the HelmDyn body/LiDAR orientation convention, and fill in each manifest's `expected` block once the paper's protocol is confirmed to match. |
 | P2 | Pipeline test coverage | Unit coverage now includes coarse-to-fine registration, truncated MSE, covariance, SE(3) PCM propagation and inversion, nonidentity PCM direction, delayed commitment policy, endpoint-aware message conversion, SOLiD descriptor construction/retrieval, graph key namespaces, sparse remote trajectories, factor orientation/deduplication, a solver-level two-robot correction graph, communication policy, and the full parameter contract. | Add ROS launch-level assertions around factor content, disconnect/replay failure injection, and measured real multi-robot evaluation. |
 | P2 | Public package identity | The ROS package is still named and described as Liorf and retains upstream maintainer metadata. | Decide whether to rename the ROS package; at minimum correct description, authorship, dependencies, and third-party notices. |
 
@@ -412,7 +423,7 @@ endpoint-incapable message.
 - `src/liorf-DiSO/zmqBridge.cpp` and `doc/FIELD_COMMUNICATION.md`: the bridge
   node and its deployment.
 - `evaluation/`: the metric implementations, dataset manifests, CLI runner,
-  and the conventions the inputs must follow.
+  graph-facing factor auditor, and the conventions the inputs must follow.
 - `test/validate_config_parameters.py`: every parameter file is checked
   against the parameters the sources declare, including the prefixed
   registration sets built at runtime, and against the declared types.
@@ -494,8 +505,7 @@ Items 1-4 are complete:
    comes from announced pose snapshots with fixed uncertainty floors rather
    than revisioned original peer factors. See "Equation (6) and the distributed
    keyframe graph" and its change record. The direct route has been exercised
-   by a bounded synthetic two-pipeline replay; complete and real field runs
-   remain.
+   over the complete synthetic two-pipeline fixture; real field runs remain.
 
 ### Phase 4: resource and evaluation parity
 
@@ -504,10 +514,10 @@ Items 1-4 are complete:
 3. **Partially done:** the six paper field configurations are restored with
    launches and a parameter-contract test. Dataset manifests and ground-truth
    conventions still belong to item 4.
-4. **Partially done:** the harness, structured diagnostic topic, and bag
-   extractors exist and are tested. A bounded synthetic two-robot trace now
-   checks timestamp and factor conventions, but no paper-protocol real
-   multi-robot result or expected figure is recorded. See
+4. **Partially done:** the harness, structured diagnostic topic, bag
+   extractors, and graph-facing factor auditor exist and are tested. A complete
+   synthetic two-robot trace checks timestamp and factor conventions, but no
+   paper-protocol real multi-robot result or expected figure is recorded. See
    `evaluation/README.md`.
 
 ## Phase 1 acceptance criteria

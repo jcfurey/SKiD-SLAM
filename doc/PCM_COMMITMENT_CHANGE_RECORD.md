@@ -146,13 +146,20 @@ gave SE(3)-aligned translation ATE RMSE of 0.056 m for jackal0 and 0.068 m for
 jackal1, confirming that the local translation trajectories were not the
 source of a large mismatch.
 
+A subsequent complete-timeline run preserved 111 factors on each endpoint
+topic. The checked-in factor auditor found exact two-sided delivery and
+strictly associated 96 of them with ground truth: 0.145 m median and 0.306 m
+p90 RTE, with two values above 2 m. The complete evidence, outlier boundary,
+and follow-up runtime fixes are recorded in
+[`FULL_TWO_ROBOT_REPLAY_CHANGE_RECORD.md`](FULL_TWO_ROBOT_REPLAY_CHANGE_RECORD.md).
+
 ## Remaining boundary
 
-This is a bounded replay of two independently recorded trajectories made
-simultaneous in the same arena. It is not real multi-robot field data, does not
-cover the final 71.768 seconds of the fixture, and does not exercise the radio
-transport. The HelmDyn ground-truth orientations contain discontinuities and
-an unresolved body/LiDAR convention, so RRE and ARE are intentionally not
-claimed. Committed factors still cannot be retracted if a persistent false
-mode later displaces them; revisioned peer state/factor exchange and graph
-factor removal remain the robust long-term fix.
+The complete synthetic fixture has now run, but it is still two independently
+recorded trajectories made simultaneous in one arena, not real multi-robot
+field data, and it does not exercise the radio transport. The HelmDyn
+ground-truth orientations contain discontinuities and an unresolved body/LiDAR
+convention, so RRE and ARE are intentionally not claimed. Committed factors
+still cannot be retracted if a persistent false mode later displaces them;
+revisioned peer state/factor exchange and graph factor removal remain the
+robust long-term fix.

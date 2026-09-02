@@ -207,8 +207,11 @@ ARE, descriptor memory against a Scan Context baseline, and communication cost.
 
 It needs no dependency beyond PyYAML. See
 [`evaluation/README.md`](evaluation/README.md) for the file conventions, the
-trajectory and structured loop-diagnostic bag extractors, and why each
-manifest's `expected` block is deliberately empty.
+trajectory and structured loop-diagnostic bag extractors, the two-sided
+graph-factor auditor, and why each manifest's `expected` block is deliberately
+empty. The complete synthetic HelmDyn08/09 evidence and its remaining outlier
+boundary are recorded in
+[`doc/FULL_TWO_ROBOT_REPLAY_CHANGE_RECORD.md`](doc/FULL_TWO_ROBOT_REPLAY_CHANGE_RECORD.md).
 
 DiSO FEATURES
 ---------------------------------------------------------------------------------------------------------------------------------------------------
