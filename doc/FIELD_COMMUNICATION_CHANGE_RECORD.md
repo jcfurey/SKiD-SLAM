@@ -182,4 +182,4 @@ Newly opened:
 
 | Commit | Contents |
 |---|---|
-| this commit | Add the ZeroMQ peer transport and inter-robot bridge |
+| `b71198b` | Add the ZeroMQ peer transport and inter-robot bridge |
