@@ -25,6 +25,15 @@
 // own.
 namespace liorf::comms {
 
+// Assign one descriptor-announcement producer to each robot pair. The lower
+// numeric robot ID owns the directed route; the other endpoint receives and
+// performs fusion. Negative IDs represent an unconfigured route.
+inline bool ownsAnnouncementRoute(
+    int local_robot_id, int peer_robot_id) noexcept {
+  return local_robot_id >= 0 && peer_robot_id >= 0 &&
+         local_robot_id < peer_robot_id;
+}
+
 struct Config {
   // Announcements held per peer while its link is down.
   std::size_t max_pending_announcements = 100;

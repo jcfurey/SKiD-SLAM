@@ -134,6 +134,8 @@ private:
     int _num_bin;
     int _robot_id_th;
     int _robot_this_th;
+    int _signal_id_th_1 = -1;
+    int _signal_id_th_2 = -1;
 
     int _max_range;
     int _num_sectors;
@@ -407,7 +409,7 @@ public:
         liorf::comms::BoundedQueue<SOLiDBin> & queue)
     {
         if (peer_id.empty() || !_communication_signal || !peer_signal ||
-            _robot_id_th >= peer_id_th)
+            !liorf::comms::ownsAnnouncementRoute(_robot_id_th, peer_id_th))
             return;
 
         SOLiDBin bin;
@@ -419,9 +421,24 @@ public:
         publishContextInfo(bin, peer_id);
     }
 
+    // Only routes this robot owns get a backlog. Previously every keyframe
+    // entered both queues even when a peer was absent or this robot was the
+    // receiving endpoint. Those unreachable queues filled forever and made
+    // the communication report claim descriptor loss on links that did not
+    // exist.
+    void queueAnnouncement(
+        int peer_id_th,
+        std::mutex & queue_mutex,
+        liorf::comms::BoundedQueue<SOLiDBin> & queue,
+        const SOLiDBin & announcement)
+    {
+        if (!liorf::comms::ownsAnnouncementRoute(_robot_id_th, peer_id_th))
+            return;
+        std::lock_guard<std::mutex> lock(queue_mutex);
+        queue.push(announcement);
+    }
+
     void publishContextInfoThread(){
-        int signal_id_th_1 = _signal_id_1.empty() ? -1 : robotID2Number(_signal_id_1);
-        int signal_id_th_2 = _signal_id_2.empty() ? -1 : robotID2Number(_signal_id_2);
         // The previous loop had no wait of any kind and spun a core flat out
         // whenever a peer was idle or the backlog was empty.
         rclcpp::Rate rate(_announce_rate_hz);
@@ -429,10 +446,10 @@ public:
         {
             rate.sleep();
             publishPendingAnnouncements(
-                _signal_id_1, signal_id_th_1, _signal_1,
+                _signal_id_1, _signal_id_th_1, _signal_1,
                 mtx_publish_1, _context_list_to_publish_1);
             publishPendingAnnouncements(
-                _signal_id_2, signal_id_th_2, _signal_2,
+                _signal_id_2, _signal_id_th_2, _signal_2,
                 mtx_publish_2, _context_list_to_publish_2);
         }
     }
@@ -639,6 +656,10 @@ private:
         _initial_loop.first = -1;
 
         _robot_id_th = robotID2Number(_robot_id);
+        _signal_id_th_1 = _signal_id_1.empty() ?
+            -1 : robotID2Number(_signal_id_1);
+        _signal_id_th_2 = _signal_id_2.empty() ?
+            -1 : robotID2Number(_signal_id_2);
 
         // Mirrors the condition guarding the announcement subscription: the
         // initial robot announces its places but does not fuse maps itself.
@@ -722,14 +743,12 @@ private:
         if (!_announce_scans)
             announcement.cloud.reset(new pcl::PointCloud<PointType>());
 
-        {
-            std::lock_guard<std::mutex> lock(mtx_publish_1);
-            _context_list_to_publish_1.push(announcement);
-        }
-        {
-            std::lock_guard<std::mutex> lock(mtx_publish_2);
-            _context_list_to_publish_2.push(announcement);
-        }
+        queueAnnouncement(
+            _signal_id_th_1, mtx_publish_1,
+            _context_list_to_publish_1, announcement);
+        queueAnnouncement(
+            _signal_id_th_2, mtx_publish_2,
+            _context_list_to_publish_2, announcement);
 
         // Own places enter the local index directly. Routing them back through
         // the shared announcement topic would put this robot's own scan on the
@@ -2497,7 +2516,11 @@ private:
         // map -> odom correction is owned by TransformFusion and is never
         // carried on this transport.
         nav_msgs::msg::Odometry odom2map;
-        odom2map.header.stamp = _cloud_header.stamp;
+        // This is the publication time of a newly optimized alignment, not
+        // the acquisition time of whichever keyframe happened to trigger the
+        // graph update. Reusing that keyframe stamp can make a legitimate
+        // late correction older than TF data already broadcast for this edge.
+        odom2map.header.stamp = now();
         odom2map.header.frame_id = _map_fusion_frame;
         odom2map.child_frame_id = _map_frame;
         odom2map.pose.pose.position.x = _trans_to_publish.x;
@@ -2675,7 +2698,7 @@ private:
 
         //publish relative transformation to other robots
         nav_msgs::msg::Odometry odom2odom;
-        odom2odom.header.stamp = _cloud_header.stamp;
+        odom2odom.header.stamp = now();
         odom2odom.header.frame_id = _robot_id;
         odom2odom.child_frame_id = _robot_this;
         odom2odom.pose.pose.position.x = _global_map_trans_optimized[_robot_this_th].x;

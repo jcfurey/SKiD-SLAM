@@ -71,6 +71,10 @@ def _default_pcm_directory():
     return os.path.join(tempfile.gettempdir(), 'skid_slam_pcm')
 
 
+def _as_bool(value):
+    return value.lower() in ('true', '1')
+
+
 def launch_setup(context, *args, **kwargs):
     robot = LaunchConfiguration('robot').perform(context)
     id1 = LaunchConfiguration('id1').perform(context)
@@ -82,14 +86,13 @@ def launch_setup(context, *args, **kwargs):
     base_parameters = _load_parameter_files(parameter_paths)
     pcm_matrix_folder = LaunchConfiguration('pcm_matrix_folder').perform(context)
     os.makedirs(pcm_matrix_folder, exist_ok=True)
-    use_map_fusion = (
-        LaunchConfiguration('use_map_fusion').perform(context).lower() in
-        ('true', '1'))
+    use_map_fusion = _as_bool(
+        LaunchConfiguration('use_map_fusion').perform(context))
+    respawn = _as_bool(LaunchConfiguration('respawn').perform(context))
     map_frame = LaunchConfiguration('map_frame').perform(context)
     map_fusion_frame = LaunchConfiguration('map_fusion_frame').perform(context)
-    map_fusion_anchor = (
-        LaunchConfiguration('map_fusion_anchor').perform(context).lower() in
-        ('true', '1'))
+    map_fusion_anchor = _as_bool(
+        LaunchConfiguration('map_fusion_anchor').perform(context))
     earth_frame = LaunchConfiguration('earth_frame').perform(context)
     geographic_frame_mode = LaunchConfiguration('geographic_frame_mode').perform(context)
     map_datum = LaunchConfiguration('map_datum').perform(context).strip()
@@ -127,7 +130,7 @@ def launch_setup(context, *args, **kwargs):
             name='liorf_imageProjection' + suffix,
             parameters=[node_parameters],
             output='screen',
-            respawn=True,
+            respawn=respawn,
         ),
         Node(
             package='liorf',
@@ -144,7 +147,7 @@ def launch_setup(context, *args, **kwargs):
             executable='liorf_imuPreintegration',
             parameters=[node_parameters],
             output='screen',
-            respawn=True,
+            respawn=respawn,
             ros_arguments=[
                 '-r', 'liorf_imuPreintegration:__node:=liorf_imuPreintegration' + suffix,
                 '-r', 'liorf_transformFusion:__node:=liorf_transformFusion' + suffix,
@@ -189,6 +192,9 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'use_map_fusion', default_value='true',
             description='Also start the inter-robot map fusion node'),
+        DeclareLaunchArgument(
+            'respawn', default_value='true',
+            description='Restart front-end and IMU nodes after an unexpected exit'),
         DeclareLaunchArgument(
             'map_frame', default_value='',
             description='Optional fully resolved local map frame override'),

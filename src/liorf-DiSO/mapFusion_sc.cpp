@@ -1322,7 +1322,10 @@ private:
 
         //publish transformation to the SLAM node
         nav_msgs::msg::Odometry odom2map;
-        odom2map.header.stamp = _cloud_header.stamp;
+        // This transform represents a newly optimized alignment, so stamp it
+        // when that estimate becomes available rather than with an arbitrary
+        // older keyframe that triggered the update.
+        odom2map.header.stamp = now();
         odom2map.header.frame_id = _robot_id + "/" + _sc_frame;
         odom2map.child_frame_id = _robot_id + "/" + _sc_frame + "/odom2map";
         odom2map.pose.pose.position.x = _trans_to_publish.x;
@@ -1479,7 +1482,7 @@ private:
 
         //publish relative transformation to other robots
         nav_msgs::msg::Odometry odom2odom;
-        odom2odom.header.stamp = _cloud_header.stamp;
+        odom2odom.header.stamp = now();
         odom2odom.header.frame_id = _robot_id;
         odom2odom.child_frame_id = _robot_this;
         odom2odom.pose.pose.position.x = _global_map_trans_optimized[_robot_this_th].x;

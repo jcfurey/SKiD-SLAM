@@ -83,3 +83,13 @@ def test_default_pcm_directory_is_runtime_storage():
     assert Path(default).parent == Path(tempfile.gettempdir())
     assert default.endswith("skid_slam_pcm")
     assert str(REPO / "config") != default
+
+
+@pytest.mark.parametrize("value", ["true", "TRUE", "1"])
+def test_boolean_launch_values_accept_true_forms(value):
+    assert MODULE._as_bool(value) is True
+
+
+@pytest.mark.parametrize("value", ["false", "FALSE", "0", ""])
+def test_boolean_launch_values_reject_other_forms(value):
+    assert MODULE._as_bool(value) is False

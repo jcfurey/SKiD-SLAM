@@ -44,6 +44,15 @@ ScanKey key(const char* robot, std::int64_t index) {
 // Configuration and keys
 // ---------------------------------------------------------------------------
 
+TEST(SkidCommsRouting, AssignsExactlyOneAnnouncementProducerPerPair) {
+  EXPECT_TRUE(liorf::comms::ownsAnnouncementRoute(0, 1));
+  EXPECT_TRUE(liorf::comms::ownsAnnouncementRoute(7, 12));
+  EXPECT_FALSE(liorf::comms::ownsAnnouncementRoute(1, 0));
+  EXPECT_FALSE(liorf::comms::ownsAnnouncementRoute(4, 4));
+  EXPECT_FALSE(liorf::comms::ownsAnnouncementRoute(0, -1));
+  EXPECT_FALSE(liorf::comms::ownsAnnouncementRoute(-1, 0));
+}
+
 TEST(SkidCommsConfig, RejectsInvalidValues) {
   EXPECT_TRUE(liorf::comms::validate(testConfig()).empty());
 
