@@ -19,6 +19,15 @@ import time
 
 
 _STARTED = "ZeroMQ bridge started"
+_TOPIC = "/solid/scan_request"
+_MESSAGE_TYPE = "liorf/msg/ScanRequest"
+_DEFAULT_TOPIC_LOGS = (
+    "bridging /solid/context_info (liorf/msg/ContextInfo)",
+    "bridging /solid/scan_request (liorf/msg/ScanRequest)",
+    "bridging /solid/scan_data (liorf/msg/ScanData)",
+    "bridging /solid/loop_info_global (liorf/msg/LoopConstraint)",
+    "bridging /solid/trans_odom (nav_msgs/msg/Odometry)",
+)
 _HEALTHY_REPORT = re.compile(
     r"sent 1 msg .* received 1 msg .* dropped own 0, topic mismatch 0, "
     r"oversize 0, malformed 0 .* send failures 0 .* echoes suppressed 1")
@@ -46,15 +55,13 @@ def _environment(domain):
     return environment
 
 
-def _bridge_command(name, port, peer_port, topic, message_type):
+def _bridge_command(name, port, peer_port):
     return [
         "ros2", "run", "liorf", "liorf_zmqBridge", "--ros-args",
         "-r", f"__node:=liorf_zmqBridge_{name}",
         "-p", f"robot_id:={name}",
         "-p", f"zmq.bind_endpoint:=tcp://127.0.0.1:{port}",
         "-p", f'zmq.peer_endpoints:=["tcp://127.0.0.1:{peer_port}"]',
-        "-p", f'zmq.topics:=["{topic}"]',
-        "-p", f'zmq.topic_types:=["{message_type}"]',
         "-p", "zmq.report_period_s:=1.0",
     ]
 
@@ -96,20 +103,23 @@ def _stop(process):
                 process.wait(timeout=3.0)
 
 
-def _exchange(source_domain, destination_domain, payload, topic,
-              message_type, output_path, error_path, publish_path, timeout):
+def _exchange(source_domain, destination_domain, payload, destination_name,
+              output_path, error_path, publish_path, timeout):
     with output_path.open("w", encoding="utf-8") as output, \
             error_path.open("w", encoding="utf-8") as error:
         echo = subprocess.Popen(
-            ["ros2", "topic", "echo", "--once", topic, message_type],
+            ["ros2", "topic", "echo", "--once", _TOPIC, _MESSAGE_TYPE],
             env=_environment(destination_domain), stdout=output, stderr=error,
             text=True, start_new_session=True)
         try:
             time.sleep(1.0)
             with publish_path.open("w", encoding="utf-8") as publish_output:
+                message = (
+                    "{robot_id: '" + payload + "', robot_id_receive: '" +
+                    destination_name + "', keyframe_index: 1}")
                 completed = subprocess.run(
-                    ["ros2", "topic", "pub", "--once", topic, message_type,
-                     "{data: '" + payload + "'}"],
+                    ["ros2", "topic", "pub", "--once", _TOPIC,
+                     _MESSAGE_TYPE, message],
                     env=_environment(source_domain), stdout=publish_output,
                     stderr=subprocess.STDOUT, text=True, timeout=timeout,
                     check=False)
@@ -139,8 +149,6 @@ def _arguments():
     parser.add_argument("--domain-b", type=_domain, required=True)
     parser.add_argument("--port-a", type=_port, required=True)
     parser.add_argument("--port-b", type=_port, required=True)
-    parser.add_argument("--topic", default="/skid_zmq_bench")
-    parser.add_argument("--message-type", default="std_msgs/msg/String")
     parser.add_argument("--startup-timeout", type=float, default=12.0)
     parser.add_argument("--message-timeout", type=float, default=12.0)
     parser.add_argument(
@@ -181,14 +189,16 @@ def main():
             handle = log_path.open("w", encoding="utf-8")
             bridge_files.append(handle)
             bridges.append(subprocess.Popen(
-                _bridge_command(name, port, peer_port, arguments.topic,
-                                arguments.message_type),
+                _bridge_command(name, port, peer_port),
                 env=_environment(domain), stdout=handle,
                 stderr=subprocess.STDOUT, text=True,
                 start_new_session=True))
 
         _wait_for(
-            lambda: all(_STARTED in _read(path) for path in bridge_logs),
+            lambda: all(
+                _STARTED in _read(path) and
+                all(topic in _read(path) for topic in _DEFAULT_TOPIC_LOGS)
+                for path in bridge_logs),
             arguments.startup_timeout, "both bridges to start", bridges)
 
         # PUB/SUB drops messages sent before its asynchronous connection has
@@ -196,14 +206,14 @@ def main():
         time.sleep(2.0)
         _exchange(
             arguments.domain_a, arguments.domain_b,
-            f"from-domain-{arguments.domain_a}", arguments.topic,
-            arguments.message_type, artifact / "received_on_b.txt",
+            f"from-domain-{arguments.domain_a}", names[1],
+            artifact / "received_on_b.txt",
             artifact / "echo_b.err", artifact / "publish_a.log",
             arguments.message_timeout)
         _exchange(
             arguments.domain_b, arguments.domain_a,
-            f"from-domain-{arguments.domain_b}", arguments.topic,
-            arguments.message_type, artifact / "received_on_a.txt",
+            f"from-domain-{arguments.domain_b}", names[0],
+            artifact / "received_on_a.txt",
             artifact / "echo_a.err", artifact / "publish_b.log",
             arguments.message_timeout)
 
