@@ -190,12 +190,13 @@ ZeroMQ transport cases pass with loopback access. The graph suite includes a
 solver-level two-robot correction test plus key-space, sparse-trajectory,
 orientation, and deduplication cases.
 
-The parent workspace's new synthetic HelmDyn08/09 launcher is suitable for the
-next integration check, but its documented derived
-`HelmDyn08_09_two_robot_v1` bag is not present on the mounted dataset. It was
-not regenerated implicitly because the provenance-preserving artifact is
-approximately 1.1 GiB. Live two-pipeline factor delivery, RViz behaviour, and
-trajectory accuracy therefore remain unclaimed.
+The parent workspace's synthetic HelmDyn08/09 fixture was subsequently
+generated at `RESPLE_dataset/HelmDyn/HelmDyn08_09_two_robot_v1`. It contains
+61,157 messages on four namespaced sensor topics over 141.768 seconds, both
+retimed ground-truth trajectories, and source/output hashes in
+`PROVENANCE.json`. The source bags were opened read-only and no partial output
+was left behind. Live two-pipeline factor delivery, RViz behaviour, and
+trajectory accuracy remain unclaimed until the derived bag is replayed.
 
 The exact graph semantics, map/Earth separation, compatibility behaviour, and
 remaining fidelity limits are in
@@ -203,8 +204,8 @@ remaining fidelity limits are in
 
 ## Suggested next steps
 
-1. Generate or provide the provenance-preserving HelmDyn08/09 derived bag,
-   replay both pipelines, and verify direct factor delivery and graph updates.
+1. Replay the generated HelmDyn08/09 bag through both pipelines and verify
+   direct factor delivery and graph updates.
 2. Bench-verify the ZeroMQ bridge with two bridges on one host.
 3. Calibrate the KISS-Matcher noise bounds and registration gates on field
    data, along with the new remote-motion uncertainty floors.

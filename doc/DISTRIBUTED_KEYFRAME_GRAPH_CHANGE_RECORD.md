@@ -148,9 +148,16 @@ Completed on ROS 2 Lyrical on 2 September 2026:
 - `test_loop_constraint_utils` covers endpoint identities, owner poses,
   covariance ordering, and same-robot compatibility.
 
-The workspace now contains a launcher and generator for a synthetic
-HelmDyn08/09 two-robot replay, but the derived
-`HelmDyn08_09_two_robot_v1` bag described by that package is not present on the
-mounted dataset. No 1.1 GiB artifact was generated implicitly. Therefore this
-change has not yet exercised the direct factor route through two live ROS
-pipelines, RViz, or a field radio, and no trajectory-accuracy claim is made.
+After the graph implementation was committed, the provenance-preserving
+HelmDyn08/09 fixture was generated at
+`RESPLE_dataset/HelmDyn/HelmDyn08_09_two_robot_v1`. `ros2 bag info` reports
+61,157 messages over 141.768 seconds on four namespaced Livox topics. The
+1.1 GiB artifact also contains 13,040 and 11,544 retimed ground-truth poses,
+respectively, plus `PROVENANCE.json` with source and output SHA-256 hashes. The
+generator opened both source databases read-only, completed through its
+partial-directory/atomic-move path, and left no partial directory behind.
+
+Derivation validates the fixture and its timestamp/topic contract, not the
+graph runtime. This change has not yet exercised the direct factor route
+through two live ROS pipelines, RViz, or a field radio, and no
+trajectory-accuracy claim is made.
