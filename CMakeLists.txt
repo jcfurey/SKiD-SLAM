@@ -337,6 +337,11 @@ if(BUILD_TESTING)
     test/test_skid_pose_uncertainty.cpp)
   target_link_libraries(test_skid_pose_uncertainty skid_pose_uncertainty)
 
+  ament_add_gtest(test_skid_graph_keys
+    test/test_skid_graph_keys.cpp)
+  target_include_directories(test_skid_graph_keys PRIVATE include)
+  target_link_libraries(test_skid_graph_keys gtsam)
+
   ament_add_gtest(test_loop_constraint_utils
     test/test_loop_constraint_utils.cpp)
   target_link_libraries(test_loop_constraint_utils

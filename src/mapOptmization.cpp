@@ -5,6 +5,7 @@
 #include "liorf/msg/loop_constraint.hpp"
 #include "loop_constraint_utils.hpp"
 #include "observable_scan_match.hpp"
+#include "skid_graph_keys.hpp"
 // <!-- liorf_yjz_lucky_boy -->
 #include <sensor_msgs/msg/nav_sat_fix.hpp>
 #include <gtsam/geometry/Rot3.h>
@@ -369,7 +370,10 @@ public:
         }
         auto noiseBetween = gtsam::noiseModel::Gaussian::Covariance(covariance);
 
-        gtSAMgraph.add(BetweenFactor<Pose3>(indexFrom, indexTo, poseBetween, noiseBetween));
+        gtSAMgraph.add(BetweenFactor<Pose3>(
+            liorf::graph_keys::localPose(indexFrom),
+            liorf::graph_keys::localPose(indexTo),
+            poseBetween, noiseBetween));
         isam->update(gtSAMgraph);
         isam->update();
         isam->update();
@@ -1801,14 +1805,22 @@ public:
         if (cloudKeyPoses3D->points.empty())
         {
             noiseModel::Diagonal::shared_ptr priorNoise = noiseModel::Diagonal::Variances((gtsam::Vector(6) << 1e-2, 1e-2, M_PI*M_PI, 1e-2, 1e-2, 1e-2).finished()); // rad*rad, meter*meter
-            gtSAMgraph.add(PriorFactor<Pose3>(0, trans2gtsamPose(transformTobeMapped), priorNoise));
-            initialEstimate.insert(0, trans2gtsamPose(transformTobeMapped));
+            const gtsam::Key firstKey = liorf::graph_keys::localPose(0);
+            gtSAMgraph.add(PriorFactor<Pose3>(
+                firstKey, trans2gtsamPose(transformTobeMapped), priorNoise));
+            initialEstimate.insert(
+                firstKey, trans2gtsamPose(transformTobeMapped));
         }else{
             noiseModel::Diagonal::shared_ptr odometryNoise = noiseModel::Diagonal::Variances((gtsam::Vector(6) << 1e-6, 1e-6, 1e-6, 1e-4, 1e-4, 1e-4).finished());
             gtsam::Pose3 poseFrom = pclPointTogtsamPose3(cloudKeyPoses6D->points.back());
             gtsam::Pose3 poseTo   = trans2gtsamPose(transformTobeMapped);
-            gtSAMgraph.add(BetweenFactor<Pose3>(cloudKeyPoses3D->size()-1, cloudKeyPoses3D->size(), poseFrom.between(poseTo), odometryNoise));
-            initialEstimate.insert(cloudKeyPoses3D->size(), poseTo);
+            const std::size_t keyframeIndex = cloudKeyPoses3D->size();
+            gtSAMgraph.add(BetweenFactor<Pose3>(
+                liorf::graph_keys::localPose(keyframeIndex - 1),
+                liorf::graph_keys::localPose(keyframeIndex),
+                poseFrom.between(poseTo), odometryNoise));
+            initialEstimate.insert(
+                liorf::graph_keys::localPose(keyframeIndex), poseTo);
         }
     }
 
@@ -1883,7 +1895,9 @@ public:
                 gtsam::Vector Vector3(3);
                 Vector3 << max(noise_x, 1.0f), max(noise_y, 1.0f), max(noise_z, 1.0f);
                 noiseModel::Diagonal::shared_ptr gps_noise = noiseModel::Diagonal::Variances(Vector3);
-                gtsam::GPSFactor gps_factor(cloudKeyPoses3D->size(), gtsam::Point3(gps_x, gps_y, gps_z), gps_noise);
+                gtsam::GPSFactor gps_factor(
+                    liorf::graph_keys::localPose(cloudKeyPoses3D->size()),
+                    gtsam::Point3(gps_x, gps_y, gps_z), gps_noise);
                 gtSAMgraph.add(gps_factor);
 
                 aLoopIsClosed = true;
@@ -1904,7 +1918,10 @@ public:
             gtsam::Pose3 poseBetween = loopPoseQueue[i];
             // gtsam::noiseModel::Diagonal::shared_ptr noiseBetween = loopNoiseQueue[i];
             auto noiseBetween = loopNoiseQueue[i];
-            gtSAMgraph.add(BetweenFactor<Pose3>(indexFrom, indexTo, poseBetween, noiseBetween));
+            gtSAMgraph.add(BetweenFactor<Pose3>(
+                liorf::graph_keys::localPose(indexFrom),
+                liorf::graph_keys::localPose(indexTo),
+                poseBetween, noiseBetween));
         }
 
         loopIndexQueue.clear();
@@ -1951,8 +1968,11 @@ public:
         PointTypePose thisPose6D;
         Pose3 latestEstimate;
 
+        const std::size_t keyframeIndex = cloudKeyPoses3D->size();
+        const gtsam::Key latestKey =
+            liorf::graph_keys::localPose(keyframeIndex);
         isamCurrentEstimate = isam->calculateEstimate();
-        latestEstimate = isamCurrentEstimate.at<Pose3>(isamCurrentEstimate.size()-1);
+        latestEstimate = isamCurrentEstimate.at<Pose3>(latestKey);
         // cout << "****************************************************" << endl;
         // isamCurrentEstimate.print("Current estimate: ");
 
@@ -1975,7 +1995,7 @@ public:
         // cout << "****************************************************" << endl;
         // cout << "Pose covariance:" << endl;
         // cout << isam->marginalCovariance(isamCurrentEstimate.size()-1) << endl << endl;
-        poseCovariance = isam->marginalCovariance(isamCurrentEstimate.size()-1);
+        poseCovariance = isam->marginalCovariance(latestKey);
         
         // save updated transform
         transformTobeMapped[0] = latestEstimate.rotation().roll();
@@ -2045,19 +2065,21 @@ public:
             // clear path
             globalPath.poses.clear();
             // update key poses
-            int numPoses = isamCurrentEstimate.size();
-            for (int i = 0; i < numPoses; ++i)
+            const std::size_t numPoses = cloudKeyPoses3D->size();
+            for (std::size_t i = 0; i < numPoses; ++i)
             {
-                cloudKeyPoses3D->points[i].x = isamCurrentEstimate.at<Pose3>(i).translation().x();
-                cloudKeyPoses3D->points[i].y = isamCurrentEstimate.at<Pose3>(i).translation().y();
-                cloudKeyPoses3D->points[i].z = isamCurrentEstimate.at<Pose3>(i).translation().z();
+                const Pose3& estimate = isamCurrentEstimate.at<Pose3>(
+                    liorf::graph_keys::localPose(i));
+                cloudKeyPoses3D->points[i].x = estimate.translation().x();
+                cloudKeyPoses3D->points[i].y = estimate.translation().y();
+                cloudKeyPoses3D->points[i].z = estimate.translation().z();
 
                 cloudKeyPoses6D->points[i].x = cloudKeyPoses3D->points[i].x;
                 cloudKeyPoses6D->points[i].y = cloudKeyPoses3D->points[i].y;
                 cloudKeyPoses6D->points[i].z = cloudKeyPoses3D->points[i].z;
-                cloudKeyPoses6D->points[i].roll  = isamCurrentEstimate.at<Pose3>(i).rotation().roll();
-                cloudKeyPoses6D->points[i].pitch = isamCurrentEstimate.at<Pose3>(i).rotation().pitch();
-                cloudKeyPoses6D->points[i].yaw   = isamCurrentEstimate.at<Pose3>(i).rotation().yaw();
+                cloudKeyPoses6D->points[i].roll  = estimate.rotation().roll();
+                cloudKeyPoses6D->points[i].pitch = estimate.rotation().pitch();
+                cloudKeyPoses6D->points[i].yaw   = estimate.rotation().yaw();
 
                 updatePath(cloudKeyPoses6D->points[i]);
             }
