@@ -1,0 +1,52 @@
+# ROS 2 parameter file for the ZeroMQ inter-robot bridge.
+#
+# The bridge carries the inter-robot topics between hosts over a ZeroMQ
+# PUB/SUB mesh, so robots need not share a DDS domain. See
+# doc/FIELD_COMMUNICATION.md for the deployment, and note that every robot
+# needs its own copy of this file: bind_endpoint and peer_endpoints differ per
+# platform, unlike the rest of this package's configuration.
+/**:
+  ros__parameters:
+    zmq:
+      # This robot's publisher. 0.0.0.0 accepts connections on every
+      # interface; bind to a specific one to keep the mesh off other networks.
+      bind_endpoint: "tcp://0.0.0.0:7447"
+
+      # Every other robot's bind_endpoint, reachable from here. A full mesh
+      # lists all peers; a relay topology lists only the relay.
+      peer_endpoints: []
+
+      # Messages held per socket before ZeroMQ discards. PUB drops rather than
+      # blocks, which is what a field link needs: an unreachable robot must
+      # not stall the robot trying to reach it.
+      send_high_water_mark: 100
+      receive_high_water_mark: 100
+
+      # Refuse a single frame larger than this rather than allocate it. A
+      # feature cloud is the largest thing carried; raise it only if scans are
+      # legitimately bigger than this.
+      max_payload_mib: 64
+
+      # Discard unsent messages on shutdown instead of waiting for an absent
+      # peer, so a node cannot hang on exit.
+      linger_ms: 0
+
+      # How often the bridge drains its subscriber.
+      poll_rate_hz: 100.0
+      report_period_s: 30.0
+
+      # Depth of the local ROS publishers and subscriptions.
+      qos_depth: 20
+
+      # A topic bridged both ways loops, so the bridge remembers what it
+      # injected locally and drops the echo. The window only has to cover a
+      # round trip through the local ROS graph.
+      echo_suppressor_capacity: 256
+      echo_suppressor_window_s: 5.0
+
+      # Leave empty to carry the inter-robot set derived from
+      # mapfusion.interRobot.solid_topic: context_info, scan_request,
+      # scan_data, loop_info_global and trans_odom. Override both lists
+      # together to carry something else; they must be the same length.
+      topics: []
+      topic_types: []

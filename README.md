@@ -178,6 +178,22 @@ for outlier detection.
 To run against a different dataset, point the launch file at the matching
 parameter file in `config/` (each `run_*.launch.py` selects one), or pass your
 own with the `params` argument of `launch/include/module_loam.launch.py`.
+## Field communication
+
+Robots exchange descriptors and scans over a ZeroMQ PUB/SUB mesh rather than a
+shared DDS domain, which is what the paper deploys and what survives a field
+radio. One `liorf_zmqBridge` per robot carries the inter-robot topics:
+
+```
+ros2 launch liorf run_zmq_bridge.launch.py robot:=jackal0 \
+    bind_endpoint:=tcp://0.0.0.0:7447 \
+    peers:=tcp://192.168.1.12:7447
+```
+
+See [`doc/FIELD_COMMUNICATION.md`](doc/FIELD_COMMUNICATION.md) for the
+topology, the bench verification to do first, and the design notes. The bridge
+is optional: a system without ZeroMQ builds everything else.
+
 ## Evaluation
 
 `evaluation/` computes the metrics the paper reports: place-recognition

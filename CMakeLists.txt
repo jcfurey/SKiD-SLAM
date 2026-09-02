@@ -229,6 +229,25 @@ target_include_directories(skid_pose_uncertainty PUBLIC
 )
 target_link_libraries(skid_pose_uncertainty PUBLIC Eigen3::Eigen gtsam)
 
+# ZeroMQ peer transport for the field communication setup. Optional: a system
+# without ZeroMQ still builds everything else, it just cannot bridge robots.
+find_path(SKID_ZMQ_HPP zmq.hpp)
+find_library(SKID_ZMQ_LIBRARY NAMES zmq)
+if(SKID_ZMQ_HPP AND SKID_ZMQ_LIBRARY)
+  set(SKID_HAVE_ZMQ TRUE)
+  add_library(skid_transport STATIC src/skid_transport.cpp)
+  target_include_directories(skid_transport
+    PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    PRIVATE ${SKID_ZMQ_HPP}
+  )
+  target_link_libraries(skid_transport PRIVATE ${SKID_ZMQ_LIBRARY})
+else()
+  set(SKID_HAVE_ZMQ FALSE)
+  message(STATUS
+    "ZeroMQ not found; skipping liorf_zmqBridge. Install libzmq3-dev and "
+    "cppzmq-dev to build the inter-robot transport.")
+endif()
+
 # Bounded communication policy for the distributed map-fusion node.
 add_library(skid_comms STATIC src/skid_comms.cpp)
 target_include_directories(skid_comms PUBLIC
@@ -279,6 +298,12 @@ target_link_libraries(${PROJECT_NAME}_mapFusion
   ${cpp_typesupport_target} ${PCL_LIBRARIES} ${NABO_LIBRARIES}
   gtsam fast_max-clique_finder solid skid_registration skid_pose_uncertainty
   skid_loop_detection skid_comms)
+
+# ZeroMQ bridge (optional)
+if(SKID_HAVE_ZMQ)
+  ament_auto_add_executable(${PROJECT_NAME}_zmqBridge src/liorf-DiSO/zmqBridge.cpp)
+  target_link_libraries(${PROJECT_NAME}_zmqBridge skid_transport)
+endif()
 
 # Map Fusion (Scan Context)
 ament_auto_add_executable(${PROJECT_NAME}_mapFusionSC src/liorf-DiSO/mapFusion_sc.cpp)
@@ -331,6 +356,12 @@ if(BUILD_TESTING)
   ament_add_gtest(test_skid_comms
     test/test_skid_comms.cpp)
   target_link_libraries(test_skid_comms skid_comms)
+
+  if(SKID_HAVE_ZMQ)
+    ament_add_gtest(test_skid_transport
+      test/test_skid_transport.cpp)
+    target_link_libraries(test_skid_transport skid_transport)
+  endif()
 
   # A parameter no node declares is ignored silently, and one declared with a
   # different type stops the node from starting. Both are caught here rather

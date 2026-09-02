@@ -36,6 +36,9 @@
   <depend>libomp-dev</depend>
   <depend>tbb</depend>
   <depend>geographiclib</depend>
+  <!-- Inter-robot transport; the bridge is skipped if these are absent. -->
+  <depend>libzmq3-dev</depend>
+  <depend>cppzmq</depend>
   <depend>libboost-timer-dev</depend>
 
   <exec_depend>launch</exec_depend>

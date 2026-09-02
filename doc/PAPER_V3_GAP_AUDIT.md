@@ -2,7 +2,7 @@
 
 Status: living audit and implementation record for the `v3` branch
 
-Last updated: 1 September 2026 (intra-robot pipeline reuse; bounded on-demand communications; map-alignment uncertainty; paper dataset configurations; evaluation harness)
+Last updated: 1 September 2026 (intra-robot pipeline reuse; bounded on-demand communications; map-alignment uncertainty; paper dataset configurations; evaluation harness; ZeroMQ transport)
 
 Audit baseline: commit `475b59f`, before the paper-registration work below.
 The gap table records that baseline so the provenance problem remains visible;
@@ -21,6 +21,7 @@ boundary:
 - [`BOUNDED_COMMUNICATIONS_CHANGE_RECORD.md`](BOUNDED_COMMUNICATIONS_CHANGE_RECORD.md)
 - [`MAP_ALIGNMENT_UNCERTAINTY_CHANGE_RECORD.md`](MAP_ALIGNMENT_UNCERTAINTY_CHANGE_RECORD.md)
 - [`EVALUATION_HARNESS_CHANGE_RECORD.md`](EVALUATION_HARNESS_CHANGE_RECORD.md)
+- [`FIELD_COMMUNICATION_CHANGE_RECORD.md`](FIELD_COMMUNICATION_CHANGE_RECORD.md)
 
 ## Executive summary
 
@@ -54,6 +55,7 @@ contract, and contains correctness issues that need tests and reimplementation.
   and caches, and byte/latency reporting.
 - The six paper dataset configurations, with a parameter-contract test.
 - A dependency-free evaluation harness for the paper's metrics.
+- A ZeroMQ peer transport and inter-robot bridge for field deployment.
 
 The last two items are post-paper extensions and should be retained while
 paper parity is restored.
@@ -349,7 +351,7 @@ robot. None of that is attempted here.
 | P1 | Distributed keyframe PGO matching Equation 6 | Partial approximation, now analysed rather than assumed. Map fusion still optimizes one `Pose3` per robot/map while each robot owns a separate keyframe graph. The two-robot case is shown below to lose no information; the multi-peer case no longer treats the map alignment as exact. | Represent remote keyframe variables explicitly. The three code-level blockers are named in "Equation (6) and the two-level formulation" below. |
 | P1 | Lightweight message pool | Implemented. Announcements are descriptor-only; scans transfer on request. Announcement backlogs, the scan cache, outstanding requests, and parked candidates are all bounded, with defined retry, backpressure, and abandonment behaviour, and byte/latency reporting on both channels. | Measure the achieved bandwidth and latency on field bags and calibrate the cache budget against the datasets' revisit horizons. |
 | P1 | Meaningful inter-robot uncertainty | Implemented for the SOLiD paper pipeline: Hessian-shaped, physically calibrated full covariance is propagated through PCM, map alignment, the typed loop message, and the GTSAM factor. | Calibrate on field data and extend trajectory uncertainty beyond the configured PCM floor. |
-| P2 | ROS + ZeroMQ field communication setup (Section VI-B) | No ZeroMQ transport or reproducible network setup is present. The message contract is now transport-agnostic: announcements and scans are separate, bounded topics, so a bridge carries descriptors and scans independently. | Add an optional transport adapter or document the external component used by the paper. |
+| P2 | ROS + ZeroMQ field communication setup (Section VI-B) | Implemented. `liorf_zmqBridge` carries the inter-robot topics over a ZeroMQ PUB/SUB mesh through a type-agnostic generic pub/sub bridge; the transport underneath is tested over real sockets. The deployment is in `doc/FIELD_COMMUNICATION.md`. The bridge is optional: a system without ZeroMQ builds everything else. | Compile and bench-verify the bridge node, which has never been built, then measure over a real radio. |
 | P2 | Paper dataset configurations | Implemented. GEODE, GRACO, Majang, Moon, Park, and STEAM are ported to ROS 2 parameters with a launch file each, and every parameter file is checked against the declared parameter contract by `validate_config_parameters`. | Verify each against its bag: topic names, `imuRate`, and the Moon sensor/topic pairing noted in that file are unverified against real data. Add cave and planetary field configs if the data are available. |
 | P2 | Paper evaluation harness | Implemented in `evaluation/`: PR curves, RTE/RRE and success rate, ATE/ARE with rigid, Sim(3) or yaw alignment, descriptor memory against a Scan Context baseline, and communication cost read back from the map-fusion diagnostics. Manifests exist for all six datasets, and the metrics are tested against analytically known cases. | Two inputs cannot yet be produced from a bag: loop-candidate scores need the structured diagnostic topic Phase 2 item 4 tracks, and registrations need a keyframe-index-to-time extractor. Fill in each manifest's `expected` block once the paper's protocol is confirmed to match. |
 | P2 | Pipeline test coverage | Unit coverage now includes coarse-to-fine registration, truncated MSE, covariance, SE(3) PCM propagation and inversion, message conversion, SOLiD descriptor construction, descriptor retrieval, the shared registration parameter contract, the communication policy, and a parameter-contract check over every configuration and launch file. | Add failure injection and multi-robot graph tests. |
@@ -395,13 +397,17 @@ robot. None of that is attempted here.
   propagated into cross-peer loop factors.
 - `config/{geode,graco,majang_rover,moon,park,steam_legged}.yaml` and their
   launch files: the paper's field datasets, ported from `0611f71`.
+- `include/skid_transport.hpp`, `src/skid_transport.cpp`: the ZeroMQ peer
+  transport and the echo suppressor, tested over real sockets.
+- `src/liorf-DiSO/zmqBridge.cpp` and `doc/FIELD_COMMUNICATION.md`: the bridge
+  node and its deployment.
 - `evaluation/`: the metric implementations, dataset manifests, CLI runner,
   and the conventions the inputs must follow.
 - `test/validate_config_parameters.py`: every parameter file is checked
   against the parameters the sources declare, including the prefixed
   registration sets built at runtime, and against the declared types.
 - `third_party/` and `CMakeLists.txt`: KISS-Matcher, Small-GICP, ROBIN, PMC,
-  and xenium are pinned and built locally. ZeroMQ remains absent.
+  and xenium are pinned and built locally.
 
 ## Recoverable paper-era material
 
