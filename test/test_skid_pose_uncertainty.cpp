@@ -55,3 +55,154 @@ TEST(PcmUncertainty, UsesSeparateAngularAndLinearUnits) {
 }
 
 }  // namespace
+
+namespace {
+
+gtsam::Pose3 samplePose() {
+  return gtsam::Pose3(
+    gtsam::Rot3::RzRyRx(0.3, -0.2, 1.1), gtsam::Point3(4.0, -1.5, 0.7));
+}
+
+liorf::uncertainty::Matrix6d sampleCovariance() {
+  Eigen::Matrix<double, 6, 1> diagonal;
+  diagonal << 0.01, 0.02, 0.03, 0.10, 0.20, 0.30;
+  liorf::uncertainty::Matrix6d covariance = diagonal.asDiagonal();
+  // A little cross-coupling so the adjoint actually has to do something.
+  covariance(0, 3) = covariance(3, 0) = 0.005;
+  return covariance;
+}
+
+// True when rhs - lhs is positive semidefinite, i.e. rhs is at least as
+// uncertain as lhs in every direction.
+bool atLeastAsUncertain(
+  const liorf::uncertainty::Matrix6d& rhs,
+  const liorf::uncertainty::Matrix6d& lhs) {
+  const liorf::uncertainty::Matrix6d difference = rhs - lhs;
+  Eigen::SelfAdjointEigenSolver<liorf::uncertainty::Matrix6d> solver(
+    0.5 * (difference + difference.transpose()));
+  return solver.info() == Eigen::Success &&
+         solver.eigenvalues().minCoeff() >= -1.0e-9;
+}
+
+}  // namespace
+
+TEST(SkidPoseUncertaintyInverse, InvertingTwiceRestoresPoseAndCovariance) {
+  const gtsam::Pose3 pose = samplePose();
+  const liorf::uncertainty::Matrix6d covariance = sampleCovariance();
+
+  const auto once = liorf::uncertainty::inverse(pose, covariance);
+  ASSERT_TRUE(liorf::uncertainty::validCovariance(once.covariance));
+  const auto twice =
+    liorf::uncertainty::inverse(once.pose, once.covariance);
+
+  EXPECT_TRUE(twice.pose.equals(pose, 1.0e-9));
+  EXPECT_NEAR(
+    0.0, (twice.covariance - covariance).cwiseAbs().maxCoeff(), 1.0e-9);
+}
+
+TEST(SkidPoseUncertaintyInverse, PreservesTotalUncertaintyScale) {
+  const auto result =
+    liorf::uncertainty::inverse(samplePose(), sampleCovariance());
+  // The adjoint is a similarity transform, so the covariance stays positive
+  // definite and none of it is lost.
+  EXPECT_TRUE(liorf::uncertainty::positiveDefiniteCovariance(result.covariance));
+  EXPECT_GT(result.covariance.trace(), 0.0);
+}
+
+TEST(SkidPoseUncertaintyInverse, RejectsAnInvalidCovariance) {
+  liorf::uncertainty::Matrix6d bad = sampleCovariance();
+  bad(0, 0) = -1.0;
+  const auto result = liorf::uncertainty::inverse(samplePose(), bad);
+  EXPECT_FALSE(liorf::uncertainty::validCovariance(result.covariance));
+}
+
+TEST(SkidPoseUncertaintyCompose, AnUncertainLeftOperandOnlyAddsUncertainty) {
+  // This is the property the cross-peer loop factor relies on: treating the
+  // map alignment as exact can only understate the factor's covariance, so
+  // carrying its uncertainty is the conservative direction.
+  const gtsam::Pose3 alignment = samplePose();
+  const gtsam::Pose3 measured = gtsam::Pose3(
+    gtsam::Rot3::RzRyRx(-0.1, 0.4, 0.2), gtsam::Point3(-2.0, 3.0, 1.0));
+  const liorf::uncertainty::Matrix6d measurement_covariance =
+    sampleCovariance();
+
+  const auto exact_alignment = liorf::uncertainty::compose(
+    alignment, liorf::uncertainty::Matrix6d::Zero(),
+    measured, measurement_covariance);
+  const auto uncertain_alignment = liorf::uncertainty::compose(
+    alignment, sampleCovariance(), measured, measurement_covariance);
+
+  EXPECT_TRUE(exact_alignment.pose.equals(uncertain_alignment.pose, 1.0e-12));
+  EXPECT_TRUE(atLeastAsUncertain(
+    uncertain_alignment.covariance, exact_alignment.covariance));
+  EXPECT_GT(
+    uncertain_alignment.covariance.trace(),
+    exact_alignment.covariance.trace());
+}
+
+TEST(SkidPoseUncertaintyCrossPeer, CarryingAlignmentUncertaintyIsConservative) {
+  // Mirrors how a cross-peer loop factor is built when its two endpoints were
+  // registered against different peers: each is brought back through that
+  // peer's map alignment before the two are differenced.
+  const gtsam::Pose3 alignment_this = samplePose();
+  const gtsam::Pose3 alignment_that = gtsam::Pose3(
+    gtsam::Rot3::RzRyRx(0.05, 0.15, -0.6), gtsam::Point3(-3.0, 2.0, -0.4));
+  const gtsam::Pose3 endpoint_this = gtsam::Pose3(
+    gtsam::Rot3::RzRyRx(0.2, 0.1, 0.3), gtsam::Point3(1.0, 2.0, 3.0));
+  const gtsam::Pose3 endpoint_that = gtsam::Pose3(
+    gtsam::Rot3::RzRyRx(-0.3, 0.25, 0.9), gtsam::Point3(5.0, -1.0, 0.5));
+  const liorf::uncertainty::Matrix6d registration_covariance =
+    sampleCovariance();
+
+  const auto build = [&](const liorf::uncertainty::Matrix6d& alignment_cov) {
+    const auto inverse_this =
+      liorf::uncertainty::inverse(alignment_this, alignment_cov);
+    const auto inverse_that =
+      liorf::uncertainty::inverse(alignment_that, alignment_cov);
+    const auto local_this = liorf::uncertainty::compose(
+      inverse_this.pose, inverse_this.covariance,
+      endpoint_this, registration_covariance);
+    const auto local_that = liorf::uncertainty::compose(
+      inverse_that.pose, inverse_that.covariance,
+      endpoint_that, registration_covariance);
+    return liorf::uncertainty::between(
+      local_that.pose, local_that.covariance,
+      local_this.pose, local_this.covariance);
+  };
+
+  const auto alignment_treated_as_exact =
+    build(liorf::uncertainty::Matrix6d::Zero());
+  const auto alignment_uncertainty_carried = build(sampleCovariance());
+
+  // The measurement itself is unchanged; only its weight is.
+  EXPECT_TRUE(alignment_uncertainty_carried.pose.equals(
+    alignment_treated_as_exact.pose, 1.0e-12));
+  EXPECT_TRUE(liorf::uncertainty::positiveDefiniteCovariance(
+    alignment_uncertainty_carried.covariance));
+  EXPECT_TRUE(atLeastAsUncertain(
+    alignment_uncertainty_carried.covariance,
+    alignment_treated_as_exact.covariance));
+  EXPECT_GT(
+    alignment_uncertainty_carried.covariance.trace(),
+    alignment_treated_as_exact.covariance.trace());
+}
+
+TEST(SkidPoseUncertaintyCrossPeer, ADiagonalFloorIsAValidCovariance) {
+  // The map-fusion node builds its alignment floor exactly this way.
+  Eigen::Matrix<double, 6, 1> variances;
+  const double rotation_variance = 0.05 * 0.05;
+  const double translation_variance = 0.20 * 0.20;
+  variances << rotation_variance, rotation_variance, rotation_variance,
+    translation_variance, translation_variance, translation_variance;
+  const liorf::uncertainty::Matrix6d floor(variances.asDiagonal());
+
+  EXPECT_TRUE(liorf::uncertainty::positiveDefiniteCovariance(floor));
+  EXPECT_NEAR(rotation_variance, floor(0, 0), 1.0e-15);
+  EXPECT_NEAR(translation_variance, floor(5, 5), 1.0e-15);
+
+  // Adding a marginal to the floor keeps it a usable covariance and can only
+  // increase it, which is what makes the floor a floor.
+  const liorf::uncertainty::Matrix6d floored = floor + sampleCovariance();
+  EXPECT_TRUE(liorf::uncertainty::positiveDefiniteCovariance(floored));
+  EXPECT_TRUE(atLeastAsUncertain(floored, floor));
+}

@@ -33,6 +33,13 @@ PoseWithCovariance compose(
   const gtsam::Pose3& rhs,
   const Matrix6d& rhs_covariance);
 
+// First-order propagation for the inverse of an uncertain pose. The Jacobian
+// is the negated adjoint, so applying this twice returns the original
+// covariance exactly.
+PoseWithCovariance inverse(
+  const gtsam::Pose3& pose,
+  const Matrix6d& covariance);
+
 // First-order propagation for an independent relative pose from -> to.
 PoseWithCovariance between(
   const gtsam::Pose3& from,

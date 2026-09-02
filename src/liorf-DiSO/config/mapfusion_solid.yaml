@@ -29,6 +29,13 @@
             # Aggregate local-trajectory uncertainty used during PCM.
             pcm_local_rotation_stddev_rad: 0.05
             pcm_local_translation_stddev_m: 0.20
+            # Floor on the estimated map-alignment uncertainty, and the value
+            # used outright when its marginal cannot be recovered. A loop
+            # constraint whose two endpoints were registered against different
+            # peers is composed through these alignments, so their error
+            # belongs in the factor's covariance.
+            map_alignment_rotation_stddev_rad: 0.05
+            map_alignment_translation_stddev_m: 0.20
             icp_threshold: 3.0
             loop_frame_threshold: 10 #frames
             pcm_start_threshold: 5   # 5 for best result, 2 for work in harsh environment

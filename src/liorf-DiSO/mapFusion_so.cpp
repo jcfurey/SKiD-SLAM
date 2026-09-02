@@ -41,6 +41,7 @@
 #include <gtsam/nonlinear/Values.h>
 #include <gtsam/nonlinear/NonlinearFactorGraph.h>
 #include <gtsam/nonlinear/LevenbergMarquardtOptimizer.h>
+#include <gtsam/nonlinear/Marginals.h>
 
 //expression graph
 #include <gtsam/nonlinear/ExpressionFactorGraph.h>
@@ -259,6 +260,13 @@ private:
 
     std::unordered_map< int, std::vector<PointTypePose> > _global_map_trans;
     std::unordered_map< int, PointTypePose> _global_map_trans_optimized;
+    // Uncertainty of each optimized map alignment. Composing a cross-peer loop
+    // constraint through an alignment treated as exact understates the
+    // factor's covariance, so this is carried with it.
+    std::unordered_map<int, liorf::uncertainty::Matrix6d>
+        _global_map_trans_covariance;
+    double _map_alignment_rotation_stddev_rad = 0.05;
+    double _map_alignment_translation_stddev_m = 0.20;
 
     int number_print;
     int _num_cores = 4;
@@ -422,6 +430,14 @@ private:
             "mapfusion.interRobot.pcm_local_rotation_stddev_rad", 0.05);
         _pcm_local_translation_stddev_m = declare_and_get<double>(
             "mapfusion.interRobot.pcm_local_translation_stddev_m", 0.20);
+        // Floor on the map-alignment uncertainty, and the value used outright
+        // when the alignment's marginal cannot be recovered. The alignment
+        // also carries error this estimator does not model, so it is never
+        // treated as better than this.
+        _map_alignment_rotation_stddev_rad = declare_and_get<double>(
+            "mapfusion.interRobot.map_alignment_rotation_stddev_rad", 0.05);
+        _map_alignment_translation_stddev_m = declare_and_get<double>(
+            "mapfusion.interRobot.map_alignment_translation_stddev_m", 0.20);
         const double legacy_icp_threshold =
             declare_and_get<double>("mapfusion.interRobot.icp_threshold", 3.0);
         _robot_initial = declare_and_get<std::string>("mapfusion.interRobot.robot_initial", "jackal0");
@@ -518,6 +534,14 @@ private:
             _pcm_local_translation_stddev_m <= 0.0) {
             throw std::invalid_argument(
                 "mapfusion PCM threshold/uncertainty values are invalid");
+        }
+
+        if (!std::isfinite(_map_alignment_rotation_stddev_rad) ||
+            _map_alignment_rotation_stddev_rad <= 0.0 ||
+            !std::isfinite(_map_alignment_translation_stddev_m) ||
+            _map_alignment_translation_stddev_m <= 0.0) {
+            throw std::invalid_argument(
+                "mapfusion map-alignment uncertainty values are invalid");
         }
 
     }
@@ -1844,6 +1868,50 @@ private:
         output_file.close();
     }
 
+    liorf::uncertainty::Matrix6d alignmentUncertaintyFloor() const {
+        Eigen::Matrix<double, 6, 1> variances;
+        const double rotation_variance =
+            _map_alignment_rotation_stddev_rad *
+            _map_alignment_rotation_stddev_rad;
+        const double translation_variance =
+            _map_alignment_translation_stddev_m *
+            _map_alignment_translation_stddev_m;
+        // GTSAM tangent order: [rx, ry, rz, tx, ty, tz].
+        variances << rotation_variance, rotation_variance, rotation_variance,
+            translation_variance, translation_variance, translation_variance;
+        return liorf::uncertainty::Matrix6d(variances.asDiagonal());
+    }
+
+    struct MapAlignment {
+        gtsam::Pose3 pose;
+        liorf::uncertainty::Matrix6d covariance =
+            liorf::uncertainty::Matrix6d::Zero();
+        bool valid = false;
+    };
+
+    // The estimated transform taking this robot's map frame into `robot_id_th`'s,
+    // with the uncertainty recorded when it was optimized.
+    MapAlignment mapAlignment(int robot_id_th) const {
+        MapAlignment alignment;
+        const auto pose_it = _global_map_trans_optimized.find(robot_id_th);
+        if (pose_it == _global_map_trans_optimized.end())
+            return alignment;
+
+        const PointTypePose & trans = pose_it->second;
+        alignment.pose = gtsam::Pose3(
+            gtsam::Rot3::RzRyRx(trans.roll, trans.pitch, trans.yaw),
+            gtsam::Point3(trans.x, trans.y, trans.z));
+
+        const auto covariance_it =
+            _global_map_trans_covariance.find(robot_id_th);
+        alignment.covariance = covariance_it == _global_map_trans_covariance.end()
+            ? alignmentUncertaintyFloor()
+            : covariance_it->second;
+        alignment.valid =
+            liorf::uncertainty::validCovariance(alignment.covariance);
+        return alignment;
+    }
+
     void gtsamExpressionGraph(){
         if (_loop_accept_queue[_robot_this_th].size()<2)
             return;
@@ -1878,6 +1946,32 @@ private:
         gtsam::Values result = gtsam::LevenbergMarquardtOptimizer(graph, initial).optimize();
 
         gtsam::Pose3 est = result.at<gtsam::Pose3>(0);
+
+        // The alignment is an estimate, and a cross-peer loop constraint
+        // composed through it inherits its error. Recover the marginal and
+        // floor it: the estimator does not model drift between the two maps
+        // or the correlation between this alignment and the registrations it
+        // was fitted to, so it must never look better than the floor.
+        liorf::uncertainty::Matrix6d alignment_covariance =
+            alignmentUncertaintyFloor();
+        try {
+            gtsam::Marginals marginals(graph, result);
+            const liorf::uncertainty::Matrix6d marginal =
+                marginals.marginalCovariance(0);
+            if (liorf::uncertainty::validCovariance(marginal))
+                alignment_covariance += marginal;
+            else
+                RCLCPP_WARN(get_logger(),
+                    "Map alignment marginal for robot %d is not a valid "
+                    "covariance; using the configured floor",
+                    _robot_this_th);
+        } catch (const std::exception & error) {
+            RCLCPP_WARN(get_logger(),
+                "Map alignment marginal for robot %d unavailable (%s); "
+                "using the configured floor",
+                _robot_this_th, error.what());
+        }
+        _global_map_trans_covariance[_robot_this_th] = alignment_covariance;
 
         PointTypePose map_trans_this;
 
@@ -1999,23 +2093,42 @@ private:
             pose_to_that = {pose_that.aligned_source_pose, pose_that.covariance};
         }
         else{
-            if (_global_map_trans_optimized.find(robot_id_this) == _global_map_trans_optimized.end() ||
-                    _global_map_trans_optimized.find(robot_id_that) == _global_map_trans_optimized.end() )
+            // The two endpoints were registered against different peers, so
+            // each is expressed in that peer's map frame and has to come back
+            // through its alignment before they can be differenced. The
+            // alignment is estimated, and its uncertainty belongs in the
+            // resulting factor.
+            //
+            // The alignment and the registration are correlated -- the
+            // alignment was fitted to registrations including this one -- and
+            // this treats them as independent. That errs towards a larger
+            // covariance, which is the safe direction; treating the alignment
+            // as exact, as this previously did, errs towards a smaller one.
+            const MapAlignment alignment_this = mapAlignment(robot_id_this);
+            const MapAlignment alignment_that = mapAlignment(robot_id_that);
+            if (!alignment_this.valid || !alignment_that.valid)
                 return;
-            PointTypePose trans_this = _global_map_trans_optimized[robot_id_this];
-            gtsam::Pose3 trans_this3 = gtsam::Pose3( gtsam::Rot3::RzRyRx(trans_this.roll, trans_this.pitch, trans_this.yaw),
-                                                    gtsam::Point3(trans_this.x, trans_this.y, trans_this.z) );
 
-            PointTypePose trans_that = _global_map_trans_optimized[robot_id_that];
-            gtsam::Pose3 trans_that3 = gtsam::Pose3( gtsam::Rot3::RzRyRx(trans_that.roll, trans_that.pitch, trans_that.yaw),
-                                                     gtsam::Point3(trans_that.x, trans_that.y, trans_that.z) );
+            const auto inverse_this = liorf::uncertainty::inverse(
+                alignment_this.pose, alignment_this.covariance);
+            const auto inverse_that = liorf::uncertainty::inverse(
+                alignment_that.pose, alignment_that.covariance);
 
-            pose_to_this = {
-                trans_this3.inverse() * pose_this.aligned_source_pose,
-                pose_this.covariance};
-            pose_to_that = {
-                trans_that3.inverse() * pose_that.aligned_source_pose,
-                pose_that.covariance};
+            pose_to_this = liorf::uncertainty::compose(
+                inverse_this.pose, inverse_this.covariance,
+                pose_this.aligned_source_pose, pose_this.covariance);
+            pose_to_that = liorf::uncertainty::compose(
+                inverse_that.pose, inverse_that.covariance,
+                pose_that.aligned_source_pose, pose_that.covariance);
+
+            if (!liorf::uncertainty::validCovariance(pose_to_this.covariance) ||
+                !liorf::uncertainty::validCovariance(pose_to_that.covariance)) {
+                RCLCPP_WARN(get_logger(),
+                    "Cross-peer loop factor between robots %d and %d dropped: "
+                    "map-alignment propagation produced an invalid covariance",
+                    robot_id_that, robot_id_this);
+                return;
+            }
         }
 
         const auto measurement = liorf::uncertainty::between(

@@ -53,6 +53,22 @@ PoseWithCovariance compose(
   return result;
 }
 
+PoseWithCovariance inverse(
+  const gtsam::Pose3& pose,
+  const Matrix6d& covariance) {
+  PoseWithCovariance result;
+  if (!validCovariance(covariance)) {
+    result.covariance = Matrix6d::Constant(
+      std::numeric_limits<double>::quiet_NaN());
+    return result;
+  }
+
+  gtsam::Matrix6 H;
+  result.pose = pose.inverse(H);
+  result.covariance = symmetric(H * covariance * H.transpose());
+  return result;
+}
+
 PoseWithCovariance between(
   const gtsam::Pose3& from,
   const Matrix6d& from_covariance,
@@ -92,13 +108,15 @@ PcmResidual pcmResidual(
     return result;
   }
 
+  // A default-constructed OptionalJacobian is the portable way to skip one:
+  // nullptr is ambiguous between OptionalJacobian's pointer constructors.
   gtsam::Matrix6 H_first_inter;
   const gtsam::Pose3 first = inner_ij.compose(
-    inter_jk, nullptr, H_first_inter);
+    inter_jk, {}, H_first_inter);
 
   gtsam::Matrix6 H_second_first;
   const gtsam::Pose3 second = first.compose(
-    inner_kl, H_second_first, nullptr);
+    inner_kl, H_second_first, {});
 
   const gtsam::Matrix6 H_inverse_inter = -inter_il.AdjointMap();
   const gtsam::Pose3 inverse_inter = inter_il.inverse();
