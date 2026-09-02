@@ -16,8 +16,9 @@ The endpoint timestamps come from accepted registration diagnostics, not the
 factor publication time.  Factors are canonicalized by endpoint, so opposite
 message orientations can be compared without hiding a transform-direction
 error.  The report includes standard RTE/RRE and an orientation-independent
-endpoint-separation error; the latter is useful when a dataset's body/sensor
-rotation convention has not yet been established.
+endpoint-separation error. Use ``--position-only-ground-truth`` when a
+dataset's orientation channel is not a valid reference, and
+``--max-separation`` to make that mode an executable regression gate.
 """
 
 import argparse
@@ -168,6 +169,11 @@ def _print_summary(report):
         print(
             f"RRE median={values['median']:.3f} deg "
             f"p90={values['p90']:.3f} deg max={values['max']:.3f} deg")
+    if score["separation"] is not None:
+        values = score["separation"]
+        print(
+            f"separation error median={values['median']:.3f} m "
+            f"p90={values['p90']:.3f} m max={values['max']:.3f} m")
 
 
 def main(argv=None):
@@ -187,10 +193,18 @@ def main(argv=None):
                         help="rosbag2 storage plugin (default: mcap)")
     parser.add_argument("--max-time-difference", type=float, default=0.03,
                         help="maximum endpoint-to-ground-truth gap in seconds")
+    parser.add_argument(
+        "--position-only-ground-truth", action="store_true",
+        help=("do not use ground-truth orientations; report only the "
+              "orientation-independent endpoint-separation error"))
     parser.add_argument("--max-rte", type=float,
                         help="fail if any associated factor exceeds this RTE")
     parser.add_argument("--max-rre", type=float,
                         help="fail if any associated factor exceeds this RRE")
+    parser.add_argument(
+        "--max-separation", type=float,
+        help=("fail if any associated factor exceeds this "
+              "orientation-independent endpoint-separation error"))
     parser.add_argument("--min-associated", type=int, default=1,
                         help="minimum number of ground-truth-scored factors")
     parser.add_argument("--output", help="write the complete JSON report")
@@ -208,6 +222,12 @@ def main(argv=None):
         parser.error("--max-rte must be non-negative")
     if arguments.max_rre is not None and arguments.max_rre < 0.0:
         parser.error("--max-rre must be non-negative")
+    if arguments.max_separation is not None and arguments.max_separation < 0.0:
+        parser.error("--max-separation must be non-negative")
+    if arguments.position_only_ground_truth and (
+            arguments.max_rte is not None or arguments.max_rre is not None):
+        parser.error(
+            "--max-rte/--max-rre require full-pose ground truth")
 
     try:
         ground_truth, ground_truth_paths = _parse_ground_truth(
@@ -221,7 +241,8 @@ def main(argv=None):
             collect_endpoint_timestamps(observations)
         score = score_factors(
             canonical_factors, endpoint_times, ground_truth,
-            arguments.max_time_difference)
+            arguments.max_time_difference,
+            position_only_ground_truth=arguments.position_only_ground_truth)
     except (OSError, RuntimeError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
@@ -244,6 +265,7 @@ def main(argv=None):
         "thresholds": {
             "max_rte_m": arguments.max_rte,
             "max_rre_deg": arguments.max_rre,
+            "max_separation_m": arguments.max_separation,
             "min_associated": arguments.min_associated,
         },
     }
@@ -275,6 +297,12 @@ def main(argv=None):
             failures.append(
                 f"maximum RRE {score['rotation']['max']:.6f} deg exceeds "
                 f"{arguments.max_rre:.6f} deg")
+    if arguments.max_separation is not None and score["separation"] is not None:
+        if score["separation"]["max"] > arguments.max_separation:
+            failures.append(
+                "maximum separation error "
+                f"{score['separation']['max']:.6f} m exceeds "
+                f"{arguments.max_separation:.6f} m")
     if failures:
         print("error: " + "; ".join(failures), file=sys.stderr)
         return 1

@@ -864,6 +864,30 @@ def test_factor_scoring_uses_original_endpoint_times_and_relative_pose():
     assert report["separation"]["max"] == pytest.approx(0.0, abs=1e-12)
 
 
+def test_factor_scoring_can_treat_ground_truth_as_position_only():
+    first = Endpoint("jackal0", 4)
+    second = Endpoint("jackal1", 9)
+    first_pose = Pose(5.0, (0.0, 0.0, 0.0), rotation_z(1.2))
+    second_pose = Pose(8.0, (3.0, 4.0, 0.0), rotation_z(-2.0))
+    # The direction is deliberately incompatible with the supplied
+    # orientations, but its five-metre endpoint separation is correct.
+    factors = {
+        (first, second): Pose(0.0, (0.0, 5.0, 0.0), IDENTITY),
+    }
+    report = score_factors(
+        factors, {first: 5.0, second: 8.0},
+        {"jackal0": Trajectory([first_pose]),
+         "jackal1": Trajectory([second_pose])},
+        position_only_ground_truth=True)
+
+    assert report["reference_mode"] == "position_only"
+    assert report["translation"] is None
+    assert report["rotation"] is None
+    assert report["separation"]["max"] == pytest.approx(0.0, abs=1e-12)
+    assert report["factors"][0]["translation_error_m"] is None
+    assert report["factors"][0]["rotation_error_deg"] is None
+
+
 def test_factor_scoring_reports_ground_truth_gaps_without_reusing_bad_poses():
     first = Endpoint("jackal0", 4)
     second = Endpoint("jackal1", 9)

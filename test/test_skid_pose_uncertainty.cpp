@@ -97,6 +97,51 @@ TEST(PcmUncertainty, ClosesANonIdentityTwoRobotCycle) {
   EXPECT_GT(reversed.mahalanobis_distance, 1.0);
 }
 
+TEST(PcmUncertainty, AbsoluteTranslationGateBoundsInflatedCovariance) {
+  liorf::uncertainty::PcmResidual residual;
+  residual.valid = true;
+  residual.mahalanobis_distance = 0.25;
+  residual.pose = gtsam::Pose3(
+    gtsam::Rot3(), gtsam::Point3(3.0, 0.0, 0.0));
+  residual.tangent = gtsam::Pose3::Logmap(residual.pose);
+
+  EXPECT_TRUE(liorf::uncertainty::pcmResidualPassesGate(
+    residual, 1.0, 0.0, 0.0));
+  EXPECT_FALSE(liorf::uncertainty::pcmResidualPassesGate(
+    residual, 1.0, 1.0, 0.0));
+  EXPECT_TRUE(liorf::uncertainty::pcmResidualPassesGate(
+    residual, 1.0, 3.0, 0.0));
+}
+
+TEST(PcmUncertainty, AbsoluteRotationGateIsIndependent) {
+  liorf::uncertainty::PcmResidual residual;
+  residual.valid = true;
+  residual.mahalanobis_distance = 0.25;
+  residual.pose = gtsam::Pose3(
+    gtsam::Rot3::Rz(0.6), gtsam::Point3(0.1, 0.0, 0.0));
+  residual.tangent = gtsam::Pose3::Logmap(residual.pose);
+
+  EXPECT_FALSE(liorf::uncertainty::pcmResidualPassesGate(
+    residual, 1.0, 1.0, 0.5));
+  EXPECT_TRUE(liorf::uncertainty::pcmResidualPassesGate(
+    residual, 1.0, 1.0, 0.7));
+  EXPECT_FALSE(liorf::uncertainty::pcmResidualPassesGate(
+    residual, 0.2, 1.0, 0.7));
+}
+
+TEST(PcmUncertainty, ResidualGateRejectsInvalidLimits) {
+  liorf::uncertainty::PcmResidual residual;
+  residual.valid = true;
+  residual.mahalanobis_distance = 0.0;
+  residual.pose = gtsam::Pose3();
+  residual.tangent.setZero();
+
+  EXPECT_FALSE(liorf::uncertainty::pcmResidualPassesGate(
+    residual, 1.0, -1.0, 0.0));
+  EXPECT_FALSE(liorf::uncertainty::pcmResidualPassesGate(
+    residual, 0.0, 0.0, 0.0));
+}
+
 }  // namespace
 
 namespace {

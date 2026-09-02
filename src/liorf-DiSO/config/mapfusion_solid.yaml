@@ -32,6 +32,12 @@
             # Aggregate local-trajectory uncertainty used during PCM.
             pcm_local_rotation_stddev_rad: 0.05
             pcm_local_translation_stddev_m: 0.20
+            # Optional absolute Equation (11) cycle-error ceilings. Zero keeps
+            # the paper's covariance-normalized gate alone. A field profile
+            # can set either ceiling to stop a very uncertain registration
+            # from buying effectively unlimited PCM tolerance.
+            pcm_max_translation_residual_m: 0.0
+            pcm_max_rotation_residual_rad: 0.0
             # Floor on the estimated map-alignment uncertainty, and the value
             # used outright when its marginal cannot be recovered. A loop
             # constraint whose two endpoints were registered against different

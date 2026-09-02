@@ -245,7 +245,8 @@ def _statistics(values, unit):
 
 
 def score_factors(factors, endpoint_times, ground_truth,
-                  max_time_difference_s=0.03):
+                  max_time_difference_s=0.03,
+                  position_only_ground_truth=False):
     """Score canonical factors using their original endpoint timestamps."""
     scored = []
     unassociated = []
@@ -283,30 +284,40 @@ def score_factors(factors, endpoint_times, ground_truth,
             continue
 
         reference = from_pose.between(to_pose)
-        error = estimate.inverse().compose(reference)
-        translation_error = linalg.norm(error.translation)
-        rotation_error = math.degrees(linalg.rotation_angle(error.rotation))
         separation_error = abs(
             linalg.norm(estimate.translation) -
             linalg.norm(reference.translation))
-        scored.append({
+        row = {
             "factor": factor_label(identity),
             "from_time": endpoint_times[from_endpoint],
             "to_time": endpoint_times[to_endpoint],
             "maximum_time_difference_s": maximum_gap,
-            "translation_error_m": translation_error,
-            "rotation_error_deg": rotation_error,
             "separation_error_m": separation_error,
-        })
+        }
+        if position_only_ground_truth:
+            row["translation_error_m"] = None
+            row["rotation_error_deg"] = None
+        else:
+            error = estimate.inverse().compose(reference)
+            row["translation_error_m"] = linalg.norm(error.translation)
+            row["rotation_error_deg"] = math.degrees(
+                linalg.rotation_angle(error.rotation))
+        scored.append(row)
 
-    translation_errors = [row["translation_error_m"] for row in scored]
-    rotation_errors = [row["rotation_error_deg"] for row in scored]
+    translation_errors = [
+        row["translation_error_m"] for row in scored
+        if row["translation_error_m"] is not None]
+    rotation_errors = [
+        row["rotation_error_deg"] for row in scored
+        if row["rotation_error_deg"] is not None]
     separation_errors = [row["separation_error_m"] for row in scored]
     return {
         "total_factors": len(factors),
         "associated_factors": len(scored),
         "unassociated_factors": len(unassociated),
         "max_time_difference_s": max_time_difference_s,
+        "reference_mode": (
+            "position_only" if position_only_ground_truth else "full_pose"),
         "translation": _statistics(translation_errors, "m"),
         "rotation": _statistics(rotation_errors, "deg"),
         "separation": _statistics(separation_errors, "m"),

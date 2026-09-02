@@ -156,6 +156,8 @@ private:
     int _loop_frame_thres;
     double _pcm_local_rotation_stddev_rad;
     double _pcm_local_translation_stddev_m;
+    double _pcm_max_translation_residual_m = 0.0;
+    double _pcm_max_rotation_residual_rad = 0.0;
 
     liorf::registration::Config _registration_config;
 
@@ -489,6 +491,10 @@ private:
             "mapfusion.interRobot.pcm_local_rotation_stddev_rad", 0.05);
         _pcm_local_translation_stddev_m = declare_and_get<double>(
             "mapfusion.interRobot.pcm_local_translation_stddev_m", 0.20);
+        _pcm_max_translation_residual_m = declare_and_get<double>(
+            "mapfusion.interRobot.pcm_max_translation_residual_m", 0.0);
+        _pcm_max_rotation_residual_rad = declare_and_get<double>(
+            "mapfusion.interRobot.pcm_max_rotation_residual_rad", 0.0);
         // Floor on the map-alignment uncertainty, and the value used outright
         // when the alignment's marginal cannot be recovered. The alignment
         // also carries error this estimator does not model, so it is never
@@ -611,7 +617,11 @@ private:
             !std::isfinite(_pcm_local_rotation_stddev_rad) ||
             _pcm_local_rotation_stddev_rad <= 0.0 ||
             !std::isfinite(_pcm_local_translation_stddev_m) ||
-            _pcm_local_translation_stddev_m <= 0.0) {
+            _pcm_local_translation_stddev_m <= 0.0 ||
+            !std::isfinite(_pcm_max_translation_residual_m) ||
+            _pcm_max_translation_residual_m < 0.0 ||
+            !std::isfinite(_pcm_max_rotation_residual_rad) ||
+            _pcm_max_rotation_residual_rad < 0.0) {
             throw std::invalid_argument(
                 "mapfusion PCM threshold/uncertainty values are invalid");
         }
@@ -624,6 +634,12 @@ private:
                     std::string("diagnostic_qos_depth must be positive") :
                     commitment_error));
         }
+        RCLCPP_INFO(
+            get_logger(),
+            "PCM pair gate: Mahalanobis < %.3f, translation <= %.3f m "
+            "and rotation <= %.3f rad (zero disables an absolute ceiling)",
+            _pcm_thres, _pcm_max_translation_residual_m,
+            _pcm_max_rotation_residual_rad);
 
         if (!std::isfinite(_map_alignment_rotation_stddev_rad) ||
             _map_alignment_rotation_stddev_rad <= 0.0 ||
@@ -2326,8 +2342,10 @@ private:
                     z_ai_aj, z_bk_bl,
                     _pcm_local_rotation_stddev_rad,
                     _pcm_local_translation_stddev_m);
-                if (residual.valid &&
-                    residual.mahalanobis_distance < _pcm_thres)
+                if (liorf::uncertainty::pcmResidualPassesGate(
+                        residual, _pcm_thres,
+                        _pcm_max_translation_residual_m,
+                        _pcm_max_rotation_residual_rad))
                     PCMMat(i,j) = 1;
                 else
                     PCMMat(i,j) = 0;

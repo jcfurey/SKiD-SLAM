@@ -166,4 +166,33 @@ PcmResidual pcmResidual(
   return result;
 }
 
+bool pcmResidualPassesGate(
+  const PcmResidual& residual,
+  double max_mahalanobis_distance,
+  double max_translation_residual_m,
+  double max_rotation_residual_rad) noexcept {
+  if (!residual.valid ||
+      !std::isfinite(residual.mahalanobis_distance) ||
+      !std::isfinite(max_mahalanobis_distance) ||
+      !std::isfinite(max_translation_residual_m) ||
+      !std::isfinite(max_rotation_residual_rad) ||
+      max_mahalanobis_distance <= 0.0 ||
+      max_translation_residual_m < 0.0 ||
+      max_rotation_residual_rad < 0.0 ||
+      residual.mahalanobis_distance >= max_mahalanobis_distance) {
+    return false;
+  }
+
+  const double translation_residual_m = residual.pose.translation().norm();
+  const double rotation_residual_rad = residual.tangent.head<3>().norm();
+  if (!std::isfinite(translation_residual_m) ||
+      !std::isfinite(rotation_residual_rad)) {
+    return false;
+  }
+  return (max_translation_residual_m == 0.0 ||
+          translation_residual_m <= max_translation_residual_m) &&
+         (max_rotation_residual_rad == 0.0 ||
+          rotation_residual_rad <= max_rotation_residual_rad);
+}
+
 }  // namespace liorf::uncertainty

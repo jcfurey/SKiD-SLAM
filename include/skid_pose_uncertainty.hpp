@@ -61,4 +61,14 @@ PcmResidual pcmResidual(
   double local_rotation_stddev_rad,
   double local_translation_stddev_m);
 
+// Apply the covariance-normalized Equation (11) gate together with optional
+// absolute cycle-error ceilings. A zero absolute ceiling disables that axis.
+// The independent ceilings prevent an extremely uncertain registration from
+// making an arbitrarily large geometric inconsistency look acceptable.
+bool pcmResidualPassesGate(
+  const PcmResidual& residual,
+  double max_mahalanobis_distance,
+  double max_translation_residual_m,
+  double max_rotation_residual_rad) noexcept;
+
 }  // namespace liorf::uncertainty
