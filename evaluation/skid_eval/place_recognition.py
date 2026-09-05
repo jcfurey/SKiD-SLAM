@@ -1,5 +1,7 @@
 """Place-recognition precision and recall."""
 
+import math
+
 from . import linalg
 
 
@@ -16,6 +18,8 @@ class Candidate:
         self.query_time = float(query_time)
         self.match_time = float(match_time)
         self.score = float(score)
+        if not all(math.isfinite(value) for value in (self.query_time, self.match_time, self.score)):
+            raise ValueError("candidate times and score must be finite")
         self.is_true_loop = is_true_loop
 
 

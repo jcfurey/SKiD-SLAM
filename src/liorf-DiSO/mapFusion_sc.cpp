@@ -1,3 +1,4 @@
+#include "skid_message_validation.hpp"
 //
 // Created by yewei on 8/31/20.
 //
@@ -158,9 +159,9 @@ private:
     pcl::PointCloud<PointType>::Ptr _laser_cloud_surface;
 
     //global variables for sc
-    Nabo::NNSearchF* _nns = NULL; //KDtree
+    std::unique_ptr<Nabo::NNSearchF> _nns; //KDtree
     Eigen::MatrixXf _target_matrix;
-    ScanContext *_scan_context_factory;
+    std::unique_ptr<ScanContext> _scan_context_factory;
 
     std::vector<int> _robot_received_list;
     std::vector<std::pair<int, int>> _idx_nearest_list;
@@ -333,7 +334,7 @@ private:
         // _laser_cloud_corner.reset(new pcl::PointCloud<PointType>());
         _laser_cloud_surface.reset(new pcl::PointCloud<PointType>());
 
-        _scan_context_factory = new ScanContext(_max_range, _knn_feature_dim, _num_sectors);
+        _scan_context_factory = std::make_unique<ScanContext>(_max_range, _knn_feature_dim, _num_sectors);
 
         _kdtree_pose_to_publish.reset(new pcl::KdTreeFLANN<PointType>());
         _cloud_pose_to_publish.reset(new pcl::PointCloud<PointType>());
@@ -666,6 +667,13 @@ private:
     }
 
     void scanContextInfoHandler(const liorf::msg::ContextInfo::ConstSharedPtr& msgIn){
+        if (!liorf::messages::validContext(*msgIn, _knn_feature_dim, _num_sectors, false)) {
+            RCLCPP_WARN(get_logger(), "Rejected malformed descriptor announcement");
+            return;
+        }
+        if (msgIn->robot_id != _robot_id && msgIn->robot_id != _signal_id_1 &&
+            msgIn->robot_id != _signal_id_2)
+            return;
         liorf::msg::ContextInfo context_info_input = *msgIn;
         //load the data received
         if (!_communication_signal)
@@ -814,7 +822,7 @@ private:
         _target_matrix.block(0, _num_bin-1, _knn_feature_dim, 1) =
             bin.ringkey.block(0, 0, _knn_feature_dim, 1);
         //add the target matrix to nns
-        _nns = Nabo::NNSearchF::createKDTreeLinearHeap(_target_matrix);
+        _nns.reset(Nabo::NNSearchF::createKDTreeLinearHeap(_target_matrix));
     }
 
     void KNNSearch(ScanContextBin bin){
@@ -1020,7 +1028,7 @@ private:
                 num_col_engaged++;
             }
             //devided by num_col_engaged: So, even if there are many columns that are excluded from the calculation, we can get high scores if other columns are well fit.
-            sim_for_each_cols(i) = sum_of_cos_sim / float(num_col_engaged);
+            sim_for_each_cols(i) = num_col_engaged ? sum_of_cos_sim / float(num_col_engaged) : 0.0f;
 
         }
         Eigen::VectorXf::Index idx_max;

@@ -181,3 +181,39 @@ TEST(SkidSolidDescriptor, RetrievesTheRotatedRevisitFromAnIndex) {
   EXPECT_EQ(0u, candidates[0].index);
   EXPECT_NEAR(0.0F, candidates[0].range_distance, 1.0e-5F);
 }
+
+TEST(SkidSolidDescriptor, IgnoresInvalidAndOutOfRangePoints) {
+  auto cloud = makeScene(0);
+  const auto expected = liorf::solid::describe(cloud, testParams());
+  pcl::PointXYZI invalid;
+  invalid.x = std::numeric_limits<float>::quiet_NaN();
+  invalid.y = invalid.z = 0;
+  cloud->push_back(invalid);
+  addPoint(cloud, 1000, 15, 0);
+  addPoint(cloud, 10, 15, 80);
+  const auto actual = liorf::solid::describe(cloud, testParams());
+  ASSERT_TRUE(actual.sized(kRangeBins, kSectors));
+  EXPECT_TRUE(actual.range.isApprox(expected.range));
+  EXPECT_TRUE(actual.angular.isApprox(expected.angular));
+}
+
+TEST(SkidSolidDescriptor, SupportsSectorCountsThatDoNotDivide360) {
+  auto params = testParams();
+  params.num_sectors = 37;
+  PointCloud::Ptr original(new PointCloud()), rotated(new PointCloud());
+  for (int sector = 0; sector < 37; ++sector) {
+    for (int height = 0; height < kHeights; ++height) {
+      const double elevation = kFovDown + (height + 0.5) * (kFovUp - kFovDown) / kHeights;
+      for (int count = 0; count <= height + sector % 7; ++count) {
+        addPoint(original, 3.0 + 2 * count, (sector + 0.5) * 360.0 / 37, elevation);
+        addPoint(rotated, 3.0 + 2 * count, (sector + 1.5) * 360.0 / 37, elevation);
+      }
+    }
+  }
+  const auto first = liorf::solid::describe(original, params);
+  const auto second = liorf::solid::describe(rotated, params);
+  ASSERT_TRUE(first.sized(kRangeBins, 37));
+  ASSERT_TRUE(second.sized(kRangeBins, 37));
+  for (int sector = 0; sector < 37; ++sector)
+    EXPECT_NEAR(first.angular[sector], second.angular[(sector + 1) % 37], 1e-3);
+}

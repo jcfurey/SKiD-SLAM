@@ -59,12 +59,14 @@ std::string validate(const Config& config);
 struct ScanKey {
   std::string robot_id;
   std::int64_t keyframe_index = -1;
+  std::uint64_t trajectory_epoch = 0;
 
   bool valid() const noexcept;
   std::string str() const;
 
   bool operator==(const ScanKey& other) const noexcept {
-    return keyframe_index == other.keyframe_index && robot_id == other.robot_id;
+    return keyframe_index == other.keyframe_index && robot_id == other.robot_id &&
+        trajectory_epoch == other.trajectory_epoch;
   }
   bool operator!=(const ScanKey& other) const noexcept {
     return !(*this == other);

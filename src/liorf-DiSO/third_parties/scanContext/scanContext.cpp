@@ -41,7 +41,9 @@ Eigen::MatrixXf ScanContext::ptCloud2ScanContext(pcl::PointCloud<PointType>::Ptr
   for (int i = 0; i < num_points; ++i){
     //point info
     PointType point_this = pt_cloud->points[i];
-    float range = sqrt(point_this.x*point_this.x + point_this.y*point_this.y);
+    if (!std::isfinite(point_this.x) || !std::isfinite(point_this.y) || !std::isfinite(point_this.z)) continue;
+    float range = std::hypot(point_this.x, point_this.y);
+    if (range <= 0.0f || range > _max_range) continue;
     float theta = xy2Theta(point_this.x, point_this.y);
 
     //find corresponding ring index
@@ -88,16 +90,7 @@ Eigen::VectorXf ScanContext::scanContext2RingKey(Eigen::MatrixXf sc_bin){
   return ringkey;
 }
 
-float ScanContext::xy2Theta(float x, float y){
-  if ( x>=0 && y>=0)
-    return 180/M_PI * atan(y/x);
-
-  if ( x<0 && y>=0)
-    return 180 - ((180/M_PI) * atan(y/(-x)));
-
-  if (x < 0 && y < 0)
-    return 180 + ((180/M_PI) * atan(y/x));
-
-  if ( x >= 0 && y < 0)
-    return 360 - ((180/M_PI) * atan((-y)/x));
+float ScanContext::xy2Theta(float x, float y) {
+  const float degrees = std::atan2(y, x) * (180.0f / static_cast<float>(M_PI));
+  return degrees < 0.0f ? degrees + 360.0f : degrees;
 }

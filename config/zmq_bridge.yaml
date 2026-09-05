@@ -41,15 +41,12 @@
       # A PCM update can release several direct graph factors in one burst.
       qos_depth: 100
 
-      # A topic bridged both ways loops, so the bridge remembers what it
-      # injected locally and drops the echo. The window only has to cover a
-      # round trip through the local ROS graph.
-      echo_suppressor_capacity: 256
-      echo_suppressor_window_s: 5.0
+      # Injected echoes are identified by their ROS publisher GID.
+      # Byte-identical retransmissions from other publishers remain valid.
 
       # Leave empty to carry the inter-robot set derived from
       # mapfusion.interRobot.solid_topic: context_info, scan_request,
-      # scan_data, loop_info_global and trans_odom. Override both lists
+      # scan_data, loop_info_global, graph_state, alignment_state and trans_odom. Override both lists
       # together to carry something else; they must be the same length.
       topics: []
       topic_types: []

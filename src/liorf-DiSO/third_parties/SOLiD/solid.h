@@ -14,6 +14,7 @@
 #include <pcl/registration/gicp.h>
 
 #include <vector>
+#include <cstdint>
 #include <cmath>
 #include <iostream>
 #include <fstream>
@@ -42,10 +43,12 @@ typedef PointXYZIRPYT  PointTypePose;
 struct SOLiDBin
 {
     std::string robotname;
+    std::int64_t keyframe_index = -1;
+    std::uint64_t trajectory_epoch = 0;
 
-    double time;
+    double time = 0.0;
 
-    PointTypePose pose;
+    PointTypePose pose{};
 
     pcl::PointCloud<PointType>::Ptr cloud;
 

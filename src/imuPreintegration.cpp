@@ -1,3 +1,5 @@
+#include "liorf/msg/alignment_state.hpp"
+#include "loop_constraint_utils.hpp"
 #include "utility.h"
 
 #include <gtsam/geometry/Rot3.h>
@@ -34,6 +36,8 @@ public:
     // never the local map -> odom correction.
     std::string _fusion_topic;
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr subFusionTrans;
+    rclcpp::Subscription<liorf::msg::AlignmentState>::SharedPtr subAlignmentState;
+    std::pair<std::uint64_t, std::uint64_t> alignmentVersion{0, 0};
 
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr subImuOdometry;
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr subLaserOdometryGlobal;
@@ -95,6 +99,21 @@ public:
 
         if (!mapFusionFrameId.empty() && !mapFusionAnchor)
         {
+            subAlignmentState = create_subscription<liorf::msg::AlignmentState>(
+                prefixTopic(robot_id, _fusion_topic + "/alignment_state"), rclcpp::QoS(100),
+                [this](const liorf::msg::AlignmentState::ConstSharedPtr& state) {
+                    const auto version = std::make_pair(state->authority_epoch, state->revision);
+                    if (state->authority_id != robot_id || state->authority_epoch == 0 ||
+                        state->revision == 0 || version <= alignmentVersion) return;
+                    if (state->valid && !liorf::loop_constraint::validPoseMessage(state->alignment.pose.pose)) return;
+                    if (state->valid) {
+                        applyFusionTransform(std::make_shared<nav_msgs::msg::Odometry>(state->alignment));
+                    } else {
+                        std::lock_guard<std::mutex> lock(mtx);
+                        fleetToMapAvailable = false;
+                    }
+                    alignmentVersion = version;
+                }, subOpt);
             subFusionTrans = create_subscription<nav_msgs::msg::Odometry>(
                 prefixTopic(robot_id, _fusion_topic + "/trans_map"), rclcpp::QoS(20),
                 std::bind(&TransformFusion::FusionTransHandler, this,
@@ -214,6 +233,13 @@ public:
 
     void FusionTransHandler(const nav_msgs::msg::Odometry::SharedPtr odomMsg)
     {
+        if (alignmentVersion.first != 0) return;
+        applyFusionTransform(odomMsg);
+    }
+
+    void applyFusionTransform(const nav_msgs::msg::Odometry::SharedPtr odomMsg)
+    {
+        if (!liorf::loop_constraint::validPoseMessage(odomMsg->pose.pose)) return;
         const std::string parent =
             liorf::frames::normalizeFrameId(odomMsg->header.frame_id);
         const std::string child =

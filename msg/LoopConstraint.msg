@@ -4,10 +4,20 @@
 # poses from the sparse remote poses in paper Equation (6). Legacy same-robot
 # producers set both endpoint IDs to robot_id.
 std_msgs/Header header
+# Revision authority is the observing map-fusion process. Epochs use system
+# time (nanoseconds), never simulated ROS time. A later epoch replaces every
+# claim from an earlier process with the same authority_id.
+# revision == 0 denotes the legacy, non-retractable contract.
+string authority_id
+uint64 authority_epoch
+uint64 revision
+bool retracted
 string robot_id
 string from_robot_id
+uint64 from_trajectory_epoch
 int64 index_from
 string to_robot_id
+uint64 to_trajectory_epoch
 int64 index_to
 
 # Endpoint estimates in each endpoint owner's own map frame. Their absolute

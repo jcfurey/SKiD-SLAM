@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <stdexcept>
 
 #include <gtsam/geometry/Pose3.h>
 
@@ -40,12 +41,13 @@ inline geometry_msgs::msg::Pose poseToMessage(const gtsam::Pose3& pose) {
 }
 
 inline gtsam::Pose3 poseFromMessage(const geometry_msgs::msg::Pose& message) {
+  if (!validPoseMessage(message))
+    throw std::invalid_argument("invalid pose message");
+  const Eigen::Quaterniond quaternion = Eigen::Quaterniond(
+      message.orientation.w, message.orientation.x,
+      message.orientation.y, message.orientation.z).normalized();
   return gtsam::Pose3(
-    gtsam::Rot3::Quaternion(
-      message.orientation.w,
-      message.orientation.x,
-      message.orientation.y,
-      message.orientation.z),
+    gtsam::Rot3(quaternion),
     gtsam::Point3(
       message.position.x,
       message.position.y,

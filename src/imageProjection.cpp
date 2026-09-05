@@ -1,4 +1,5 @@
 #include "utility.h"
+#include "skid_message_validation.hpp"
 #include "liorf/msg/cloud_info.hpp"
 // <!-- liorf_localization_yjz_lucky_boy -->
 struct VelodynePointXYZIRT
@@ -228,13 +229,20 @@ public:
         sensor_msgs::msg::Imu thisImu = imuConverter(*imuMsg);
 
         std::lock_guard<std::mutex> lock1(imuLock);
+        if (!imuQueue.empty() && stamp2Sec(thisImu.header.stamp) <=
+                stamp2Sec(imuQueue.back().header.stamp))
+            return;
         imuQueue.push_back(thisImu);
+        while (imuQueue.size() > static_cast<std::size_t>(queueLength))
+            imuQueue.pop_front();
     }
 
     void odometryHandler(const nav_msgs::msg::Odometry::SharedPtr odometryMsg)
     {
         std::lock_guard<std::mutex> lock2(odoLock);
         odomQueue.push_back(*odometryMsg);
+        while (odomQueue.size() > static_cast<std::size_t>(queueLength))
+            odomQueue.pop_front();
     }
 
     void cloudHandler(const sensor_msgs::msg::PointCloud2::SharedPtr laserCloudMsg)
@@ -254,6 +262,10 @@ public:
 
     bool cachePointCloud(const sensor_msgs::msg::PointCloud2::SharedPtr& laserCloudMsg)
     {
+        if (!liorf::messages::validCloud(*laserCloudMsg)) {
+            RCLCPP_WARN(get_logger(), "Skipping a malformed point cloud");
+            return false;
+        }
         // cache point cloud
         cloudQueue.push_back(*laserCloudMsg);
         if (cloudQueue.size() <= 2)
@@ -527,7 +539,7 @@ public:
 
         imuPointerCur = 0;
 
-        for (int i = 0; i < (int)imuQueue.size(); ++i)
+        for (int i = 0; i < (int)imuQueue.size() && imuPointerCur < queueLength; ++i)
         {
             sensor_msgs::msg::Imu thisImuMsg = imuQueue[i];
             double currentImuTime = stamp2Sec(thisImuMsg.header.stamp);

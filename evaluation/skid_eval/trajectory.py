@@ -21,6 +21,11 @@ class Pose:
         self.time = float(time)
         self.translation = tuple(float(value) for value in translation)
         self.rotation = tuple(tuple(float(v) for v in row) for row in rotation)
+        if (len(self.translation) != 3 or len(self.rotation) != 3 or
+                any(len(row) != 3 for row in self.rotation) or
+                not all(math.isfinite(value) for value in
+                        (self.time, *self.translation, *(v for row in self.rotation for v in row)))):
+            raise ValueError("pose coordinates and timestamp must be finite with 3D dimensions")
 
     @classmethod
     def from_quaternion(cls, time, translation, quaternion):
@@ -116,6 +121,8 @@ def parse_tum(lines):
         except ValueError as error:
             raise ValueError(f"line {number}: {error}") from error
 
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError(f"line {number}: pose values must be finite")
         quaternion = tuple(values[4:8])
         if math.sqrt(sum(v * v for v in quaternion)) < 1e-9:
             raise ValueError(f"line {number}: quaternion has zero norm")

@@ -14,3 +14,4 @@ string robot_id_receive
 
 # Keyframe index within the owning robot's trajectory.
 int64 keyframe_index
+uint64 trajectory_epoch

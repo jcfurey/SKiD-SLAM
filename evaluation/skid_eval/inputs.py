@@ -5,6 +5,7 @@ script, by a log scraper, or by hand, and diffed in review.
 """
 
 import csv
+import math
 
 from .place_recognition import Candidate
 from .trajectory import Pose
@@ -24,8 +25,10 @@ def read_candidates(path):
             if label in (None, ""):
                 is_true_loop = None
             else:
-                is_true_loop = str(label).strip().lower() in {
-                    "1", "true", "yes"}
+                normalized = str(label).strip().lower()
+                if normalized not in {"1", "true", "yes", "0", "false", "no"}:
+                    raise ValueError(f"{path} line {number}: invalid boolean label {label!r}")
+                is_true_loop = normalized in {"1", "true", "yes"}
             candidates.append(Candidate(
                 row["query_time"], row["match_time"], row["score"],
                 is_true_loop))
@@ -50,6 +53,8 @@ def read_registrations(path):
                 raise ValueError(
                     f"{path} line {number}: missing {', '.join(missing)}")
             values = {key: float(row[key]) for key in fields}
+            if not all(math.isfinite(value) for value in values.values()):
+                raise ValueError(f"{path} line {number}: registration values must be finite")
             pose = Pose.from_quaternion(
                 values["query_time"],
                 (values["tx"], values["ty"], values["tz"]),

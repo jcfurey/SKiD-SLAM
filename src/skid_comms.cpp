@@ -57,7 +57,8 @@ std::size_t ScanKeyHash::operator()(const ScanKey& key) const noexcept {
   const std::size_t robot = std::hash<std::string>()(key.robot_id);
   const std::size_t index =
     std::hash<std::int64_t>()(key.keyframe_index);
-  return robot ^ (index + 0x9e3779b97f4a7c15ULL + (robot << 6) + (robot >> 2));
+  const auto pair = robot ^ (index + 0x9e3779b97f4a7c15ULL + (robot << 6) + (robot >> 2));
+  return pair ^ std::hash<std::uint64_t>()(key.trajectory_epoch);
 }
 
 const char* toString(RequestDecision decision) noexcept {

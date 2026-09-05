@@ -18,9 +18,11 @@ from .metrics import Statistics
 class Endpoint:
     robot_id: str
     keyframe_index: int
+    trajectory_epoch: int = 0
 
     def label(self):
-        return f"{self.robot_id}/{self.keyframe_index}"
+        suffix = f"@{self.trajectory_epoch}" if self.trajectory_epoch else ""
+        return f"{self.robot_id}/{self.keyframe_index}{suffix}"
 
 
 @dataclass(frozen=True)
@@ -29,6 +31,11 @@ class Factor:
     from_endpoint: Endpoint
     to_endpoint: Endpoint
     relative_pose: object
+    authority_id: str = ""
+    authority_epoch: int = 0
+    revision: int = 0
+    retracted: bool = False
+    covariance: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -85,6 +92,68 @@ def index_factor_deliveries(factors, translation_tolerance_m=1.0e-6,
     return indexed, duplicate_count, duplicate_conflicts
 
 
+def resolve_factor_revisions(factors, translation_tolerance_m=1e-6,
+                             rotation_tolerance_deg=1e-5):
+    """Resolve final graph state while retaining evidence of conflicting replays.
+
+    Legacy messages remain strict: duplicates without a revision are errors.
+    Modern messages use per-authority generations and per-pair revisions.
+    """
+    epochs = {}
+    owner_epochs = {}
+    for factor in factors:
+        if factor.revision:
+            epochs[factor.authority_id] = max(
+                epochs.get(factor.authority_id, 0), factor.authority_epoch)
+            for endpoint in (factor.from_endpoint, factor.to_endpoint):
+                owner_epochs[endpoint.robot_id] = max(
+                    owner_epochs.get(endpoint.robot_id, 0), endpoint.trajectory_epoch)
+    latest = {}
+    seen = {}
+    legacy = []
+    conflicts = []
+    replays = 0
+    for factor in factors:
+        if not factor.revision:
+            legacy.append(factor)
+            continue
+        identity, pose = canonical_factor(factor)
+        claim = identity, factor.authority_id
+        version = claim, factor.authority_epoch, factor.revision
+        previous = seen.get(version)
+        if previous is not None:
+            replays += 1
+            _, previous_pose = canonical_factor(previous)
+            translation, rotation = pose_difference(previous_pose, pose)
+            if (factor.retracted != previous.retracted or
+                    translation > translation_tolerance_m or
+                    rotation > rotation_tolerance_deg or
+                    factor.covariance != previous.covariance):
+                conflicts.append({"factor": factor_label(identity),
+                                  "reason": "conflicting_revision_payload"})
+        else:
+            seen[version] = factor
+        if factor.authority_epoch != epochs[factor.authority_id]:
+            continue
+        if any(endpoint.trajectory_epoch != owner_epochs[endpoint.robot_id]
+               for endpoint in (factor.from_endpoint, factor.to_endpoint)):
+            continue
+        previous = latest.get(claim)
+        if previous is None or factor.revision > previous.revision:
+            latest[claim] = factor
+    active = {}
+    for (identity, authority), factor in sorted(latest.items()):
+        if not factor.retracted and identity not in active:
+            active[identity] = factor
+    modern_ids = {claim[0] for claim in latest}
+    resolved = [factor for factor in legacy
+                if canonical_factor(factor)[0] not in modern_ids] + list(active.values())
+    versions = [(factor_label(identity), authority, factor.authority_epoch,
+                 factor.revision, factor.retracted, factor.covariance)
+                for (identity, authority), factor in sorted(latest.items())]
+    return resolved, replays, conflicts, versions
+
+
 def compare_factor_deliveries(deliveries, translation_tolerance_m=1.0e-6,
                               rotation_tolerance_deg=1.0e-5):
     """Verify that every topic received the same oriented measurements."""
@@ -95,16 +164,24 @@ def compare_factor_deliveries(deliveries, translation_tolerance_m=1.0e-6,
     topic_summary = {}
     duplicate_conflicts = []
     duplicate_messages = 0
+    replay_messages = 0
+    revision_states = {}
     recipients_by_factor = collections.defaultdict(set)
     recipient_errors = []
-    for topic, factors in sorted(deliveries.items()):
+    for topic, raw_factors in sorted(deliveries.items()):
+        factors, replays, revision_conflicts, revisions = resolve_factor_revisions(
+            raw_factors, translation_tolerance_m, rotation_tolerance_deg)
+        replay_messages += replays
+        revision_states[topic] = revisions
         values, duplicates, conflicts = index_factor_deliveries(
             factors, translation_tolerance_m, rotation_tolerance_deg)
+        conflicts.extend(revision_conflicts)
         indexed[topic] = values
         duplicate_messages += duplicates
         topic_recipients = sorted(set(factor.recipient for factor in factors))
         topic_summary[topic] = {
-            "messages": len(factors),
+            "messages": len(raw_factors),
+            "replays": replays,
             "unique_factors": len(values),
             "duplicates": duplicates,
             "recipients": topic_recipients,
@@ -169,9 +246,11 @@ def compare_factor_deliveries(deliveries, translation_tolerance_m=1.0e-6,
                 "expected": sorted(expected),
             })
 
+    revision_mismatches = [topic for topic in sorted(revision_states)
+                           if revision_states[topic] != revision_states[baseline_topic]]
     symmetric = not (
         missing or extra or measurement_mismatches or duplicate_conflicts or
-        duplicate_messages or recipient_errors)
+        duplicate_messages or recipient_errors or revision_mismatches)
     return {
         "symmetric": symmetric,
         "baseline_topic": baseline_topic,
@@ -181,6 +260,8 @@ def compare_factor_deliveries(deliveries, translation_tolerance_m=1.0e-6,
         "measurement_mismatches": measurement_mismatches,
         "duplicate_conflicts": duplicate_conflicts,
         "duplicate_messages": duplicate_messages,
+        "replay_messages": replay_messages,
+        "revision_mismatches": revision_mismatches,
         "recipient_errors": recipient_errors,
     }, baseline
 
@@ -203,9 +284,9 @@ def collect_endpoint_timestamps(observations, tolerance_s=1.0e-6):
 
     by_robot = collections.defaultdict(list)
     for endpoint, timestamp in endpoint_times.items():
-        by_robot[endpoint.robot_id].append((endpoint.keyframe_index, timestamp))
+        by_robot[(endpoint.robot_id, endpoint.trajectory_epoch)].append((endpoint.keyframe_index, timestamp))
     monotonicity_violations = []
-    for robot_id, values in sorted(by_robot.items()):
+    for (robot_id, epoch), values in sorted(by_robot.items()):
         values.sort()
         for previous, current in zip(values, values[1:]):
             if current[1] + tolerance_s < previous[1]:

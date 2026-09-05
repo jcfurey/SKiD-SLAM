@@ -27,6 +27,8 @@ _DEFAULT_TOPIC_LOGS = (
     "bridging /solid/scan_data (liorf/msg/ScanData)",
     "bridging /solid/loop_info_global (liorf/msg/LoopConstraint)",
     "bridging /solid/trans_odom (nav_msgs/msg/Odometry)",
+    "bridging /solid/graph_state (liorf/msg/GraphState)",
+    "bridging /solid/alignment_state (liorf/msg/AlignmentState)",
 )
 _HEALTHY_REPORT = re.compile(
     r"sent 1 msg .* received 1 msg .* dropped own 0, topic mismatch 0, "

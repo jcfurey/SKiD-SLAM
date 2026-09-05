@@ -446,3 +446,13 @@ TEST(SkidCommsTransferStats, IgnoresUnusableLatencySamples) {
   EXPECT_EQ(0u, stats.messagesSent());
   EXPECT_TRUE(std::isnan(stats.maxLatencySeconds()));
 }
+
+TEST(SkidScanIdentity, ReusedKeyframesAfterRestartCannotHitAnOldCacheEntry) {
+  const liorf::comms::ScanKey old{"robot", 7, 100};
+  const liorf::comms::ScanKey fresh{"robot", 7, 101};
+  liorf::comms::ScanCache cache(liorf::comms::Config{});
+  cache.insert(old, 1024);
+  EXPECT_TRUE(cache.contains(old));
+  EXPECT_FALSE(cache.contains(fresh));
+  EXPECT_NE(old, fresh);
+}

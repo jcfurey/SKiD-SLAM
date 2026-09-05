@@ -42,6 +42,8 @@ const std::vector<std::pair<std::string, std::string>> kDefaultTopics = {
   {"/scan_request", "liorf/msg/ScanRequest"},
   {"/scan_data", "liorf/msg/ScanData"},
   {"/loop_info_global", "liorf/msg/LoopConstraint"},
+  {"/graph_state", "liorf/msg/GraphState"},
+  {"/alignment_state", "liorf/msg/AlignmentState"},
   {"/trans_odom", "nav_msgs/msg/Odometry"},
 };
 
@@ -82,9 +84,14 @@ class ZmqBridge : public rclcpp::Node {
       "zmq.topics", std::vector<std::string>{});
     auto types = declare_and_get<std::vector<std::string>>(
       "zmq.topic_types", std::vector<std::string>{});
+    if (names.empty() && !types.empty())
+      throw std::invalid_argument("zmq.topic_types requires matching zmq.topics");
     if (names.empty()) {
       for (const auto & entry : kDefaultTopics) {
-        names.push_back("/" + solid_topic + entry.first);
+        const auto begin = solid_topic.find_first_not_of('/');
+        const auto end = solid_topic.find_last_not_of('/');
+        if (begin == std::string::npos) throw std::invalid_argument("solid_topic must not be empty");
+        names.push_back("/" + solid_topic.substr(begin, end - begin + 1) + entry.first);
         types.push_back(entry.second);
       }
     }
@@ -105,17 +112,6 @@ class ZmqBridge : public rclcpp::Node {
         "ZeroMQ transport failed to start: " + _transport->error());
     }
 
-    const int echo_capacity =
-      declare_and_get<int>("zmq.echo_suppressor_capacity", 256);
-    const double echo_window =
-      declare_and_get<double>("zmq.echo_suppressor_window_s", 5.0);
-    if (echo_capacity < 1 || !std::isfinite(echo_window) || echo_window <= 0.0) {
-      throw std::invalid_argument(
-        "zmq.echo_suppressor_capacity and _window_s must be positive");
-    }
-    _echo = std::make_unique<liorf::transport::EchoSuppressor>(
-      static_cast<std::size_t>(echo_capacity), echo_window);
-
     const int qos_depth = declare_and_get<int>("zmq.qos_depth", 100);
     if (qos_depth < 1) {
       throw std::invalid_argument("zmq.qos_depth must be at least 1");
@@ -129,7 +125,16 @@ class ZmqBridge : public rclcpp::Node {
       _publishers[name] = create_generic_publisher(name, type, qos);
       _subscriptions.push_back(create_generic_subscription(
         name, type, qos,
-        [this, name](std::shared_ptr<rclcpp::SerializedMessage> message) {
+        [this, name](std::shared_ptr<rclcpp::SerializedMessage> message,
+                     const rclcpp::MessageInfo& info) {
+          // Publisher identity distinguishes an injected echo from a valid,
+          // byte-identical replay. A payload cache cannot make that distinction.
+          const auto& own = _publishers.at(name)->get_gid();
+          const auto& sender = info.get_rmw_message_info().publisher_gid;
+          if (std::memcmp(own.data, sender.data, RMW_GID_STORAGE_SIZE) == 0) {
+            ++_echoes_suppressed;
+            return;
+          }
           forwardToPeers(name, *message);
         }));
       RCLCPP_INFO(get_logger(), "bridging %s (%s)", name.c_str(), type.c_str());
@@ -178,9 +183,6 @@ class ZmqBridge : public rclcpp::Node {
 
     // A message this bridge injected locally must not go straight back out:
     // that is the two-way bridging loop, and it amplifies without bound.
-    if (_echo->isEcho(topic, payload, size, nowSeconds())) {
-      return;
-    }
     if (!_transport->publish(topic, payload, size)) {
       RCLCPP_DEBUG(get_logger(), "dropped an outbound message on %s",
                    topic.c_str());
@@ -196,9 +198,6 @@ class ZmqBridge : public rclcpp::Node {
         continue;
       }
 
-      _echo->remember(message.topic, message.payload.data(),
-                      message.payload.size(), nowSeconds());
-
       rclcpp::SerializedMessage serialized(message.payload.size());
       auto & raw = serialized.get_rcl_serialized_message();
       std::memcpy(raw.buffer, message.payload.data(), message.payload.size());
@@ -207,7 +206,6 @@ class ZmqBridge : public rclcpp::Node {
     }
   }
 
-  double nowSeconds() const { return this->now().seconds(); }
 
   void report() {
     const auto & statistics = _transport->statistics();
@@ -225,11 +223,11 @@ class ZmqBridge : public rclcpp::Node {
       static_cast<unsigned long>(statistics.dropped_oversize),
       static_cast<unsigned long>(statistics.dropped_malformed),
       static_cast<unsigned long>(statistics.send_failures),
-      _echo->suppressed());
+      _echoes_suppressed);
   }
 
   std::unique_ptr<liorf::transport::PeerTransport> _transport;
-  std::unique_ptr<liorf::transport::EchoSuppressor> _echo;
+  std::size_t _echoes_suppressed = 0;
   std::map<std::string, std::shared_ptr<rclcpp::GenericPublisher>> _publishers;
   std::vector<std::shared_ptr<rclcpp::GenericSubscription>> _subscriptions;
   rclcpp::TimerBase::SharedPtr _poll_timer;

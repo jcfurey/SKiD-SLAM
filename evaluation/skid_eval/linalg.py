@@ -115,7 +115,9 @@ def jacobi_eigen(matrix, max_sweeps=100, tolerance=1e-14):
 def quaternion_to_matrix(quaternion):
     """Rotation matrix for a quaternion given as (x, y, z, w)."""
     x, y, z, w = quaternion
-    length = math.sqrt(x * x + y * y + z * z + w * w)
+    length = math.hypot(x, y, z, w)
+    if not math.isfinite(length):
+        raise ValueError("quaternion must be finite")
     if length == 0.0:
         raise ValueError("zero-norm quaternion")
     x, y, z, w = x / length, y / length, z / length, w / length

@@ -36,18 +36,9 @@ SOLiDBin SOLiD::ptcloud2bin(pcl::PointCloud<PointType>::Ptr pt_cloud,
   return solid_bin;
 }
 
-float SOLiD::xy2Theta(float x, float y){
-  if ( x>=0 && y>=0)
-    return 180/M_PI * atan(y/x);
-
-  if ( x<0 && y>=0)
-    return 180 - ((180/M_PI) * atan(y/(-x)));
-
-  if (x < 0 && y < 0)
-    return 180 + ((180/M_PI) * atan(y/x));
-
-  if ( x >= 0 && y < 0)
-    return 360 - ((180/M_PI) * atan((-y)/x));
+float SOLiD::xy2Theta(float x, float y) {
+  const float degrees = std::atan2(y, x) * (180.0f / static_cast<float>(M_PI));
+  return degrees < 0.0f ? degrees + 360.0f : degrees;
 }
 
 // =======================================================================================================================
@@ -61,6 +52,9 @@ std::pair<Eigen::VectorXf, Eigen::VectorXf> SOLiD::ptCloud2SOLiD(pcl::PointCloud
                                                                  float FOV_d,
                                                                  int MAX_DISTANCE) 
 {
+    if (!pt_cloud || NUM_RANGE <= 0 || NUM_ANGLE <= 0 || NUM_HEIGHT <= 0 ||
+        MAX_DISTANCE <= 0 || !std::isfinite(FOV_u) || !std::isfinite(FOV_d) || FOV_u <= FOV_d)
+      return {};
     Eigen::MatrixXf range_matrix(NUM_RANGE, NUM_HEIGHT);
     range_matrix.setZero();
 
@@ -70,24 +64,24 @@ std::pair<Eigen::VectorXf, Eigen::VectorXf> SOLiD::ptCloud2SOLiD(pcl::PointCloud
     Eigen::VectorXf solid(NUM_RANGE);
     solid.setZero();
 
-    float gap_angle = 360/NUM_ANGLE;
+    float gap_angle = 360.0f/NUM_ANGLE;
     float gap_range = static_cast<float>(MAX_DISTANCE)/NUM_RANGE;
     float gap_height = (FOV_u - FOV_d) / NUM_HEIGHT;
 
-    for (int i = 0; i < pt_cloud->points.size(); i++) 
+    for (std::size_t i = 0; i < pt_cloud->points.size(); i++)
     {
         float point_x = pt_cloud->points[i].x;
         float point_y = pt_cloud->points[i].y;
         float point_z = pt_cloud->points[i].z;
         
-        if(point_x == 0.0)
-            point_x = 0.001;
-        if(point_y == 0.0)
-            point_y = 0.001;
+        if (!std::isfinite(point_x) || !std::isfinite(point_y) || !std::isfinite(point_z))
+            continue;
 
         float theta = xy2Theta(point_x, point_y);
-        float dist_xy = sqrt(point_x*point_x + point_y*point_y);
+        float dist_xy = std::hypot(point_x, point_y);
         float phi = rad2deg(atan2(point_z, dist_xy));
+        if (dist_xy <= 0.0f || dist_xy > MAX_DISTANCE || phi < FOV_d || phi > FOV_u)
+            continue;
         int idx_range = std::min(static_cast<int>(dist_xy / gap_range), NUM_RANGE - 1);
         int idx_angle = std::min(static_cast<int>(theta / gap_angle), NUM_ANGLE - 1);
         int idx_height = std::min(static_cast<int>((phi - FOV_d)/gap_height), NUM_HEIGHT - 1);
@@ -112,6 +106,8 @@ std::pair<Eigen::VectorXf, Eigen::VectorXf> SOLiD::ptCloud2SOLiD(pcl::PointCloud
 
     float min_val = number_vector.minCoeff();
     float max_val = number_vector.maxCoeff();
+    if (max_val <= min_val)
+        return {Eigen::VectorXf::Zero(NUM_RANGE), Eigen::VectorXf::Zero(NUM_ANGLE)};
     number_vector = (number_vector.array() - min_val) / (max_val - min_val);
     
     Eigen::VectorXf r_solid = range_matrix * number_vector;

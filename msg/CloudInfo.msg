@@ -1,5 +1,6 @@
 # Cloud Info
 std_msgs/Header header
+uint64 trajectory_epoch
 
 int32[] start_ring_index
 int32[] end_ring_index

@@ -20,19 +20,9 @@ float deg2rad(float degrees)
 }
 
 
-float xy2theta( const float & _x, const float & _y )
-{
-    if ( (_x >= 0) & (_y >= 0)) 
-        return (180/M_PI) * atan(_y / _x);
-
-    if ( (_x < 0) & (_y >= 0)) 
-        return 180 - ( (180/M_PI) * atan(_y / (-_x)) );
-
-    if ( (_x < 0) & (_y < 0)) 
-        return 180 + ( (180/M_PI) * atan(_y / _x) );
-
-    if ( (_x >= 0) & (_y < 0))
-        return 360 - ( (180/M_PI) * atan((-_y) / _x) );
+float xy2theta(const float& x, const float& y) {
+    const float degrees = std::atan2(y, x) * (180.0f / static_cast<float>(M_PI));
+    return degrees < 0.0f ? degrees + 360.0f : degrees;
 } // xy2theta
 
 

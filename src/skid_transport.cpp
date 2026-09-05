@@ -95,6 +95,11 @@ PeerTransport::PeerTransport(const Config& config)
     impl_->subscriber->set(zmq::sockopt::rcvhwm,
                            config.receive_high_water_mark);
     impl_->subscriber->set(zmq::sockopt::linger, config.linger_ms);
+    // Enforce the allocation bound inside libzmq, before an oversized frame
+    // can reach receive(). Reserve a small envelope allowance for tiny test
+    // payload limits; the application still checks the exact payload budget.
+    impl_->subscriber->set(zmq::sockopt::maxmsgsize,
+        static_cast<std::int64_t>(std::max<std::size_t>(config.max_payload_bytes, 1024)));
     for (const auto& topic : config.topics) {
       impl_->subscriber->set(zmq::sockopt::subscribe, topic);
     }
@@ -177,7 +182,8 @@ std::vector<Message> PeerTransport::receive(int timeout_ms,
   const auto& topics = impl_->config.topics;
   bool first = true;
 
-  while (messages.size() < max_messages) {
+  std::size_t examined = 0;
+  while (examined < max_messages) {
     zmq::message_t topic_frame;
     zmq::recv_result_t result;
     try {
@@ -196,6 +202,7 @@ std::vector<Message> PeerTransport::receive(int timeout_ms,
     if (!result) {
       break;
     }
+    ++examined;
 
     // A multipart message arrives whole or not at all, so the remaining
     // frames are already queued once the first has been read.
@@ -210,6 +217,18 @@ std::vector<Message> PeerTransport::receive(int timeout_ms,
       sender_frame.more() &&
       impl_->subscriber->recv(payload_frame, zmq::recv_flags::none);
     if (!complete) {
+      ++impl_->statistics.dropped_malformed;
+      continue;
+    }
+    if (payload_frame.more()) {
+      // Consume the entire malformed envelope before reading another topic.
+      // Otherwise its fourth frame becomes a forged next-message boundary.
+      bool more = true;
+      while (more) {
+        zmq::message_t extra;
+        if (!impl_->subscriber->recv(extra, zmq::recv_flags::none)) break;
+        more = extra.more();
+      }
       ++impl_->statistics.dropped_malformed;
       continue;
     }

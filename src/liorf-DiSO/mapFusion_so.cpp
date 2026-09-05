@@ -1,3 +1,8 @@
+#include "skid_message_validation.hpp"
+#include <atomic>
+#include "liorf/msg/alignment_state.hpp"
+#include "liorf/msg/graph_state.hpp"
+#include "skid_map_alignment.hpp"
 //
 // Created by yewei on 8/31/20.
 // Modified by Hogyun Kim on 11/07/24
@@ -22,6 +27,7 @@
 #include "skid_comms.hpp"
 #include "skid_loop_detection.hpp"
 #include "skid_pcm_commitment.hpp"
+#include "skid_graph_sync.hpp"
 #include "skid_registration.hpp"
 #include "skid_registration_params.hpp"
 #include "skid_remote_graph.hpp"
@@ -82,7 +88,17 @@ private:
 
     rclcpp::Subscription<liorf::msg::CloudInfo>::SharedPtr _sub_laser_cloud_info;
     rclcpp::Subscription<liorf::msg::ContextInfo>::SharedPtr _sub_solid_info;
-    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr _sub_odom_trans;
+    rclcpp::Subscription<liorf::msg::AlignmentState>::SharedPtr _sub_alignment_state;
+    rclcpp::Publisher<liorf::msg::AlignmentState>::SharedPtr _pub_alignment_state;
+    rclcpp::Publisher<liorf::msg::AlignmentState>::SharedPtr _pub_local_alignment_state;
+    std::map<std::string, liorf::msg::AlignmentState> _outbound_alignments;
+    std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> _alignment_versions;
+    std::uint64_t _alignment_revision = 0;
+    rclcpp::Publisher<liorf::msg::GraphState>::SharedPtr _pub_graph_state;
+    rclcpp::Subscription<liorf::msg::GraphState>::SharedPtr _sub_graph_state;
+    std::map<liorf::graph_sync::PoseIdentity, std::uint64_t> _pose_revisions;
+    std::size_t _pose_request_cursor = 0;
+    std::set<int> _dirty_pcm_pairs;
     rclcpp::Subscription<liorf::msg::LoopConstraint>::SharedPtr _sub_loop_info_global;
     rclcpp::Subscription<liorf::msg::ScanRequest>::SharedPtr _sub_scan_request;
     rclcpp::Subscription<liorf::msg::ScanData>::SharedPtr _sub_scan_data;
@@ -123,9 +139,9 @@ private:
 	
 	std::string _local_topic;
 
-    bool _communication_signal;
-    bool _signal_1;
-    bool _signal_2;
+    std::atomic<bool> _communication_signal{true};
+    std::atomic<bool> _signal_1{true};
+    std::atomic<bool> _signal_2{true};
     bool _use_position_search;
     bool _direct_keyframe_factors = true;
     bool _publish_factors = true;
@@ -227,9 +243,9 @@ private:
     pcl::PointCloud<PointType>::Ptr _laser_cloud_surface;
 
     //global variables for solid
-    Nabo::NNSearchF* _nns = NULL; //KDtree
+    std::unique_ptr<Nabo::NNSearchF> _nns; //KDtree
     Eigen::MatrixXf _target_matrix;
-    SOLiD *_solid_factory;
+    std::unique_ptr<SOLiD> _solid_factory;
 
     std::vector<int> _robot_received_list;
 
@@ -293,7 +309,12 @@ private:
     std::unordered_map< int, std::vector<int> > _loop_commit_queue;
     std::unordered_map<int, liorf::pcm::CommitmentTracker>
         _pcm_commitment_trackers;
-    std::set<liorf::remote_graph::FactorIdentity> _published_direct_factors;
+    liorf::graph_sync::Replay _factor_replay;
+    std::map<std::string, std::uint64_t> _trajectory_epochs;
+    const std::uint64_t _authority_epoch = liorf::graph_sync::newEpoch();
+    std::uint64_t _factor_revision = 0;
+    rclcpp::TimerBase::SharedPtr _factor_replay_timer;
+    std::size_t _factor_replay_batch = 32;
 
     std::unordered_map< int, std::vector<PointTypePose> > _global_map_trans;
     std::unordered_map< int, PointTypePose> _global_map_trans_optimized;
@@ -356,9 +377,9 @@ public:
             _sub_solid_info = create_subscription<liorf::msg::ContextInfo>(
                 _solid_topic + "/context_info", rclcpp::QoS(20),
                 std::bind(&MapFusion::solidInfoHandler, this, std::placeholders::_1), subOpt);//number of buffer may differs for different robot numbers
-            _sub_odom_trans = create_subscription<nav_msgs::msg::Odometry>(
-                _solid_topic + "/trans_odom", rclcpp::QoS(20),
-                std::bind(&MapFusion::OdomTransHandler, this, std::placeholders::_1), subOpt);
+            _sub_alignment_state = create_subscription<liorf::msg::AlignmentState>(
+                _solid_topic + "/alignment_state", rclcpp::QoS(100),
+                std::bind(&MapFusion::alignmentStateHandler, this, std::placeholders::_1), subOpt);
 
         }
 
@@ -389,6 +410,32 @@ public:
                 _solid_topic + "/scan_request", 20);
         _pub_scan_data = create_publisher<liorf::msg::ScanData>(
                 _solid_topic + "/scan_data", 20);
+
+        const double sync_period = declare_and_get<double>("mapfusion.graph_sync.period_s", 1.0);
+        const int sync_batch = declare_and_get<int>("mapfusion.graph_sync.batch_size", 32);
+        if (!std::isfinite(sync_period) || sync_period <= 0.0 || sync_batch < 1 || sync_batch > 100)
+            throw std::invalid_argument("graph_sync requires a positive period and batch_size in [1,100]");
+        _factor_replay_batch = static_cast<std::size_t>(sync_batch);
+        _factor_replay_timer = create_wall_timer(std::chrono::duration<double>(sync_period),
+            [this]() {
+                if (_publish_factors && _direct_keyframe_factors)
+                    for (const auto& record : _factor_replay.next(_factor_replay_batch))
+                        sendFactorRecord(record);
+                requestGraphCorrections();
+                for (const auto& entry : _outbound_alignments) {
+                    if (entry.first == "local") _pub_local_alignment_state->publish(entry.second);
+                    else _pub_alignment_state->publish(entry.second);
+                }
+            }, _callback_group);
+
+        _pub_graph_state = create_publisher<liorf::msg::GraphState>(_solid_topic + "/graph_state", 100);
+        _sub_graph_state = create_subscription<liorf::msg::GraphState>(
+            _solid_topic + "/graph_state", rclcpp::QoS(100),
+            std::bind(&MapFusion::graphStateHandler, this, std::placeholders::_1), subOpt);
+        _pub_alignment_state = create_publisher<liorf::msg::AlignmentState>(
+            _solid_topic + "/alignment_state", 100);
+        _pub_local_alignment_state = create_publisher<liorf::msg::AlignmentState>(
+            prefixTopic(_robot_id, _solid_topic + "/alignment_state"), 100);
 
         // Resends timed-out scan requests, drops candidates whose scans never
         // arrived, and reports what the link is costing.
@@ -535,6 +582,12 @@ private:
             throw std::invalid_argument(
                 "mapfusion PCM publication policy values must be non-negative");
         }
+        const int pcm_retract_observations = declare_and_get<int>(
+            "mapfusion.interRobot.pcm_min_retract_observations", 3);
+        if (pcm_retract_observations < 1)
+            throw std::invalid_argument("pcm_min_retract_observations must be positive");
+        _pcm_commitment_config.min_consecutive_rejections =
+            static_cast<std::size_t>(pcm_retract_observations);
         _pcm_commitment_config.min_clique_size =
             static_cast<std::size_t>(pcm_min_publish_clique_size);
         _pcm_commitment_config.min_consecutive_acceptances =
@@ -657,7 +710,7 @@ private:
         // _laser_cloud_corner.reset(new pcl::PointCloud<PointType>());
         _laser_cloud_surface.reset(new pcl::PointCloud<PointType>());
 
-        _solid_factory = new SOLiD(_max_range, _knn_feature_dim, _num_sectors);
+        _solid_factory = std::make_unique<SOLiD>(_max_range, _knn_feature_dim, _num_sectors);
 
         _kdtree_pose_to_publish.reset(new pcl::KdTreeFLANN<PointType>());
         _cloud_pose_to_publish.reset(new pcl::PointCloud<PointType>());
@@ -710,8 +763,73 @@ private:
         return std::stoi(robo.substr(suffix + 1));
     }
 
+    bool observeTrajectory(const std::string& robot, std::uint64_t epoch)
+    {
+        auto& known = _trajectory_epochs[robot];
+        if (known != 0 && epoch < known) return false;
+        if (epoch == known) return true;
+        const bool restarted = known != 0;
+        known = epoch;
+        if (!restarted) return true;
+        // All numeric bin indices are local to a recognition session. Purge
+        // that session atomically rather than combine reused keyframe IDs or
+        // allow an old clique to dominate a restarted robot's new trajectory.
+        std::vector<liorf::msg::LoopConstraint> withdrawals;
+        for (const auto& entry : _factor_replay.latest()) {
+            if (entry.second.retracted) continue;
+            auto message = entry.second;
+            message.retracted = true;
+            message.revision = ++_factor_revision;
+            withdrawals.push_back(message);
+        }
+        for (const auto& message : withdrawals) {
+            _factor_replay.put(message);
+            if (_publish_factors) sendFactorRecord(message);
+        }
+        _nns.reset();
+        _target_matrix.resize(_knn_feature_dim, 0);
+        _num_bin = 0;
+        _bin_with_id.clear();
+        _bin_of_scan_key.clear();
+        _idx_nearest_list.clear();
+        _pose_queue.clear();
+        _pose_revisions.clear();
+        _dirty_pcm_pairs.clear();
+        _loop_queue.clear();
+        _loop_commit_queue.clear();
+        _pcm_commitment_trackers.clear();
+        _global_map_trans.clear();
+        _global_map_trans_optimized.clear();
+        _global_map_trans_covariance.clear();
+        _global_odom_trans.clear();
+        _robot_received_list.clear();
+        _cloud_pose_to_search_this->clear();
+        _cloud_pose_to_search_other->clear();
+        _cloud_pose_to_publish->clear();
+        _cloud_loop_to_search->clear();
+        _scans.clear();
+        _scan_cache->clear();
+        _scan_requests->clear();
+        _deferred_candidates->clear();
+        _initial_loop.first = -1;
+        _have_trans_to_publish = false;
+        const auto previousAlignments = _outbound_alignments;
+        for (const auto& entry : previousAlignments)
+            publishAlignment(entry.second.alignment, false, entry.first == "local");
+        {
+            std::scoped_lock lock(mtx_publish_1, mtx_publish_2);
+            _context_list_to_publish_1.clear();
+            _context_list_to_publish_2.clear();
+        }
+        RCLCPP_WARN(get_logger(), "Reset recognition after %s restarted its trajectory", robot.c_str());
+        return true;
+    }
+
     void laserCloudInfoHandler(const liorf::msg::CloudInfo::ConstSharedPtr& msgIn)
     {
+        if (!observeTrajectory(_robot_id, msgIn->trajectory_epoch)) return;
+        if (!liorf::messages::validCloud(msgIn->cloud_deskewed) ||
+            !liorf::messages::validCloud(msgIn->cloud_surface)) return;
         _laser_cloud_sum->clear();
         _laser_cloud_feature->clear();
         // _laser_cloud_corner->clear();
@@ -743,6 +861,8 @@ private:
         bin.pose.pitch =  _cloud_info.initial_guess_pitch;
         bin.pose.yaw   =  _cloud_info.initial_guess_yaw;
         bin.pose.intensity = _cloud_info.imu_available;
+        bin.keyframe_index = _cloud_info.imu_available;
+        bin.trajectory_epoch = _cloud_info.trajectory_epoch;
 
         // ptcloud2bin swaps the cloud it is handed into the bin it returns, so
         // bin.cloud aliases _laser_cloud_sum, which the next scan overwrites in
@@ -787,7 +907,10 @@ private:
         _signal_2 = msg->data;
     }
 
-    double nowSeconds() const { return this->now().seconds(); }
+    double nowSeconds() const {
+        return std::chrono::duration<double>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
 
     liorf::msg::LoopDiagnostic diagnosticFor(
         int query_bin, const DescriptorCandidate & candidate) {
@@ -818,12 +941,14 @@ private:
         const auto query = _bin_with_id.find(query_bin);
         if (query != _bin_with_id.end()) {
             diagnostic.query_robot_id = query->second.robotname;
+            diagnostic.query_trajectory_epoch = query->second.trajectory_epoch;
             diagnostic.query_keyframe_index = keyframeIndexOf(query->second);
             diagnostic.query_time = query->second.time;
         }
         const auto match = _bin_with_id.find(candidate.match_bin);
         if (match != _bin_with_id.end()) {
             diagnostic.match_robot_id = match->second.robotname;
+            diagnostic.match_trajectory_epoch = match->second.trajectory_epoch;
             diagnostic.match_keyframe_index = keyframeIndexOf(match->second);
             diagnostic.match_time = match->second.time;
         }
@@ -913,13 +1038,15 @@ private:
     // float, so this is exact only below 2^24 keyframes. Every side derives
     // the identity the same way, so the two ends agree regardless.
     static std::int64_t keyframeIndexOf(const SOLiDBin & bin) {
-        return static_cast<std::int64_t>(std::llround(bin.pose.intensity));
+        return bin.keyframe_index >= 0 ? bin.keyframe_index :
+            static_cast<std::int64_t>(std::llround(bin.pose.intensity));
     }
 
     static liorf::comms::ScanKey scanKeyOf(const SOLiDBin & bin) {
         liorf::comms::ScanKey key;
         key.robot_id = bin.robotname;
         key.keyframe_index = keyframeIndexOf(bin);
+        key.trajectory_epoch = bin.trajectory_epoch;
         return key;
     }
 
@@ -971,7 +1098,7 @@ private:
 
         context_info.asolid.assign(_num_sectors, 0);
         context_info.rsolid.assign(_knn_feature_dim, 0);
-        context_info.header = _cloud_header;
+        context_info.header.frame_id = _solid_frame;
         // Announcements leave a bounded FIFO on a background thread. Using
         // the node's latest cloud header here silently re-timestamped older
         // keyframes and made loop diagnostics point at the wrong ground-truth
@@ -988,6 +1115,7 @@ private:
 
         context_info.robot_id_receive = robot_to;
         context_info.keyframe_index = keyframeIndexOf(bin);
+        context_info.trajectory_epoch = bin.trajectory_epoch;
         context_info.pose_x = bin.pose.x;
         context_info.pose_y = bin.pose.y;
         context_info.pose_z = bin.pose.z;
@@ -1023,6 +1151,7 @@ private:
         request.robot_id = _robot_id;
         request.robot_id_receive = key.robot_id;
         request.keyframe_index = key.keyframe_index;
+        request.trajectory_epoch = key.trajectory_epoch;
         _pub_scan_request->publish(request);
         {
             std::lock_guard<std::mutex> lock(mtx_stats);
@@ -1066,6 +1195,7 @@ private:
         liorf::comms::ScanKey key;
         key.robot_id = _robot_id;
         key.keyframe_index = msgIn->keyframe_index;
+        key.trajectory_epoch = msgIn->trajectory_epoch;
 
         liorf::msg::ScanData data;
         data.header.stamp = this->now();
@@ -1073,6 +1203,7 @@ private:
         data.robot_id = _robot_id;
         data.robot_id_receive = msgIn->robot_id;
         data.keyframe_index = msgIn->keyframe_index;
+        data.trajectory_epoch = msgIn->trajectory_epoch;
 
         const pcl::PointCloud<PointType>::Ptr cloud = findScan(key);
         data.available = cloud && !cloud->empty();
@@ -1105,7 +1236,9 @@ private:
         liorf::comms::ScanKey key;
         key.robot_id = msgIn->robot_id;
         key.keyframe_index = msgIn->keyframe_index;
-        if (!key.valid())
+        key.trajectory_epoch = msgIn->trajectory_epoch;
+        if (!key.valid() || !liorf::messages::validCloud(msgIn->scan_cloud) ||
+            msgIn->scan_cloud.data.size() > _comms_config.max_cached_scan_bytes)
             return;
 
         const double now_s = nowSeconds();
@@ -1242,7 +1375,7 @@ private:
         if( robot_publish == _robot_id)
             return;//skip info publish by the node itself
         std::string robot_child = odomMsg->child_frame_id;
-        std::string index = robot_child + robot_publish;
+        std::string index = robot_child + "|" + robot_publish;
         PointTypePose pose;
         pose.x = odomMsg->pose.pose.position.x;
         pose.y = odomMsg->pose.pose.position.y;
@@ -1264,7 +1397,7 @@ private:
              _global_odom_trans.emplace(std::make_pair(index, tmp_pose_list));
          }
         else//else add a new association;
-            _global_odom_trans[index].push_back(pose);
+            _global_odom_trans[index] = {pose};
 
         gtsamFactorGraph();
         sendMapOutputMessage();
@@ -1280,177 +1413,89 @@ private:
 
     }
 
-    void gtsamFactorGraph(){
-        if (_global_map_trans.size() == 0 && _global_odom_trans.size() == 0)
-            return;
-        gtsam::Vector Vector6(6);
-        gtsam::NonlinearFactorGraph graph;
-        gtsam::Values initialEstimate;
-
-        std::vector<int> id_received = _robot_received_list;
-        std::vector<std::tuple <int, int, gtsam::Pose3>> trans_list;
-
-        if (_global_map_trans.size() != 0)
-            id_received.push_back(_robot_id_th);
-
-        //set initial
-        Vector6 << 1e-8, 1e-8, 1e-8, 1e-8, 1e-8, 1e-8;
-        auto odometryNoise0 = gtsam::noiseModel::Diagonal::Variances(Vector6);
-        graph.add( gtsam::PriorFactor<gtsam::Pose3>(gtsam::PriorFactor<gtsam::Pose3>(0, gtsam::Pose3( gtsam::Rot3::RzRyRx(0, 0, 0), gtsam::Point3(0, 0, 0) ) , odometryNoise0) ) );
-        initialEstimate.insert(0, gtsam::Pose3( gtsam::Rot3::RzRyRx(0, 0, 0), gtsam::Point3(0, 0, 0)));
-
-        bool ill_posed = true;
-        //add local constraints
-        for(auto ite : _global_map_trans){
-            int id_0 = std::min(ite.first, _robot_id_th);
-            int id_1 = std::max(ite.first, _robot_id_th);
-
-            for(auto ite_measure : ite.second){
-                PointTypePose pclpose = ite_measure;
-                gtsam::Pose3 measurement = gtsam::Pose3 (gtsam::Rot3::RzRyRx(pclpose.roll, pclpose.pitch, pclpose.yaw),
-                                                         gtsam::Point3(pclpose.x, pclpose.y, pclpose.z) );
-                Vector6 << 1, 1, 1, 1, 1, 1;
-                auto odometryNoise = gtsam::noiseModel::Diagonal::Variances(Vector6);
-                graph.add( gtsam::BetweenFactor<gtsam::Pose3>(id_0, id_1, measurement, odometryNoise) );
-            }
-
-            PointTypePose pclpose = ite.second[ite.second.size() - 1];
-            gtsam::Pose3 measurement_latest = gtsam::Pose3 (gtsam::Rot3::RzRyRx(pclpose.roll, pclpose.pitch, pclpose.yaw),
-                                                            gtsam::Point3(pclpose.x, pclpose.y, pclpose.z));
-            if(id_0 == 0){
-                initialEstimate.insert(id_1, measurement_latest);
-                ill_posed = false;
-            }
-            else
-                trans_list.emplace_back(std::make_tuple(id_0, id_1, measurement_latest));
+    void gtsamFactorGraph()
+    {
+        std::vector<liorf::map_alignment::Edge> edges;
+        const auto poseOf = [](const PointTypePose& pose) {
+            return gtsam::Pose3(gtsam::Rot3::RzRyRx(pose.roll, pose.pitch, pose.yaw),
+                               gtsam::Point3(pose.x, pose.y, pose.z));
+        };
+        for (const auto& entry : _global_map_trans) {
+            if (!entry.second.empty())
+                edges.push_back({std::min(entry.first, _robot_id_th),
+                    std::max(entry.first, _robot_id_th), poseOf(entry.second.back())});
         }
-
-        for(auto ite: _global_odom_trans){
-            int id_publish = robotID2Number(ite.first);
-            int id_child = ite.second[0].intensity;
-            int id_0 = std::min(id_publish, id_child);
-            int id_1 = std::max(id_publish, id_child);
-
-            for(auto ite_measure: ite.second){
-
-                PointTypePose pclpose = ite_measure;
-                gtsam::Pose3 measurement = gtsam::Pose3 (gtsam::Rot3::RzRyRx(pclpose.roll, pclpose.pitch, pclpose.yaw),
-                                                         gtsam::Point3(pclpose.x, pclpose.y, pclpose.z));
-                Vector6 << 1, 1, 1, 1, 1, 1;
-                auto odometryNoise = gtsam::noiseModel::Diagonal::Variances(Vector6);
-                graph.add( gtsam::BetweenFactor<gtsam::Pose3>(id_0, id_1, measurement, odometryNoise) );
-            }
-
-            PointTypePose pclpose = ite.second[ite.second.size() - 1];
-            gtsam::Pose3 measurement_latest = gtsam::Pose3 (gtsam::Rot3::RzRyRx(pclpose.roll, pclpose.pitch, pclpose.yaw),
-                                                     gtsam::Point3(pclpose.x, pclpose.y, pclpose.z));
-
-            if(id_0 == 0){
-                initialEstimate.insert(id_1, measurement_latest);
-                ill_posed = false;
-            }
-            else
-                trans_list.emplace_back(std::make_tuple(id_0, id_1, measurement_latest));
-
-            if(find(id_received.begin(), id_received.end(), id_0) == id_received.end())
-                id_received.push_back(id_0);
-
-            if(find(id_received.begin(), id_received.end(), id_1) == id_received.end())
-                id_received.push_back(id_1);
-
+        for (const auto& entry : _global_odom_trans) {
+            if (entry.second.empty()) continue;
+            const int publisher = robotID2Number(entry.first.substr(entry.first.find('|') + 1));
+            const int child = static_cast<int>(entry.second.back().intensity);
+            edges.push_back({std::min(publisher, child), std::max(publisher, child),
+                             poseOf(entry.second.back())});
         }
-
-        if (find(id_received.begin(), id_received.end(), _robot_id_th) == id_received.end()){
-            return;
-        }
-        if (ill_posed)
-            return;
-
-        bool terminate_signal = false;
-        while (!terminate_signal){
-            if (id_received.size() == 0)
-                break;
-            terminate_signal = true;
-            for(auto id = id_received.begin(); id != id_received.end();)
-            {
-                int id_this = *id;
-                if(initialEstimate.exists(id_this)){
-                    id = id_received.erase(id);
-                    continue;
-                }
-                else
-                    ++id;
-
-                auto it = std::find_if(trans_list.begin(), trans_list.end(),
-                                       [id_this](auto& e)
-                                       {return std::get<0>(e) == id_this || std::get<1>(e) == id_this;});
-
-                if(it == trans_list.end())
-                    continue;
-
-                int id_t = get<0>(*it) + get<1>(*it) - id_this;
-
-                if(!initialEstimate.exists(id_t))
-                    continue;
-                gtsam::Pose3 pose_t = initialEstimate.at<gtsam::Pose3>(id_t);
-                if ( id_this == get<1>(*it)){
-                    gtsam::Pose3 pose_f = pose_t * get<2>(*it);
-                    initialEstimate.insert(id_this, pose_f);
-                    terminate_signal = false;
-
-                }
-                if ( id_this == get<0>(*it)){
-                    gtsam::Pose3 pose_f = pose_t * get<2>(*it).inverse();
-                    initialEstimate.insert(id_this, pose_f);
-                    terminate_signal = false;
-                }
-            }
-        }
-
-        for (auto it : id_received){
-            initialEstimate.insert(it, gtsam::Pose3( gtsam::Rot3::RzRyRx(0, 0, 0), gtsam::Point3(0, 0, 0) ));
-        }
-
-        id_received.clear();
-        trans_list.clear();
-
-        gtsam::Values result = gtsam::LevenbergMarquardtOptimizer(graph, initialEstimate).optimize();
-
-        initialEstimate.clear();
-        graph.resize(0);
-
-        gtsam::Pose3 est = result.at<gtsam::Pose3>(_robot_id_th);
-
-        _trans_to_publish.x = est.translation().x();
-        _trans_to_publish.y = est.translation().y();
-        _trans_to_publish.z = est.translation().z();
-        _trans_to_publish.roll = est.rotation().roll();
-        _trans_to_publish.pitch = est.rotation().pitch();
-        _trans_to_publish.yaw = est.rotation().yaw();
+        const auto solved = liorf::map_alignment::solve(
+            edges, robotID2Number(_robot_initial), _robot_id_th);
+        _have_trans_to_publish = solved.has_value();
+        if (!solved) return;
+        _trans_to_publish.x = solved->x();
+        _trans_to_publish.y = solved->y();
+        _trans_to_publish.z = solved->z();
+        _trans_to_publish.roll = solved->rotation().roll();
+        _trans_to_publish.pitch = solved->rotation().pitch();
+        _trans_to_publish.yaw = solved->rotation().yaw();
         _trans_to_publish.intensity = 1;
-        _have_trans_to_publish = true;
+    }
 
-        if (_have_trans_to_publish){
-            int robot_id_initial = robotID2Number(_robot_initial);
-            if (_global_map_trans_optimized.find(robot_id_initial) == _global_map_trans_optimized.end()){
-                _global_map_trans_optimized.emplace(std::make_pair(robot_id_initial, _trans_to_publish));
-            }
+    void publishAlignment(const nav_msgs::msg::Odometry& alignment, bool valid, bool local)
+    {
+        liorf::msg::AlignmentState state;
+        state.authority_id = _robot_id;
+        state.authority_epoch = _authority_epoch;
+        state.revision = ++_alignment_revision;
+        state.valid = valid;
+        state.alignment = alignment;
+        const std::string key = local ? "local" : alignment.child_frame_id;
+        _outbound_alignments[key] = state;
+        if (local) _pub_local_alignment_state->publish(state);
+        else _pub_alignment_state->publish(state);
+    }
 
-
-            else{
-                _global_map_trans[robot_id_initial].push_back(_trans_to_publish);
-                _global_map_trans_optimized[robot_id_initial] = _trans_to_publish;
-                }
+    void alignmentStateHandler(const liorf::msg::AlignmentState::ConstSharedPtr& state)
+    {
+        const auto& alignment = state->alignment;
+        if (state->authority_id == _robot_id || state->authority_epoch == 0 || state->revision == 0 ||
+            state->authority_id != alignment.header.frame_id ||
+            (state->authority_id != _signal_id_1 && state->authority_id != _signal_id_2) ||
+            (alignment.child_frame_id != _robot_id && alignment.child_frame_id != _signal_id_1 &&
+             alignment.child_frame_id != _signal_id_2) ||
+            (state->valid && !liorf::loop_constraint::validPoseMessage(alignment.pose.pose))) return;
+        const std::string key = alignment.child_frame_id + "|" + state->authority_id;
+        const auto version = std::make_pair(state->authority_epoch, state->revision);
+        if (version <= _alignment_versions[key]) return;
+        _alignment_versions[key] = version;
+        if (state->valid) {
+            OdomTransHandler(std::make_shared<nav_msgs::msg::Odometry>(alignment));
+        } else {
+            _global_odom_trans.erase(key);
+            gtsamFactorGraph();
+            sendMapOutputMessage();
         }
     }
 
     void solidInfoHandler(const liorf::msg::ContextInfo::ConstSharedPtr& msgIn){
+        if (!liorf::messages::validContext(*msgIn, _knn_feature_dim, _num_sectors, true)) {
+            RCLCPP_WARN(get_logger(), "Rejected malformed descriptor announcement");
+            return;
+        }
+        if (msgIn->robot_id != _robot_id && msgIn->robot_id != _signal_id_1 &&
+            msgIn->robot_id != _signal_id_2)
+            return;
         liorf::msg::ContextInfo context_info_input = *msgIn;
         //load the data received
         if (!_communication_signal)
             return;
         if (msgIn->robot_id_receive != _robot_id)
             return;
+        if (!observeTrajectory(msgIn->robot_id, msgIn->trajectory_epoch)) return;
 
         SOLiDBin bin;
         bin.robotname = msgIn->robot_id;
@@ -1465,6 +1510,8 @@ private:
         // The explicit keyframe index is the place's identity; pose_intensity
         // carries the same value for the legacy consumers of this message.
         bin.pose.intensity = static_cast<float>(msgIn->keyframe_index);
+        bin.keyframe_index = msgIn->keyframe_index;
+        bin.trajectory_epoch = msgIn->trajectory_epoch;
 
         // An announcement may or may not carry its scan. When it does the
         // scan is filed immediately; when it does not, it is requested only if
@@ -1492,6 +1539,10 @@ private:
     }
 
     void run(SOLiDBin bin){
+        if (bin.rsolid.size() != _knn_feature_dim || bin.asolid.size() != _num_sectors ||
+            !bin.rsolid.allFinite() || !bin.asolid.allFinite() || bin.rsolid.norm() <= 0.0f ||
+            _bin_of_scan_key.count(scanKeyOf(bin)))
+            return;
         //build
 
         _idx_nearest_list.clear();
@@ -1512,13 +1563,38 @@ private:
     // by an arriving announcement or by a scan that completed a parked
     // candidate later.
     void optimizeAndPublish(){
-        if(!incrementalPCM()){
-            return;
+        const auto dirty = std::move(_dirty_pcm_pairs);
+        _dirty_pcm_pairs.clear();
+        for (const int peer : dirty) {
+            _robot_this_th = peer;
+            if (_loop_queue[peer].empty()) continue;
+            const auto& loop = _loop_queue[peer].back();
+            const auto& query = _bin_with_id.at(loop.query_bin);
+            const auto& match = _bin_with_id.at(loop.match_bin);
+            _robot_this = query.robotname == _robot_id ? match.robotname : query.robotname;
+            optimizePairAndPublish();
         }
+    }
 
-        if (_publish_factors && _direct_keyframe_factors)
+    void optimizePairAndPublish(){
+        const bool commitmentsChanged = incrementalPCM();
+        if (!commitmentsChanged && _loop_commit_queue[_robot_this_th].size() < 2) return;
+
+        if (commitmentsChanged && _publish_factors && _direct_keyframe_factors)
             publishAcceptedDirectFactors();
 
+        if (_loop_commit_queue[_robot_this_th].size() < 2) {
+            _global_map_trans.erase(_robot_this_th);
+            _global_map_trans_optimized.erase(_robot_this_th);
+            _global_map_trans_covariance.erase(_robot_this_th);
+            gtsamFactorGraph();
+            sendMapOutputMessage();
+            nav_msgs::msg::Odometry withdrawn;
+            withdrawn.header.frame_id = _robot_id;
+            withdrawn.child_frame_id = _robot_this;
+            publishAlignment(withdrawn, false, false);
+            return;
+        }
         //perform optimization
         gtsamExpressionGraph();
 
@@ -1640,7 +1716,7 @@ private:
         }
         _target_matrix.block(0, _num_bin-1, _knn_feature_dim, 1) = ringkey_segment;
 
-        _nns = Nabo::NNSearchF::createKDTreeLinearHeap(_target_matrix);
+        _nns.reset(Nabo::NNSearchF::createKDTreeLinearHeap(_target_matrix));
     }
 
     void KNNSearch(SOLiDBin bin){
@@ -1995,6 +2071,7 @@ private:
         loop_candidate.query_from_match = query_from_match;
         loop_candidate.registration_diagnostic =
             std::move(registration_diagnostic);
+        _dirty_pcm_pairs.insert(_robot_this_th);
         _loop_queue[_robot_this_th].push_back(std::move(loop_candidate));
 
         return true;
@@ -2131,6 +2208,76 @@ private:
 
     }
 
+    void requestGraphCorrections()
+    {
+        std::set<int> indices;
+        for (const auto& pair : _loop_queue)
+            for (const auto& loop : pair.second) {
+                indices.insert(loop.query_bin);
+                indices.insert(loop.match_bin);
+            }
+        if (indices.empty()) return;
+        const std::vector<int> bins(indices.begin(), indices.end());
+        std::map<std::pair<std::string, std::uint64_t>, liorf::msg::GraphState> requests;
+        for (std::size_t i = 0; i < std::min(_factor_replay_batch, bins.size()); ++i) {
+            const auto& bin = _bin_with_id.at(bins[(_pose_request_cursor + i) % bins.size()]);
+            auto& request = requests[{bin.robotname, bin.trajectory_epoch}];
+            request.request = true;
+            request.header.stamp = now();
+            request.owner_robot_id = bin.robotname;
+            request.requester_robot_id = _robot_id;
+            request.trajectory_epoch = bin.trajectory_epoch;
+            request.keyframe_indices.push_back(keyframeIndexOf(bin));
+        }
+        _pose_request_cursor = (_pose_request_cursor + std::min(_factor_replay_batch, bins.size())) % bins.size();
+        for (const auto& request : requests) _pub_graph_state->publish(request.second);
+    }
+
+    void graphStateHandler(const liorf::msg::GraphState::ConstSharedPtr& message)
+    {
+        if (message->request || message->requester_robot_id != _robot_id ||
+            message->trajectory_epoch == 0 || message->poses.size() > 100 ||
+            message->poses.size() != message->keyframe_indices.size() ||
+            !_trajectory_epochs.count(message->owner_robot_id)) return;
+        for (const auto& pose : message->poses)
+            if (!liorf::loop_constraint::validPoseMessage(pose)) return;
+        if (!observeTrajectory(message->owner_robot_id, message->trajectory_epoch)) return;
+        std::set<int> changed;
+        for (std::size_t i = 0; i < message->poses.size(); ++i) {
+            const liorf::comms::ScanKey scan{message->owner_robot_id,
+                message->keyframe_indices[i], message->trajectory_epoch};
+            const auto found = _bin_of_scan_key.find(scan);
+            if (found == _bin_of_scan_key.end()) continue;
+            const liorf::graph_sync::PoseIdentity identity{scan.robot_id, scan.trajectory_epoch, scan.keyframe_index};
+            if (message->revision <= _pose_revisions[identity]) continue;
+            auto& bin = _bin_with_id.at(found->second);
+            const auto corrected = liorf::loop_constraint::poseFromMessage(message->poses[i]);
+            _pose_revisions[identity] = message->revision;
+            if (ownerPose(bin).equals(corrected, 1.0e-5)) continue;
+            bin.pose.x = corrected.x(); bin.pose.y = corrected.y(); bin.pose.z = corrected.z();
+            bin.pose.roll = corrected.rotation().roll();
+            bin.pose.pitch = corrected.rotation().pitch();
+            bin.pose.yaw = corrected.rotation().yaw();
+            changed.insert(found->second);
+        }
+        for (const auto& pair : _loop_queue) {
+            for (std::size_t i = 0; i < pair.second.size(); ++i) {
+                const auto& loop = pair.second[i];
+                if (!changed.count(loop.query_bin) && !changed.count(loop.match_bin)) continue;
+                const auto inverse = liorf::uncertainty::inverse(loop.relative_pose, loop.covariance);
+                const auto aligned = liorf::uncertainty::compose(
+                    ownerPose(_bin_with_id.at(loop.target_bin)), liorf::uncertainty::Matrix6d::Zero(),
+                    inverse.pose, inverse.covariance);
+                auto& pose = _pose_queue[pair.first][i];
+                pose.source_pose = ownerPose(_bin_with_id.at(loop.source_bin));
+                pose.aligned_source_pose = aligned.pose;
+                pose.covariance = aligned.covariance;
+                _dirty_pcm_pairs.insert(pair.first);
+            }
+        }
+        if (!_dirty_pcm_pairs.empty()) optimizeAndPublish();
+    }
+
     void publishPcmDiagnostics(
         const std::vector<LoopCandidate> & candidates,
         const std::vector<int> & maximum_clique,
@@ -2201,7 +2348,7 @@ private:
             previous_commitments.size(), max_clique_data.size(),
             _pcm_commitment_config.min_clique_size,
             _pcm_commitment_config.min_consecutive_acceptances);
-        return !previous_commitments.empty();
+        return true;  // An empty set also withdraws previously published factors.
     }
 
     static gtsam::Pose3 ownerPose(const SOLiDBin & bin) {
@@ -2218,92 +2365,81 @@ private:
             to.robotname, keyframeIndexOf(to));
     }
 
-    void publishDirectFactor(
-        const LoopCandidate & candidate,
-        const SOLiDBin & query,
-        const SOLiDBin & match,
-        const std::string & recipient) {
+    liorf::msg::LoopConstraint directFactor(
+        const LoopCandidate& candidate, const SOLiDBin& query, const SOLiDBin& match)
+    {
         liorf::msg::LoopConstraint message;
         message.header = candidate.registration_diagnostic.header;
-        liorf::loop_constraint::populateInterRobot(
-            message,
-            recipient,
-            query.robotname,
-            keyframeIndexOf(query),
-            ownerPose(query),
-            match.robotname,
-            keyframeIndexOf(match),
-            ownerPose(match),
+        liorf::loop_constraint::populateInterRobot(message, _robot_id,
+            query.robotname, keyframeIndexOf(query), ownerPose(query),
+            match.robotname, keyframeIndexOf(match), ownerPose(match),
             candidate.query_from_match,
             candidate.registration_diagnostic.truncated_mse_m2,
             candidate.registration_diagnostic.overlap_ratio,
             candidate.registration_diagnostic.metric_inliers);
-
-        if (recipient == _robot_id)
-            _pub_loop_info->publish(message);
-        else
-            _pub_loop_info_global->publish(message);
+        message.authority_id = _robot_id;
+        message.authority_epoch = _authority_epoch;
+        message.revision = ++_factor_revision;
+        message.from_trajectory_epoch = query.trajectory_epoch;
+        message.to_trajectory_epoch = match.trajectory_epoch;
+        return message;
     }
 
-    // Publish one direct query-to-match factor for every newly PCM-committed
-    // registration. Each endpoint robot receives the same measurement and
-    // represents the other endpoint as a sparse remote state. Previously the
-    // node waited for two registrations and algebraically eliminated the peer
-    // states before publishing a local-only factor.
-    void publishAcceptedDirectFactors() {
-        const auto accepted = _loop_commit_queue.find(_robot_this_th);
-        const auto candidates = _loop_queue.find(_robot_this_th);
-        if (accepted == _loop_commit_queue.end() ||
-            candidates == _loop_queue.end())
-            return;
+    void sendFactorRecord(liorf::msg::LoopConstraint message)
+    {
+        message.robot_id = _robot_id;
+        _pub_loop_info->publish(message);
+        message.robot_id = message.from_robot_id == _robot_id ?
+            message.to_robot_id : message.from_robot_id;
+        _pub_loop_info_global->publish(message);
+    }
 
-        for (const int accepted_index : accepted->second) {
-            if (accepted_index < 0 ||
-                static_cast<std::size_t>(accepted_index) >=
-                    candidates->second.size()) {
-                RCLCPP_WARN(get_logger(),
-                    "PCM returned out-of-range loop index %d",
-                    accepted_index);
+    void publishAcceptedDirectFactors()
+    {
+        std::map<liorf::graph_sync::Identity, liorf::msg::LoopConstraint> desired;
+        for (const int index : _loop_commit_queue[_robot_this_th]) {
+            const auto& candidates = _loop_queue[_robot_this_th];
+            if (index < 0 || static_cast<std::size_t>(index) >= candidates.size()) continue;
+            const auto& candidate = candidates[index];
+            const auto query = _bin_with_id.find(candidate.query_bin);
+            const auto match = _bin_with_id.find(candidate.match_bin);
+            if (query == _bin_with_id.end() || match == _bin_with_id.end()) continue;
+            if (query->second.robotname == match->second.robotname ||
+                (query->second.robotname != _robot_id && match->second.robotname != _robot_id))
                 continue;
-            }
-
-            const LoopCandidate & candidate =
-                candidates->second[static_cast<std::size_t>(accepted_index)];
-            const auto query_it = _bin_with_id.find(candidate.query_bin);
-            const auto match_it = _bin_with_id.find(candidate.match_bin);
-            if (query_it == _bin_with_id.end() ||
-                match_it == _bin_with_id.end()) {
-                RCLCPP_WARN(get_logger(),
-                    "PCM-accepted loop %d has no endpoint metadata",
-                    accepted_index);
+            const auto id = directFactorIdentity(query->second, match->second);
+            if (desired.count(id)) continue;
+            const auto old = _factor_replay.latest().find(id);
+            if (old != _factor_replay.latest().end() && !old->second.retracted)
+                desired[id] = old->second;
+            else
+                desired[id] = directFactor(candidate, query->second, match->second);
+        }
+        std::vector<liorf::msg::LoopConstraint> changes;
+        for (const auto& old : _factor_replay.latest()) {
+            const auto& message = old.second;
+            const std::string peer = message.from_robot_id == _robot_id ?
+                message.to_robot_id : message.from_robot_id;
+            if (robotID2Number(peer) != _robot_this_th || message.retracted || desired.count(old.first))
                 continue;
-            }
-            const SOLiDBin & query = query_it->second;
-            const SOLiDBin & match = match_it->second;
-            if (query.robotname == match.robotname)
-                continue;
-            if (query.robotname != _robot_id && match.robotname != _robot_id) {
-                RCLCPP_WARN(get_logger(),
-                    "PCM-accepted loop does not involve observer %s",
-                    _robot_id.c_str());
-                continue;
-            }
-
-            const auto identity =
-                directFactorIdentity(query, match);
-            if (!_published_direct_factors.insert(identity).second)
-                continue;
-
-            const std::string peer = query.robotname == _robot_id ?
-                match.robotname : query.robotname;
-            publishDirectFactor(candidate, query, match, _robot_id);
-            publishDirectFactor(candidate, query, match, peer);
-            RCLCPP_INFO(get_logger(),
-                "Published direct inter-robot factor %s/%ld -> %s/%ld",
-                query.robotname.c_str(),
-                static_cast<long>(keyframeIndexOf(query)),
-                match.robotname.c_str(),
-                static_cast<long>(keyframeIndexOf(match)));
+            auto withdrawal = message;
+            withdrawal.retracted = true;
+            withdrawal.revision = ++_factor_revision;
+            changes.push_back(withdrawal);
+        }
+        for (const auto& entry : desired) {
+            const auto old = _factor_replay.latest().find(entry.first);
+            if (old == _factor_replay.latest().end() || old->second.retracted)
+                changes.push_back(entry.second);
+        }
+        for (const auto& message : changes) {
+            _factor_replay.put(message);
+            sendFactorRecord(message);
+            RCLCPP_INFO(get_logger(), "%s inter-robot factor %s/%ld -> %s/%ld revision %lu",
+                message.retracted ? "Retracted" : "Published",
+                message.from_robot_id.c_str(), static_cast<long>(message.index_from),
+                message.to_robot_id.c_str(), static_cast<long>(message.index_to),
+                static_cast<unsigned long>(message.revision));
         }
     }
 
@@ -2501,34 +2637,26 @@ private:
             _global_map_trans_optimized.emplace(std::make_pair( _robot_this_th, map_trans_this));
         }
         else{
-            _global_map_trans[_robot_this_th].push_back(map_trans_this);
+            _global_map_trans[_robot_this_th] = {map_trans_this};
             _global_map_trans_optimized[_robot_this_th] = map_trans_this;
         }
 
 
-        if (_global_odom_trans.size() != 0)
-            gtsamFactorGraph();
-
-        if (!_have_trans_to_publish){
-            ite = _global_map_trans.find(0);
-            if(ite == _global_map_trans.end())
-                return;
-            _global_map_trans_optimized[0].intensity = 1;
-            _trans_to_publish = _global_map_trans_optimized[0];
-            _have_trans_to_publish = true;
-        }
-
-        if (_global_map_trans.size() == 1  && _global_odom_trans.size() == 0)
-            _trans_to_publish = _global_map_trans_optimized[0];
+        gtsamFactorGraph();
 
         graph.resize(0);
 
     }
 
     void sendMapOutputMessage(){
-        if (!_have_trans_to_publish || _map_fusion_frame.empty() ||
-            _map_frame.empty())
+        if (_map_fusion_frame.empty() || _map_frame.empty()) return;
+        if (!_have_trans_to_publish) {
+            nav_msgs::msg::Odometry withdrawn;
+            withdrawn.header.frame_id = _map_fusion_frame;
+            withdrawn.child_frame_id = _map_frame;
+            publishAlignment(withdrawn, false, true);
             return;
+        }
 
         // Publish the fleet-map -> per-platform-map alignment. Local
         // map -> odom correction is owned by TransformFusion and is never
@@ -2547,6 +2675,7 @@ private:
         odom2map.pose.pose.orientation = createQuaternionMsgFromRollPitchYaw
             (_trans_to_publish.roll, _trans_to_publish.pitch, _trans_to_publish.yaw);
         _pub_trans_odom2map->publish(odom2map);
+        publishAlignment(odom2map, true, true);
     }
 
     void sendGlobalLoopMessageKDTree(){
@@ -2727,6 +2856,7 @@ private:
              _global_map_trans_optimized[_robot_this_th].pitch,
              _global_map_trans_optimized[_robot_this_th].yaw);
         _pub_trans_odom2odom->publish(odom2odom);
+        publishAlignment(odom2odom, true, false);
 
         if (_publish_factors && !_direct_keyframe_factors)
             sendGlobalLoopMessageKDTree();

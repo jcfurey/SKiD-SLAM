@@ -55,9 +55,9 @@ struct ScanContextBin
 {
     std::string robotname;
 
-    double time;
+    double time = 0.0;
 
-    PointTypePose pose;
+    PointTypePose pose{};
 
     pcl::PointCloud<PointType>::Ptr cloud;
 

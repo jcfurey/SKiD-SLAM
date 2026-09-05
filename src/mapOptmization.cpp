@@ -2,6 +2,9 @@
 #include "liorf/msg/cloud_info.hpp"
 #include "liorf/srv/save_map.hpp"
 #include "liorf/msg/context_info.hpp"
+#include "liorf/msg/graph_state.hpp"
+#include "skid_distributed_graph.hpp"
+#include <filesystem>
 #include "liorf/msg/loop_constraint.hpp"
 #include "loop_constraint_utils.hpp"
 #include "observable_scan_match.hpp"
@@ -77,7 +80,10 @@ public:
     NonlinearFactorGraph gtSAMgraph;
     Values initialEstimate;
     Values optimizedEstimate;
-    ISAM2 *isam;
+    std::unique_ptr<ISAM2> isam;
+    // Export corrections from a graph containing only locally measured
+    // factors, so a peer cannot feed our own inter-robot corrections back.
+    std::unique_ptr<ISAM2> localIsam;
     Values isamCurrentEstimate;
     Eigen::MatrixXd poseCovariance;
 
@@ -205,11 +211,19 @@ public:
     // Equation (6) graph state. Locally owned poses use X(index); peer poses
     // use a separate packed symbol namespace and are tied together by sparse
     // relative-motion constraints derived in the peer's own map frame.
-    std::unique_ptr<liorf::graph_keys::KeySpace> distributedGraphKeys;
-    liorf::remote_graph::TrajectoryStore remoteTrajectories;
     double remoteOdometryRotationStddevRad = 0.05;
     double remoteOdometryTranslationStddevM = 0.20;
     std::set<liorf::remote_graph::FactorIdentity> distributedFactors;
+    liorf::graph_sync::Ledger graphLedger;
+    liorf::graph_sync::PoseStore peerCorrections;
+    const std::uint64_t trajectoryEpoch = liorf::graph_sync::newEpoch();
+    std::uint64_t localGraphRevision = 0;
+    bool distributedGraphDirty = false;
+    std::size_t graphSyncBatchSize = 32;
+    std::size_t graphSyncCursor = 0;
+    rclcpp::Publisher<liorf::msg::GraphState>::SharedPtr pubGraphState;
+    rclcpp::Subscription<liorf::msg::GraphState>::SharedPtr subGraphState;
+    rclcpp::TimerBase::SharedPtr graphSyncTimer;
 
     explicit mapOptimization(const rclcpp::NodeOptions & options)
     : ParamServer("liorf_mapOptmization", options), timeLaserInfoStamp(0, 0, RCL_ROS_TIME)
@@ -217,11 +231,11 @@ public:
         ISAM2Params parameters;
         parameters.relinearizeThreshold = 0.1;
         parameters.relinearizeSkip = 1;
-        isam = new ISAM2(parameters);
+        isam = std::make_unique<ISAM2>(parameters);
+        localIsam = std::make_unique<ISAM2>(parameters);
+        graphLedger.observeTrajectory(robot_id, trajectoryEpoch);
 
         declareLoopClosureParameters();
-        distributedGraphKeys =
-            std::make_unique<liorf::graph_keys::KeySpace>(robot_id);
 
         if (geographicFrameMode == liorf::frames::GeographicFrameMode::ECEF_ANCHORED)
         {
@@ -309,6 +323,23 @@ public:
         }
 
         allocateMemory();
+
+        const std::string solidTopic = declare_and_get<std::string>(
+            "mapfusion.interRobot.solid_topic", "solid");
+        const double syncPeriod = declare_and_get<double>(
+            "mapfusion.graph_sync.period_s", 1.0);
+        const int syncBatch = declare_and_get<int>(
+            "mapfusion.graph_sync.batch_size", 32);
+        if (!std::isfinite(syncPeriod) || syncPeriod <= 0.0 || syncBatch < 1 || syncBatch > 100)
+            throw std::invalid_argument("graph_sync requires a positive period and batch_size in [1,100]");
+        graphSyncBatchSize = static_cast<std::size_t>(syncBatch);
+        pubGraphState = create_publisher<liorf::msg::GraphState>(
+            solidTopic + "/graph_state", 100);
+        subGraphState = create_subscription<liorf::msg::GraphState>(
+            solidTopic + "/graph_state", rclcpp::QoS(100),
+            std::bind(&mapOptimization::graphStateHandler, this, std::placeholders::_1), subOpt);
+        graphSyncTimer = create_wall_timer(std::chrono::duration<double>(syncPeriod),
+            std::bind(&mapOptimization::graphSyncTick, this), callbackGroup);
     }
 
     void allocateMemory()
@@ -364,152 +395,173 @@ public:
     {
         if (msgIn->robot_id != robot_id)
             return;
-
         std::lock_guard<std::mutex> lock(mtx);
-
-        // Messages recorded before the endpoint-aware contract are still
-        // interpreted as local-only factors.
-        const std::string fromRobot = msgIn->from_robot_id.empty() ?
-            msgIn->robot_id : msgIn->from_robot_id;
-        const std::string toRobot = msgIn->to_robot_id.empty() ?
-            msgIn->robot_id : msgIn->to_robot_id;
-        if (msgIn->index_from < 0 || msgIn->index_to < 0) {
-            RCLCPP_WARN(get_logger(),
-                "Rejected loop constraint with negative keyframe index");
+        auto message = *msgIn;
+        if (message.from_robot_id.empty()) message.from_robot_id = robot_id;
+        if (message.to_robot_id.empty()) message.to_robot_id = robot_id;
+        if (!liorf::graph_sync::valid(message)) {
+            RCLCPP_WARN(get_logger(), "Rejected malformed loop constraint");
             return;
         }
-
-        const bool fromLocal = fromRobot == robot_id;
-        const bool toLocal = toRobot == robot_id;
-        if (!fromLocal && !toLocal) {
-            RCLCPP_WARN(get_logger(),
-                "Rejected loop constraint for %s with endpoints %s and %s",
-                robot_id.c_str(), fromRobot.c_str(), toRobot.c_str());
-            return;
-        }
-        if (fromRobot != toRobot && fromLocal == toLocal) {
-            RCLCPP_WARN(get_logger(),
-                "Rejected inter-robot loop without exactly one local endpoint");
-            return;
-        }
-
-        const std::uint64_t indexFrom =
-            static_cast<std::uint64_t>(msgIn->index_from);
-        const std::uint64_t indexTo =
-            static_cast<std::uint64_t>(msgIn->index_to);
-        const std::size_t localPoseCount = cloudKeyPoses3D->size();
-        if ((fromLocal && indexFrom >= localPoseCount) ||
-            (toLocal && indexTo >= localPoseCount)) {
-            RCLCPP_WARN(get_logger(),
-                "Rejected loop constraint whose local keyframe is not available");
-            return;
-        }
-
-        if (!liorf::loop_constraint::validPoseMessage(
-                msgIn->relative_pose.pose)) {
-            RCLCPP_WARN(get_logger(),
-                "Rejected loop constraint with invalid relative pose");
-            return;
-        }
-        const gtsam::Pose3 poseBetween =
-            liorf::loop_constraint::poseFromMessage(msgIn->relative_pose.pose);
-        const auto covariance = liorf::loop_constraint::covarianceFromMessage(
-            msgIn->relative_pose.covariance);
-        if (!liorf::uncertainty::positiveDefiniteCovariance(covariance)) {
-            RCLCPP_WARN(get_logger(),
-                "Rejected loop constraint with invalid covariance");
-            return;
-        }
-
-        const auto identity = liorf::remote_graph::canonicalFactorIdentity(
-            fromRobot, msgIn->index_from, toRobot, msgIn->index_to);
-        if (distributedFactors.find(identity) != distributedFactors.end())
+        const bool fromLocal = message.from_robot_id == robot_id;
+        const bool toLocal = message.to_robot_id == robot_id;
+        if ((!fromLocal && !toLocal) ||
+            (fromLocal && message.from_trajectory_epoch != 0 &&
+             message.from_trajectory_epoch != trajectoryEpoch) ||
+            (toLocal && message.to_trajectory_epoch != 0 &&
+             message.to_trajectory_epoch != trajectoryEpoch))
             return;
 
-        gtsam::Key keyFrom;
-        gtsam::Key keyTo;
-        try {
-            keyFrom = distributedGraphKeys->pose(fromRobot, indexFrom);
-            keyTo = distributedGraphKeys->pose(toRobot, indexTo);
-        } catch (const std::exception & error) {
-            RCLCPP_WARN(get_logger(),
-                "Rejected loop constraint with unusable graph key: %s",
-                error.what());
-            return;
-        }
-
-        gtsam::NonlinearFactorGraph updateGraph;
-        gtsam::Values newValues;
-
-        if (fromRobot != toRobot) {
-            const std::string & remoteRobot = fromLocal ? toRobot : fromRobot;
-            const std::uint64_t remoteIndex = fromLocal ? indexTo : indexFrom;
-            const geometry_msgs::msg::Pose & remotePoseMessage =
-                fromLocal ? msgIn->to_pose : msgIn->from_pose;
-            if (!liorf::loop_constraint::validPoseMessage(remotePoseMessage)) {
-                RCLCPP_WARN(get_logger(),
-                    "Rejected inter-robot loop with invalid peer pose");
+        if (fromLocal && toLocal) {
+            // Comparison-node compatibility: legacy local loops have no
+            // revision authority and are added once to both local graphs.
+            if (message.revision != 0 || message.retracted ||
+                static_cast<std::size_t>(message.index_from) >= cloudKeyPoses3D->size() ||
+                static_cast<std::size_t>(message.index_to) >= cloudKeyPoses3D->size())
                 return;
+            const auto identity = liorf::graph_sync::identity(message);
+            if (distributedFactors.count(identity)) return;
+            gtsam::NonlinearFactorGraph graph;
+            graph.emplace_shared<BetweenFactor<Pose3>>(
+                liorf::graph_keys::localPose(message.index_from),
+                liorf::graph_keys::localPose(message.index_to),
+                liorf::loop_constraint::poseFromMessage(message.relative_pose.pose),
+                gtsam::noiseModel::Gaussian::Covariance(
+                    liorf::loop_constraint::covarianceFromMessage(message.relative_pose.covariance)));
+            try {
+                auto updated = std::make_unique<ISAM2>(*isam);
+                auto updatedLocal = std::make_unique<ISAM2>(*localIsam);
+                updated->update(graph);
+                updatedLocal->update(graph);
+                for (int iteration = 0; iteration < 5; ++iteration) {
+                    updated->update();
+                    updatedLocal->update();
+                }
+                isam = std::move(updated);
+                localIsam = std::move(updatedLocal);
+                ++localGraphRevision;
+                distributedFactors.insert(identity);
+                isamCurrentEstimate = isam->calculateEstimate();
+                aLoopIsClosed = true;
+                correctPoses();
+                publishFrames();
+            } catch (const std::exception& error) {
+                RCLCPP_ERROR(get_logger(), "Local loop update failed: %s", error.what());
             }
-            const gtsam::Pose3 remoteOwnerPose =
-                liorf::loop_constraint::poseFromMessage(remotePoseMessage);
-            const gtsam::Key remoteKey = fromLocal ? keyTo : keyFrom;
-            const gtsam::Key localKey = fromLocal ? keyFrom : keyTo;
-
-            if (!isam->valueExists(localKey)) {
-                RCLCPP_WARN(get_logger(),
-                    "Rejected inter-robot loop whose local graph key is absent");
-                return;
-            }
-            if (!isam->valueExists(remoteKey)) {
-                const gtsam::Pose3 localEstimate =
-                    isam->calculateEstimate<gtsam::Pose3>(localKey);
-                const gtsam::Pose3 remoteInitial =
-                    liorf::remote_graph::initialRemotePose(
-                        localEstimate, poseBetween, fromLocal);
-                newValues.insert(remoteKey, remoteInitial);
-            }
-
-            const auto remoteEdge = remoteTrajectories.insert(
-                remoteRobot, remoteIndex, remoteOwnerPose);
-            if (remoteEdge.has_value()) {
-                const gtsam::Key edgeFrom = distributedGraphKeys->pose(
-                    remoteEdge->robot_id, remoteEdge->index_from);
-                const gtsam::Key edgeTo = distributedGraphKeys->pose(
-                    remoteEdge->robot_id, remoteEdge->index_to);
-                updateGraph.add(BetweenFactor<Pose3>(
-                    edgeFrom, edgeTo, remoteEdge->measurement,
-                    remoteOdometryNoise()));
-            }
-        }
-
-        updateGraph.add(BetweenFactor<Pose3>(
-            keyFrom, keyTo, poseBetween,
-            gtsam::noiseModel::Gaussian::Covariance(covariance)));
-        try {
-            isam->update(updateGraph, newValues);
-            for (int iteration = 0; iteration < 5; ++iteration)
-                isam->update();
-            isamCurrentEstimate = isam->calculateEstimate();
-        } catch (const std::exception & error) {
-            RCLCPP_ERROR(get_logger(),
-                "Failed to add distributed loop factor: %s", error.what());
             return;
         }
+        // Keep the newest record even when its local keyframe has not yet
+        // arrived. The timer applies a batch, and duplicates are inexpensive.
+        if (graphLedger.accept(message))
+            distributedGraphDirty = true;
+    }
 
-        distributedFactors.insert(identity);
-        aLoopIsClosed = true;
+    std::set<liorf::graph_sync::PoseIdentity> requestedPeerPoses() const
+    {
+        std::set<liorf::graph_sync::PoseIdentity> result;
+        for (const auto& message : graphLedger.active()) {
+            const bool fromLocal = message.from_robot_id == robot_id;
+            result.emplace(fromLocal ? message.to_robot_id : message.from_robot_id,
+                fromLocal ? message.to_trajectory_epoch : message.from_trajectory_epoch,
+                fromLocal ? message.index_to : message.index_from);
+        }
+        return result;
+    }
 
-        RCLCPP_INFO(get_logger(),
-            "Accepted loop factor %s/%ld -> %s/%ld: error=%.6f m^2 "
-            "overlap=%.3f inliers=%zu",
-            fromRobot.c_str(), static_cast<long>(msgIn->index_from),
-            toRobot.c_str(), static_cast<long>(msgIn->index_to),
-            msgIn->registration_error_m2, msgIn->overlap_ratio,
-            static_cast<std::size_t>(msgIn->registration_inliers));
+    void graphStateHandler(const liorf::msg::GraphState::ConstSharedPtr& message)
+    {
+        if (message->owner_robot_id.empty() || message->requester_robot_id.empty() ||
+            message->keyframe_indices.size() > 100 || message->poses.size() > 100)
+            return;
+        std::lock_guard<std::mutex> lock(mtx);
+        if (message->request) {
+            if (message->owner_robot_id != robot_id ||
+                !message->poses.empty())
+                return;
+            liorf::msg::GraphState response;
+            response.header.stamp = now();
+            response.owner_robot_id = robot_id;
+            response.requester_robot_id = message->requester_robot_id;
+            response.trajectory_epoch = trajectoryEpoch;
+            response.revision = localGraphRevision;
+            // An epoch-only reply invalidates a retired owner trajectory.
+            if (message->trajectory_epoch == trajectoryEpoch) {
+                for (const auto index : message->keyframe_indices) {
+                    if (index < 0 || static_cast<std::size_t>(index) >= cloudKeyPoses3D->size())
+                        continue;
+                    const auto key = liorf::graph_keys::localPose(index);
+                    if (!localIsam->valueExists(key)) continue;
+                    response.keyframe_indices.push_back(index);
+                    response.poses.push_back(liorf::loop_constraint::poseToMessage(
+                        localIsam->calculateEstimate<Pose3>(key)));
+                }
+            }
+            pubGraphState->publish(response);
+            return;
+        }
+        if (message->requester_robot_id != robot_id ||
+            message->owner_robot_id == robot_id || message->trajectory_epoch == 0 ||
+            message->poses.size() != message->keyframe_indices.size())
+            return;
+        for (const auto& pose : message->poses)
+            if (!liorf::loop_constraint::validPoseMessage(pose)) return;
+        const auto interests = requestedPeerPoses();
+        const bool interested = std::any_of(interests.begin(), interests.end(),
+            [&](const auto& key) { return std::get<0>(key) == message->owner_robot_id; });
+        if (!interested) return;
+        if (graphLedger.observeTrajectory(message->owner_robot_id, message->trajectory_epoch))
+            distributedGraphDirty = true;
+        for (std::size_t i = 0; i < message->poses.size(); ++i) {
+            const liorf::graph_sync::PoseIdentity key{message->owner_robot_id,
+                message->trajectory_epoch, message->keyframe_indices[i]};
+            if (!interests.count(key)) continue;
+            auto found = peerCorrections.find(key);
+            if (found != peerCorrections.end() && found->second.revision >= message->revision)
+                continue;
+            const auto pose = liorf::loop_constraint::poseFromMessage(message->poses[i]);
+            if (found == peerCorrections.end() || !found->second.pose.equals(pose, 1.0e-6))
+                distributedGraphDirty = true;
+            peerCorrections[key] = {message->revision, pose};
+        }
+    }
 
-        correctPoses();
-        publishFrames();
+    void graphSyncTick()
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        if (distributedGraphDirty && !cloudKeyPoses3D->empty()) {
+            try {
+                auto updated = liorf::graph_sync::rebuild(*isam, graphLedger.active(),
+                    peerCorrections, robot_id, remoteOdometryNoise());
+                isam = std::move(updated);
+                isamCurrentEstimate = isam->calculateEstimate();
+                distributedGraphDirty = false;
+                aLoopIsClosed = true;
+                correctPoses();
+                publishFrames();
+            } catch (const std::exception& error) {
+                RCLCPP_ERROR(get_logger(), "Distributed graph update deferred: %s", error.what());
+            }
+        }
+        const auto interests = requestedPeerPoses();
+        for (auto it = peerCorrections.begin(); it != peerCorrections.end();) {
+            if (!interests.count(it->first)) it = peerCorrections.erase(it);
+            else ++it;
+        }
+        if (interests.empty()) return;
+        const std::vector<liorf::graph_sync::PoseIdentity> poses(interests.begin(), interests.end());
+        std::map<std::pair<std::string, std::uint64_t>, liorf::msg::GraphState> requests;
+        for (std::size_t count = 0; count < std::min(graphSyncBatchSize, poses.size()); ++count) {
+            const auto& key = poses[(graphSyncCursor + count) % poses.size()];
+            auto& request = requests[{std::get<0>(key), std::get<1>(key)}];
+            request.header.stamp = now();
+            request.request = true;
+            request.owner_robot_id = std::get<0>(key);
+            request.requester_robot_id = robot_id;
+            request.trajectory_epoch = std::get<1>(key);
+            request.keyframe_indices.push_back(std::get<2>(key));
+        }
+        graphSyncCursor = (graphSyncCursor + std::min(graphSyncBatchSize, poses.size())) % poses.size();
+        for (const auto& request : requests) pubGraphState->publish(request.second);
     }
 
     void laserCloudInfoHandler(const liorf::msg::CloudInfo::ConstSharedPtr& msgIn)
@@ -736,57 +788,57 @@ public:
     bool saveMapService(const std::shared_ptr<liorf::srv::SaveMap::Request> req,
                         std::shared_ptr<liorf::srv::SaveMap::Response> res)
     {
-      string saveMapDirectory;
-
-      cout << "****************************************************" << endl;
-      cout << "Saving map to pcd files ..." << endl;
-      if(req->destination.empty()) saveMapDirectory = std::getenv("HOME") + savePCDDirectory;
-      else saveMapDirectory = std::getenv("HOME") + req->destination;
-      cout << "Save destination: " << saveMapDirectory << endl;
-      // create directory and remove old files;
-      int unused = system((std::string("exec rm -r ") + saveMapDirectory).c_str());
-      unused = system((std::string("mkdir -p ") + saveMapDirectory).c_str());
-      // save key frame transformations
-      pcl::io::savePCDFileBinary(saveMapDirectory + "/trajectory.pcd", *cloudKeyPoses3D);
-      pcl::io::savePCDFileBinary(saveMapDirectory + "/transformations.pcd", *cloudKeyPoses6D);
-      // extract global point cloud map
-
-      pcl::PointCloud<PointType>::Ptr globalSurfCloud(new pcl::PointCloud<PointType>());
-      pcl::PointCloud<PointType>::Ptr globalSurfCloudDS(new pcl::PointCloud<PointType>());
-      pcl::PointCloud<PointType>::Ptr globalMapCloud(new pcl::PointCloud<PointType>());
-      for (int i = 0; i < (int)cloudKeyPoses3D->size(); i++) {
-          *globalSurfCloud   += *transformPointCloud(surfCloudKeyFrames[i],    &cloudKeyPoses6D->points[i]);
-          cout << "\r" << std::flush << "Processing feature cloud " << i << " of " << cloudKeyPoses6D->size() << " ...";
-      }
-
-      if(req->resolution != 0)
-      {
-        cout << "\n\nSave resolution: " << req->resolution << endl;
-        // down-sample and save surf cloud
-        downSizeFilterSurf.setInputCloud(globalSurfCloud);
-        downSizeFilterSurf.setLeafSize(req->resolution, req->resolution, req->resolution);
-        downSizeFilterSurf.filter(*globalSurfCloudDS);
-        pcl::io::savePCDFileBinary(saveMapDirectory + "/SurfMap.pcd", *globalSurfCloudDS);
-      }
-      else
-      {
-
-        // save surf cloud
-        pcl::io::savePCDFileBinary(saveMapDirectory + "/SurfMap.pcd", *globalSurfCloud);
-      }
-
-      // save global point cloud map
-      *globalMapCloud += *globalSurfCloud;
-
-      int ret = pcl::io::savePCDFileBinary(saveMapDirectory + "/GlobalMap.pcd", *globalMapCloud);
-      res->success = ret == 0;
-
-      downSizeFilterSurf.setLeafSize(mappingSurfLeafSize, mappingSurfLeafSize, mappingSurfLeafSize);
-
-      cout << "****************************************************" << endl;
-      cout << "Saving map to pcd files completed\n" << endl;
-
-      return true;
+        res->success = false;
+        if (!std::isfinite(req->resolution) || req->resolution < 0.0) {
+            RCLCPP_ERROR(get_logger(), "Map resolution must be finite and non-negative");
+            return true;
+        }
+        try {
+            std::filesystem::path directory(req->destination);
+            if (directory.empty()) {
+                const char* userHome = std::getenv("HOME");
+                if (!userHome) throw std::runtime_error("HOME is not configured");
+                directory = std::filesystem::path(userHome) /
+                    std::filesystem::path(savePCDDirectory).relative_path();
+            }
+            // Save only this service's files. Never recursively delete a
+            // user-supplied directory or interpret it as shell command text.
+            std::filesystem::create_directories(directory);
+            pcl::PointCloud<PointType> poses3D;
+            pcl::PointCloud<PointTypePose> poses6D;
+            std::vector<pcl::PointCloud<PointType>::Ptr> scans;
+            {
+                std::lock_guard<std::mutex> lock(mtx);
+                poses3D = *cloudKeyPoses3D;
+                poses6D = *cloudKeyPoses6D;
+                scans = surfCloudKeyFrames;
+            }
+            if (poses3D.empty()) return true;
+            const auto save = [&directory](const char* name, const auto& cloud) {
+                if (pcl::io::savePCDFileBinary((directory / name).string(), cloud) != 0)
+                    throw std::runtime_error(std::string("failed to write ") + name);
+            };
+            save("trajectory.pcd", poses3D);
+            save("transformations.pcd", poses6D);
+            pcl::PointCloud<PointType>::Ptr global(new pcl::PointCloud<PointType>());
+            for (std::size_t i = 0; i < scans.size(); ++i)
+                *global += *transformPointCloud(scans[i], &poses6D.points[i]);
+            if (req->resolution > 0.0) {
+                pcl::VoxelGrid<PointType> filter;
+                filter.setLeafSize(req->resolution, req->resolution, req->resolution);
+                filter.setInputCloud(global);
+                pcl::PointCloud<PointType> reduced;
+                filter.filter(reduced);
+                save("SurfMap.pcd", reduced);
+            } else {
+                save("SurfMap.pcd", *global);
+            }
+            save("GlobalMap.pcd", *global);
+            res->success = true;
+        } catch (const std::exception& error) {
+            RCLCPP_ERROR(get_logger(), "Map save failed: %s", error.what());
+        }
+        return true;
     }
 
     void visualizeGlobalMapThread()
@@ -2076,6 +2128,11 @@ public:
         // gtSAMgraph.print("GTSAM Graph:\n");
 
         // update iSAM
+        localIsam->update(gtSAMgraph, initialEstimate);
+        localIsam->update();
+        if (aLoopIsClosed)
+            for (int iteration = 0; iteration < 5; ++iteration) localIsam->update();
+        ++localGraphRevision;
         isam->update(gtSAMgraph, initialEstimate);
         isam->update();
 
@@ -2178,7 +2235,15 @@ public:
         //     pubFeatureCloud, laserCloudCornerLastFeature,
         //     cloudInfo.header.stamp, lidarFrameId);
         cloudInfo.cloud_surface = publishCloud(pubFeatureCloud,  laserCloudSurfLastFeature,  cloudInfo.header.stamp, lidarFrameId);
+        cloudInfo.trajectory_epoch = trajectoryEpoch;
         pubLaserCloudInfo->publish(cloudInfo);
+        // A previously replayed constraint may now have its local endpoint.
+        for (const auto& message : graphLedger.active()) {
+            const auto localIndex = message.from_robot_id == robot_id ?
+                message.index_from : message.index_to;
+            if (localIndex == static_cast<std::int64_t>(keyframeIndex))
+                distributedGraphDirty = true;
+        }
     }
 
     void correctPoses()
@@ -2212,6 +2277,15 @@ public:
                 updatePath(cloudKeyPoses6D->points[i]);
             }
 
+            const auto latestKey = liorf::graph_keys::localPose(numPoses - 1);
+            const auto& latest = isamCurrentEstimate.at<Pose3>(latestKey);
+            transformTobeMapped[0] = latest.rotation().roll();
+            transformTobeMapped[1] = latest.rotation().pitch();
+            transformTobeMapped[2] = latest.rotation().yaw();
+            transformTobeMapped[3] = latest.x();
+            transformTobeMapped[4] = latest.y();
+            transformTobeMapped[5] = latest.z();
+            poseCovariance = isam->marginalCovariance(latestKey);
             aLoopIsClosed = false;
         }
     }

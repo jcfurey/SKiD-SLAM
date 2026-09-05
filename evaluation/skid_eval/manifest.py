@@ -1,6 +1,7 @@
 """Dataset manifests: what to evaluate, and what to compare it against."""
 
 import pathlib
+import math
 
 import yaml
 
@@ -14,6 +15,8 @@ class ManifestError(ValueError):
 
 class Robot:
     def __init__(self, entry, index):
+        if not isinstance(entry, dict):
+            raise ManifestError(f"robots[{index}] must be a mapping")
         if "id" not in entry:
             raise ManifestError(f"robots[{index}] has no id")
         self.id = str(entry["id"])
@@ -45,6 +48,8 @@ class Manifest:
         self.robots = [Robot(entry, index)
                        for index, entry in enumerate(robots)]
 
+        if len({robot.id for robot in self.robots}) != len(self.robots):
+            raise ManifestError("robot IDs must be unique")
         self.alignment = str(document.get("alignment", "rigid"))
         if self.alignment not in _ALIGNMENTS:
             raise ManifestError(
@@ -53,7 +58,8 @@ class Manifest:
 
         self.association_max_time_difference_s = float(
             document.get("association_max_time_difference_s", 0.02))
-        if self.association_max_time_difference_s <= 0.0:
+        if (not math.isfinite(self.association_max_time_difference_s) or
+                self.association_max_time_difference_s <= 0.0):
             raise ManifestError(
                 "association_max_time_difference_s must be positive")
 
@@ -77,6 +83,16 @@ class Manifest:
         self.num_sectors = int(resources.get("num_sectors", 60))
         self.scan_context_rings = resources.get("scan_context_rings")
 
+        for name, value in (
+            ("revisit_distance_m", self.revisit_distance_m),
+            ("min_time_gap_s", self.place_min_time_gap_s),
+            ("translation_threshold_m", self.registration_translation_threshold_m),
+            ("rotation_threshold_deg", self.registration_rotation_threshold_deg),
+        ):
+            if not math.isfinite(value) or value < 0:
+                raise ManifestError(f"{name} must be finite and non-negative")
+        if self.knn_feature_dim < 1 or self.num_sectors < 1:
+            raise ManifestError("descriptor dimensions must be positive")
         self.expected = self._section(document, "expected")
 
     @staticmethod

@@ -164,6 +164,8 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/ContextInfo.msg"
   "msg/LoopConstraint.msg"
   "msg/LoopDiagnostic.msg"
+  "msg/GraphState.msg"
+  "msg/AlignmentState.msg"
   "msg/ScanRequest.msg"
   "msg/ScanData.msg"
   "srv/SaveMap.srv"
@@ -281,11 +283,17 @@ target_link_libraries(${PROJECT_NAME}_imageProjection
   ${cpp_typesupport_target} ${PCL_LIBRARIES} ${OpenCV_LIBRARIES})
 
 # Mapping Optimization
+add_library(skid_distributed_graph STATIC src/skid_distributed_graph.cpp)
+target_include_directories(skid_distributed_graph PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+target_link_libraries(skid_distributed_graph PUBLIC
+  ${cpp_typesupport_target} skid_pose_uncertainty gtsam)
+
 ament_auto_add_executable(${PROJECT_NAME}_mapOptmization src/mapOptmization.cpp ${common_lib})
 target_link_libraries(${PROJECT_NAME}_mapOptmization
   ${cpp_typesupport_target} ${PCL_LIBRARIES} ${OpenCV_LIBRARIES} OpenMP::OpenMP_CXX
   ${GeographicLib_LIBRARIES} gtsam skid_pose_uncertainty
-  skid_registration skid_loop_detection skid_solid_descriptor)
+  skid_registration skid_loop_detection skid_solid_descriptor skid_distributed_graph)
 
 # IMU Preintegration
 ament_auto_add_executable(${PROJECT_NAME}_imuPreintegration src/imuPreintegration.cpp ${common_lib})
@@ -318,6 +326,8 @@ target_link_libraries(${PROJECT_NAME}_mapFusionSC
 
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_skid_graph_sync test/test_skid_graph_sync.cpp)
+  target_link_libraries(test_skid_graph_sync skid_distributed_graph)
   ament_add_gtest(test_observable_scan_match
     test/test_observable_scan_match.cpp)
   target_include_directories(test_observable_scan_match PRIVATE include)

@@ -904,3 +904,57 @@ def test_factor_scoring_reports_ground_truth_gaps_without_reusing_bad_poses():
     assert report["associated_factors"] == 0
     assert report["translation"] is None
     assert report["unassociated"][0]["reason"] == "ground_truth_time_gap"
+
+
+def test_factor_audit_treats_revisioned_replays_as_idempotent():
+    from dataclasses import replace
+    from skid_eval.factor_scoring import Endpoint, Factor, compare_factor_deliveries
+    pose = Pose.from_quaternion(0, (1, 0, 0), (0, 0, 0, 1))
+    factor = Factor('a', Endpoint('a', 0, 10), Endpoint('b', 0, 20), pose,
+                    authority_id='b', authority_epoch=30, revision=1)
+    peer = replace(factor, recipient='b')
+    report, active = compare_factor_deliveries({'a': [factor] * 4, 'b': [peer] * 2})
+    assert report['symmetric']
+    assert report['replay_messages'] == 4
+    assert len(active) == 1
+
+
+def test_factor_audit_detects_missed_withdrawal_and_conflicting_revisions():
+    from dataclasses import replace
+    from skid_eval.factor_scoring import Endpoint, Factor, compare_factor_deliveries
+    pose = Pose.from_quaternion(0, (1, 0, 0), (0, 0, 0, 1))
+    factor = Factor('a', Endpoint('a', 0, 10), Endpoint('b', 0, 20), pose,
+                    authority_id='b', authority_epoch=30, revision=1)
+    withdrawal = replace(factor, revision=2, retracted=True)
+    report, _ = compare_factor_deliveries({
+        'a': [factor, withdrawal, factor], 'b': [replace(factor, recipient='b')]})
+    assert not report['symmetric']
+    assert report['revision_mismatches'] == ['b']
+    report, active = compare_factor_deliveries({
+        'a': [withdrawal, factor],
+        'b': [replace(withdrawal, recipient='b'), replace(factor, recipient='b')]})
+    assert report['symmetric']
+    assert not active
+    conflict = replace(factor, covariance=(99.0,))
+    report, _ = compare_factor_deliveries({
+        'a': [factor, conflict], 'b': [replace(factor, recipient='b')]})
+    assert not report['symmetric']
+    assert report['duplicate_conflicts']
+
+
+@pytest.mark.parametrize('value', ['nan', 'inf', '-inf'])
+def test_tum_rejects_nonfinite_coordinates(value):
+    with pytest.raises(ValueError, match='finite'):
+        parse_tum([f'0 {value} 0 0 0 0 0 1'])
+
+
+def test_manifest_rejects_duplicate_robots_and_nonfinite_tolerance():
+    from skid_eval.manifest import Manifest, ManifestError
+    document = _minimal_manifest()
+    document['robots'] = [{'id': 'same'}, {'id': 'same'}]
+    with pytest.raises(ManifestError, match='unique'):
+        Manifest(document)
+    document['robots'] = [{'id': 'a'}]
+    document['association_max_time_difference_s'] = float('nan')
+    with pytest.raises(ManifestError, match='positive'):
+        Manifest(document)

@@ -24,6 +24,7 @@ float32 pose_intensity
 # Keyframe index within the publishing robot's trajectory. Identifies this
 # place for a later ScanRequest, so the scan itself need not be announced.
 int64 keyframe_index
+uint64 trajectory_epoch
 
 # Point cloud messages
 #

@@ -7,9 +7,11 @@ string observer_robot_id
 
 # Candidate identity. query is the newly processed place; match is the
 # retrieved place. Times are the original keyframe timestamps in seconds.
+uint64 query_trajectory_epoch
 string query_robot_id
 int64 query_keyframe_index
 float64 query_time
+uint64 match_trajectory_epoch
 string match_robot_id
 int64 match_keyframe_index
 float64 match_time
@@ -57,7 +59,6 @@ float64 metric_time_ms
 bool pcm_evaluated
 bool pcm_accepted
 # True once the candidate has satisfied the configured publication policy.
-# Commitments are monotonic because the current back-end cannot retract a
-# factor that was already published.
+# A persistent exclusion retracts a previously committed factor.
 bool pcm_committed
 uint64 pcm_clique_size

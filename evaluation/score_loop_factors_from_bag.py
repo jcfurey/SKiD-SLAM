@@ -101,10 +101,17 @@ def _read_messages(bag, storage, factor_topics, diagnostic_topic):
             deliveries[topic].append(Factor(
                 recipient=message.robot_id,
                 from_endpoint=Endpoint(
-                    message.from_robot_id, int(message.index_from)),
+                    message.from_robot_id, int(message.index_from),
+                    int(getattr(message, "from_trajectory_epoch", 0))),
                 to_endpoint=Endpoint(
-                    message.to_robot_id, int(message.index_to)),
-                relative_pose=_pose_from_message(message.relative_pose.pose)))
+                    message.to_robot_id, int(message.index_to),
+                    int(getattr(message, "to_trajectory_epoch", 0))),
+                relative_pose=_pose_from_message(message.relative_pose.pose),
+                authority_id=getattr(message, "authority_id", ""),
+                authority_epoch=int(getattr(message, "authority_epoch", 0)),
+                revision=int(getattr(message, "revision", 0)),
+                retracted=bool(getattr(message, "retracted", False)),
+                covariance=tuple(message.relative_pose.covariance)))
             continue
 
         if (message.stage != "registration" or
@@ -114,11 +121,13 @@ def _read_messages(bag, storage, factor_topics, diagnostic_topic):
         timestamp_observations.extend((
             EndpointTimestamp(
                 Endpoint(message.query_robot_id,
-                         int(message.query_keyframe_index)),
+                         int(message.query_keyframe_index),
+                         int(getattr(message, "query_trajectory_epoch", 0))),
                 float(message.query_time)),
             EndpointTimestamp(
                 Endpoint(message.match_robot_id,
-                         int(message.match_keyframe_index)),
+                         int(message.match_keyframe_index),
+                         int(getattr(message, "match_trajectory_epoch", 0))),
                 float(message.match_time)),
         ))
     return deliveries, timestamp_observations, accepted_diagnostics
