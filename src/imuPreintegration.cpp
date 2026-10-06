@@ -684,6 +684,12 @@ public:
             else
                 break;
         }
+        // Sparse IMUs can leave a lidar correction interval with no samples.
+        // A zero-duration preintegration gives a singular factor and zero bias
+        // sigmas. Keep the graph unchanged until an IMU interval is available.
+        if (!validIntegrationStep(imuIntegratorOpt_->deltaTij(), "lidar correction without IMU samples"))
+            return;
+
         // add imu factor to graph
         const gtsam::PreintegratedImuMeasurements& preint_imu = dynamic_cast<const gtsam::PreintegratedImuMeasurements&>(*imuIntegratorOpt_);
         gtsam::ImuFactor imu_factor(X(key - 1), V(key - 1), X(key), V(key), B(key - 1), preint_imu);

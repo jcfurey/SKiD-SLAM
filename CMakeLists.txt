@@ -387,6 +387,30 @@ if(BUILD_TESTING)
   # different type stops the node from starting. Both are caught here rather
   # than on the robot.
   find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  add_test(NAME test_scan_matching_jacobian
+    COMMAND ${Python3_EXECUTABLE} -m pytest -q
+      ${CMAKE_CURRENT_SOURCE_DIR}/test/test_scan_matching_jacobian.py)
+
+  # Exercise the actual nodes: correction intervals shorter than IMU capture,
+  # and deskew endpoints falling between sparse IMU samples. Separate DDS
+  # domains keep these fixtures away from a running robot or simulator.
+  add_test(NAME test_sparse_imu_solver
+    COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/test/check_sparse_imu.py
+      --executable $<TARGET_FILE:liorf_imuPreintegration>
+      --output-dir ${CMAKE_CURRENT_BINARY_DIR}/Testing/sparse_imu)
+  add_test(NAME test_sparse_imu_deskew
+    COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/test/check_sparse_deskew.py
+      --executable $<TARGET_FILE:liorf_imageProjection>
+      --output-dir ${CMAKE_CURRENT_BINARY_DIR}/Testing/sparse_deskew)
+  set_tests_properties(test_sparse_imu_solver PROPERTIES
+    TIMEOUT 45
+    ENVIRONMENT "ROS_DOMAIN_ID=204;ROS_LOG_DIR=${CMAKE_CURRENT_BINARY_DIR}/Testing/sparse_imu/ros_logs")
+  set_tests_properties(test_sparse_imu_deskew PROPERTIES
+    TIMEOUT 45
+    ENVIRONMENT "ROS_DOMAIN_ID=205;ROS_LOG_DIR=${CMAKE_CURRENT_BINARY_DIR}/Testing/sparse_deskew/ros_logs")
+
   add_test(NAME validate_config_parameters
     COMMAND ${Python3_EXECUTABLE}
       ${CMAKE_CURRENT_SOURCE_DIR}/test/validate_config_parameters.py

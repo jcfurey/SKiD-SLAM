@@ -50,6 +50,9 @@
 
   <test_depend>ament_cmake_gtest</test_depend>
   <test_depend>python3-pytest</test_depend>
+  <test_depend>python3-numpy</test_depend>
+  <test_depend>rclpy</test_depend>
+  <test_depend>sensor_msgs_py</test_depend>
 
   <member_of_group>rosidl_interface_packages</member_of_group>
 

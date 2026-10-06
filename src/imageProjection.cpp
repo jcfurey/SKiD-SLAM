@@ -526,9 +526,10 @@ public:
     {
         cloudInfo.imu_available = false;
 
-        while (!imuQueue.empty())
+        // Retain the last sample at/before scan start, including sparse IMUs.
+        while (imuQueue.size() > 1)
         {
-            if (stamp2Sec(imuQueue.front().header.stamp) < timeScanCur - 0.01)
+            if (stamp2Sec(imuQueue[1].header.stamp) <= timeScanCur)
                 imuQueue.pop_front();
             else
                 break;
@@ -550,9 +551,6 @@ public:
                     imuRPY2rosRPY(&thisImuMsg, &cloudInfo.imu_roll_init, &cloudInfo.imu_pitch_init, &cloudInfo.imu_yaw_init);
             }
 
-            if (currentImuTime > timeScanEnd + 0.01)
-                break;
-
             if (imuPointerCur == 0){
                 imuRotX[0] = 0;
                 imuRotY[0] = 0;
@@ -573,6 +571,9 @@ public:
             imuRotZ[imuPointerCur] = imuRotZ[imuPointerCur-1] + angular_z * timeDiff;
             imuTime[imuPointerCur] = currentImuTime;
             ++imuPointerCur;
+            // Include the first sample at/after the end for interpolation.
+            if (currentImuTime >= timeScanEnd)
+                break;
         }
 
         --imuPointerCur;
