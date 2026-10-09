@@ -865,9 +865,6 @@ public:
         if (pubLaserCloudSurround->get_subscription_count() == 0)
             return;
 
-        if (cloudKeyPoses3D->points.empty() == true)
-            return;
-
         pcl::KdTreeFLANN<PointType>::Ptr kdtreeGlobalMap(new pcl::KdTreeFLANN<PointType>());;
         pcl::PointCloud<PointType>::Ptr globalMapKeyPoses(new pcl::PointCloud<PointType>());
         pcl::PointCloud<PointType>::Ptr globalMapKeyPosesDS(new pcl::PointCloud<PointType>());
@@ -877,14 +874,26 @@ public:
         // kd-tree to find near key frames to visualize
         std::vector<int> pointSearchIndGlobalMap;
         std::vector<float> pointSearchSqDisGlobalMap;
-        // search near key frames to visualize
+        // This runs on its own thread while mapping appends key frames and loop
+        // or graph-sync corrections rewrite their poses: copy what it reads under
+        // the lock (the key frame clouds themselves are never modified)
+        pcl::PointCloud<PointType>::Ptr keyPoses3D(new pcl::PointCloud<PointType>());
+        pcl::PointCloud<PointTypePose>::Ptr keyPoses6D(new pcl::PointCloud<PointTypePose>());
+        std::vector<pcl::PointCloud<PointType>::Ptr> keyFrames;
         mtx.lock();
-        kdtreeGlobalMap->setInputCloud(cloudKeyPoses3D);
-        kdtreeGlobalMap->radiusSearch(cloudKeyPoses3D->back(), globalMapVisualizationSearchRadius, pointSearchIndGlobalMap, pointSearchSqDisGlobalMap, 0);
+        *keyPoses3D = *cloudKeyPoses3D;
+        *keyPoses6D = *cloudKeyPoses6D;
+        keyFrames = surfCloudKeyFrames;
         mtx.unlock();
+        if (keyPoses3D->empty())
+            return;
+
+        // search near key frames to visualize
+        kdtreeGlobalMap->setInputCloud(keyPoses3D);
+        kdtreeGlobalMap->radiusSearch(keyPoses3D->back(), globalMapVisualizationSearchRadius, pointSearchIndGlobalMap, pointSearchSqDisGlobalMap, 0);
 
         for (int i = 0; i < (int)pointSearchIndGlobalMap.size(); ++i)
-            globalMapKeyPoses->push_back(cloudKeyPoses3D->points[pointSearchIndGlobalMap[i]]);
+            globalMapKeyPoses->push_back(keyPoses3D->points[pointSearchIndGlobalMap[i]]);
         // downsample near selected key frames
         pcl::VoxelGrid<PointType> downSizeFilterGlobalMapKeyPoses; // for global map visualization
         downSizeFilterGlobalMapKeyPoses.setLeafSize(globalMapVisualizationPoseDensity, globalMapVisualizationPoseDensity, globalMapVisualizationPoseDensity); // for global map visualization
@@ -894,15 +903,17 @@ public:
         for(auto& pt : globalMapKeyPosesDS->points)
         {
             kdtreeGlobalMap->nearestKSearch(pt, 1, pointSearchIndGlobalMap, pointSearchSqDisGlobalMap);
-            pt.intensity = cloudKeyPoses3D->points[pointSearchIndGlobalMap[0]].intensity;
+            pt.intensity = keyPoses3D->points[pointSearchIndGlobalMap[0]].intensity;
         }
 
         // extract visualized and downsampled key frames
         for (int i = 0; i < (int)globalMapKeyPosesDS->size(); ++i){
-            if (common_lib_->pointDistance(globalMapKeyPosesDS->points[i], cloudKeyPoses3D->back()) > globalMapVisualizationSearchRadius)
+            if (common_lib_->pointDistance(globalMapKeyPosesDS->points[i], keyPoses3D->back()) > globalMapVisualizationSearchRadius)
                 continue;
             int thisKeyInd = (int)globalMapKeyPosesDS->points[i].intensity;
-            *globalMapKeyFrames += *transformPointCloud(surfCloudKeyFrames[thisKeyInd],    &cloudKeyPoses6D->points[thisKeyInd]);
+            if (thisKeyInd < 0 || thisKeyInd >= (int)keyFrames.size() || thisKeyInd >= (int)keyPoses6D->size())
+                continue;
+            *globalMapKeyFrames += *transformPointCloud(keyFrames[thisKeyInd],    &keyPoses6D->points[thisKeyInd]);
         }
         // downsample visualized points
         pcl::VoxelGrid<PointType> downSizeFilterGlobalMapKeyFrames; // for global map visualization
@@ -1470,10 +1481,16 @@ public:
         // use imu pre-integration estimation for pose guess
         static bool lastImuPreTransAvailable = false;
         static Eigen::Affine3f lastImuPreTransformation;
+        static uint64_t lastOdomResetCount = 0;
         if (cloudInfo.odom_available == true)
         {
             Eigen::Affine3f transBack = pcl::getTransformation(cloudInfo.initial_guess_x,    cloudInfo.initial_guess_y,     cloudInfo.initial_guess_z, 
                                                                cloudInfo.initial_guess_roll, cloudInfo.initial_guess_pitch, cloudInfo.initial_guess_yaw);
+            // A pre-integration restart re-anchors its odometry: the step from the
+            // last (diverged) pose to the new anchor is not motion. Start over.
+            if (cloudInfo.odom_reset_count != lastOdomResetCount)
+                lastImuPreTransAvailable = false;
+            lastOdomResetCount = cloudInfo.odom_reset_count;
             if (lastImuPreTransAvailable == false)
             {
                 lastImuPreTransformation = transBack;

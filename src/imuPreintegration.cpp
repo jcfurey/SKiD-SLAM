@@ -16,6 +16,7 @@
 #include <gtsam/inference/Symbol.h>
 
 #include <gtsam/nonlinear/ISAM2.h>
+#include <gtsam/linear/linearExceptions.h>
 
 #include <tf2_ros/transform_broadcaster.h>
 #include <tf2_ros/static_transform_broadcaster.h>
@@ -381,6 +382,7 @@ public:
             odom_to_body = odom_to_body * lidar2Baselink;
 
         nav_msgs::msg::Odometry laserOdometry = imuOdomQueue.back();
+        laserOdometry.pose.covariance.fill(0.0); // not the internal restart count
         laserOdometry.header.frame_id = odometryFrameId;
         laserOdometry.child_frame_id = baselinkFrameId;
         laserOdometry.pose.pose.position.x = odom_to_body.getOrigin().x();
@@ -541,11 +543,28 @@ public:
         graphValues = NewGraphValues;
     }
 
+    // Counts restarts; published with the incremental odometry, whose next pose
+    // re-anchors to the lidar instead of following from the last one.
+    uint64_t odomResetCount = 0;
+
     void resetParams()
     {
         lastImuT_imu = -1;
         doneFirstOpt = false;
         systemInitialized = false;
+        ++odomResetCount;
+    }
+
+    // A diverging estimate (e.g. a run of velocity failures) can leave the
+    // graph ill-posed. Restart from the next lidar pose, as for a velocity
+    // failure, rather than let the exception end the node.
+    void restartAfterSolverFailure(const gtsam::IndeterminantLinearSystemException & error)
+    {
+        RCLCPP_WARN(get_logger(), "IMU pre-integration solver failed near %s; restarting",
+            gtsam::DefaultKeyFormatter(error.nearbyVariable()).c_str());
+        graphFactors.resize(0);
+        graphValues.clear();
+        resetParams();
     }
 
     bool validIntegrationStep(double dt, const char * path)
@@ -631,6 +650,7 @@ public:
 
         // reset graph for speed
         if (key == 100)
+        try
         {
             // get updated noise before reset
             gtsam::noiseModel::Gaussian::shared_ptr updatedPoseNoise = gtsam::noiseModel::Gaussian::Covariance(optimizer.marginalCovariance(X(key-1)));
@@ -658,6 +678,11 @@ public:
 
             key = 1;
         }
+        catch (const gtsam::IndeterminantLinearSystemException & error)
+        {
+            restartAfterSolverFailure(error);
+            return;
+        }
 
 
         // 1. integrate imu data and optimize
@@ -673,6 +698,16 @@ public:
                 {
                     imuQueOpt.pop_front();
                     continue;
+                }
+                if (dt > imuMaxGap)
+                {
+                    // Holding one sample across a long gap (e.g. a render stall)
+                    // integrates any acceleration error, gravity included, over the
+                    // whole gap. Restart from the next lidar pose instead.
+                    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                        "IMU gap of %.3f s exceeds liorf.imuMaxGap; restarting pre-integration", dt);
+                    resetParams();
+                    return;
                 }
                 imuIntegratorOpt_->integrateMeasurement(
                         gtsam::Vector3(thisImu->linear_acceleration.x, thisImu->linear_acceleration.y, thisImu->linear_acceleration.z),
@@ -707,12 +742,21 @@ public:
         graphValues.insert(V(key), propState_.v());
         graphValues.insert(B(key), prevBias_);
         // optimize
-        optimizer.update(graphFactors, graphValues);
-        optimizer.update();
-        graphFactors.resize(0);
-        graphValues.clear();
-        // Overwrite the beginning of the preintegration for the next step.
-        gtsam::Values result = optimizer.calculateEstimate();
+        gtsam::Values result;
+        try
+        {
+            optimizer.update(graphFactors, graphValues);
+            optimizer.update();
+            graphFactors.resize(0);
+            graphValues.clear();
+            // Overwrite the beginning of the preintegration for the next step.
+            result = optimizer.calculateEstimate();
+        }
+        catch (const gtsam::IndeterminantLinearSystemException & error)
+        {
+            restartAfterSolverFailure(error);
+            return;
+        }
         prevPose_  = result.at<gtsam::Pose3>(X(key));
         prevVel_   = result.at<gtsam::Vector3>(V(key));
         prevState_ = gtsam::NavState(prevPose_, prevVel_);
@@ -813,6 +857,9 @@ public:
         if (!validIntegrationStep(dt, "real-time propagation"))
             return;
         lastImuT_imu = imuTime;
+        // Don't propagate across a gap; the next correction restarts integration.
+        if (dt > imuMaxGap)
+            return;
 
         // integrate this single imu message
         imuIntegratorImu_->integrateMeasurement(gtsam::Vector3(thisImu.linear_acceleration.x, thisImu.linear_acceleration.y, thisImu.linear_acceleration.z),
@@ -845,6 +892,8 @@ public:
         odometry.twist.twist.angular.x = thisImu.angular_velocity.x + prevBiasOdom.gyroscope().x();
         odometry.twist.twist.angular.y = thisImu.angular_velocity.y + prevBiasOdom.gyroscope().y();
         odometry.twist.twist.angular.z = thisImu.angular_velocity.z + prevBiasOdom.gyroscope().z();
+        // Internal topic: carries the restart count to imageProjection (see CloudInfo)
+        odometry.pose.covariance[0] = static_cast<double>(odomResetCount);
         pubImuOdometry->publish(odometry);
     }
 };

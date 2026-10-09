@@ -130,6 +130,7 @@ public:
     float imuGyrBiasN;
     float imuGravity;
     float imuRPYWeight;
+    float imuMaxGap;
     vector<double> extRotV;
     vector<double> extRPYV;
     vector<double> extTransV;
@@ -295,6 +296,8 @@ public:
         imuGyrBiasN  = declare_and_get<double>("liorf.imuGyrBiasN", 0.00003);
         imuGravity   = declare_and_get<double>("liorf.imuGravity", 9.80511);
         imuRPYWeight = declare_and_get<double>("liorf.imuRPYWeight", 0.01);
+        // Longest IMU sample interval integrated; a longer gap restarts pre-integration
+        imuMaxGap    = declare_and_get<double>("liorf.imuMaxGap", 0.3);
 
         extRotV   = declare_and_get<std::vector<double>>("liorf.extrinsicRot", std::vector<double>());
         extRPYV   = declare_and_get<std::vector<double>>("liorf.extrinsicRPY", std::vector<double>());

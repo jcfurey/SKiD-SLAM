@@ -17,6 +17,8 @@ float32 imu_pitch_init
 float32 imu_yaw_init
 
 # Initial guess from imu pre-integration
+# Changes when pre-integration restarts: the guess then jumps to a new anchor
+uint64 odom_reset_count
 float32 initial_guess_x
 float32 initial_guess_y
 float32 initial_guess_z

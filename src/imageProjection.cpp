@@ -628,6 +628,7 @@ public:
         cloudInfo.initial_guess_roll  = roll;
         cloudInfo.initial_guess_pitch = pitch;
         cloudInfo.initial_guess_yaw   = yaw;
+        cloudInfo.odom_reset_count = static_cast<uint64_t>(startOdomMsg.pose.covariance[0]);
 
         cloudInfo.odom_available = true;
 
