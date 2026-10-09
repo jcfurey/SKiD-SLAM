@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -215,6 +216,32 @@ class RequestTracker {
   // Allows a previously abandoned key to be requested again.
   bool forget(const ScanKey& key);
 
+  // Forgets every pending or abandoned request whose key matches, such as
+  // scans of a trajectory that has since restarted. Those keys will not be
+  // asked for again, so they are neither resent nor reported as abandoned.
+  // Returns how many keys were forgotten.
+  template <typename Predicate>
+  std::size_t eraseIf(Predicate matches) {
+    std::size_t erased = 0;
+    for (auto it = pending_.begin(); it != pending_.end();) {
+      if (matches(it->first)) {
+        it = pending_.erase(it);
+        ++erased;
+      } else {
+        ++it;
+      }
+    }
+    for (auto it = abandoned_.begin(); it != abandoned_.end();) {
+      if (matches(*it)) {
+        it = abandoned_.erase(it);
+        ++erased;
+      } else {
+        ++it;
+      }
+    }
+    return erased;
+  }
+
   std::size_t inflight() const noexcept { return pending_.size(); }
   std::size_t sent() const noexcept { return sent_; }
   std::size_t retried() const noexcept { return retried_; }
@@ -272,6 +299,17 @@ class DeferredCandidateQueue {
   // Same expiry policy, but returns the dropped candidates so a caller can
   // publish a terminal diagnostic for each one.
   std::vector<DeferredCandidate> expireCandidates(double now_s);
+
+  // Removes every parked candidate that matches, such as those referring to
+  // places that no longer exist. They are neither dropped nor expired, so the
+  // counters are unchanged. Returns how many were removed.
+  template <typename Predicate>
+  std::size_t eraseIf(Predicate matches) {
+    const std::size_t before = parked_.size();
+    parked_.erase(std::remove_if(parked_.begin(), parked_.end(), matches),
+                  parked_.end());
+    return before - parked_.size();
+  }
 
   std::size_t size() const noexcept { return parked_.size(); }
   std::size_t dropped() const noexcept { return dropped_; }

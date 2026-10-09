@@ -31,6 +31,7 @@
 #include "skid_registration.hpp"
 #include "skid_registration_params.hpp"
 #include "skid_remote_graph.hpp"
+#include "skid_trajectory_restart.hpp"
 
 //ros
 #include <rclcpp/rclcpp.hpp>
@@ -147,6 +148,8 @@ private:
     bool _publish_factors = true;
     int _diagnostic_qos_depth = 1000;
 
+    // Next bin id. Ids are never reused: a trajectory restart forgets that
+    // robot's bins and leaves gaps, so this is not the number of live bins.
     int _num_bin;
     int _robot_id_th;
     int _robot_this_th;
@@ -243,8 +246,9 @@ private:
     pcl::PointCloud<PointType>::Ptr _laser_cloud_surface;
 
     //global variables for solid
-    std::unique_ptr<Nabo::NNSearchF> _nns; //KDtree
-    Eigen::MatrixXf _target_matrix;
+    // KD-tree over _descriptor_columns, rebuilt whenever the columns change.
+    std::unique_ptr<Nabo::NNSearchF> _nns;
+    liorf::trajectory_restart::DescriptorColumns _descriptor_columns;
     std::unique_ptr<SOLiD> _solid_factory;
 
     std::vector<int> _robot_received_list;
@@ -310,7 +314,7 @@ private:
     std::unordered_map<int, liorf::pcm::CommitmentTracker>
         _pcm_commitment_trackers;
     liorf::graph_sync::Replay _factor_replay;
-    std::map<std::string, std::uint64_t> _trajectory_epochs;
+    liorf::trajectory_restart::TrajectoryEpochs _trajectory_epochs;
     const std::uint64_t _authority_epoch = liorf::graph_sync::newEpoch();
     std::uint64_t _factor_revision = 0;
     rclcpp::TimerBase::SharedPtr _factor_replay_timer;
@@ -765,64 +769,163 @@ private:
 
     bool observeTrajectory(const std::string& robot, std::uint64_t epoch)
     {
-        auto& known = _trajectory_epochs[robot];
-        if (known != 0 && epoch < known) return false;
-        if (epoch == known) return true;
-        const bool restarted = known != 0;
-        known = epoch;
-        if (!restarted) return true;
-        // All numeric bin indices are local to a recognition session. Purge
-        // that session atomically rather than combine reused keyframe IDs or
-        // allow an old clique to dominate a restarted robot's new trajectory.
-        std::vector<liorf::msg::LoopConstraint> withdrawals;
-        for (const auto& entry : _factor_replay.latest()) {
-            if (entry.second.retracted) continue;
-            auto message = entry.second;
-            message.retracted = true;
-            message.revision = ++_factor_revision;
-            withdrawals.push_back(message);
-        }
-        for (const auto& message : withdrawals) {
-            _factor_replay.put(message);
-            if (_publish_factors) sendFactorRecord(message);
-        }
+        using liorf::trajectory_restart::EpochObservation;
+        const EpochObservation observation =
+            _trajectory_epochs.observe(robot, epoch);
+        if (observation == EpochObservation::kStale) return false;
+        if (observation == EpochObservation::kRestarted)
+            purgeSupersededTrajectory({robot, epoch});
+        return true;
+    }
+
+    // A robot restarted its trajectory: its keyframe indices start again from
+    // zero in a new map frame. Withdraw and forget what involves its earlier
+    // trajectory, and nothing else.
+    //
+    // A peer's restart touches only that peer: its places, scans and scan
+    // requests, the pair this node fuses with it, the alignment between the
+    // two maps, and the factors with an endpoint on it. Every other pair
+    // keeps its places, PCM state and factors. This used to reset the whole
+    // recognition session, so one robot's restart also retracted the other
+    // pairs' factors and discarded every place indexed so far, including this
+    // robot's own. Descriptors are announced once, so those pairs could not
+    // be matched again.
+    //
+    // This node's own restart is the same rule applied to itself. Its old
+    // keyframe indices are reused by the new trajectory, so its own places,
+    // scans and queued announcements go, and every pair fused here has this
+    // node at one end, so all registrations, PCM state, factors and map
+    // alignments go with them. Peers' places and scans stay: their
+    // trajectories did not change, and since peers do not announce again,
+    // matching new keyframes against them is the only way to recover those
+    // pairs. Factor tombstones also stay, so the withdrawals keep replaying.
+    void purgeSupersededTrajectory(
+        const liorf::trajectory_restart::Superseded& superseded)
+    {
+        namespace restart = liorf::trajectory_restart;
+        const bool self = superseded.robot == _robot_id;
+        const int robot_th = robotID2Number(superseded.robot);
+
+        // A factor identity names only robot and keyframe, so a live factor
+        // left in the replay would be reused for the new trajectory's
+        // keyframe with the same index. Its tombstone keeps replaying instead.
+        const auto withdrawals = restart::withdrawFactors(
+            _factor_replay, superseded, _factor_revision);
+        if (_publish_factors)
+            for (const auto& message : withdrawals) sendFactorRecord(message);
+
+        // Places. libnabo cannot delete points, so the tree is rebuilt from
+        // the remaining descriptors rather than reset.
+        const std::set<int> removed =
+            restart::eraseBins(_bin_with_id, _bin_of_scan_key, superseded);
         _nns.reset();
-        _target_matrix.resize(_knn_feature_dim, 0);
-        _num_bin = 0;
-        _bin_with_id.clear();
-        _bin_of_scan_key.clear();
+        _descriptor_columns.erase(removed);
+        if (!_descriptor_columns.empty())
+            _nns.reset(Nabo::NNSearchF::createKDTreeLinearHeap(
+                _descriptor_columns.matrix()));
+        const auto forgetPoses = [&removed](pcl::PointCloud<PointType>& cloud) {
+            pcl::PointCloud<PointType> kept;
+            for (const auto& point : cloud.points)
+                if (!removed.count(static_cast<int>(point.intensity)))
+                    kept.push_back(point);
+            cloud = std::move(kept);
+        };
+        forgetPoses(*_cloud_pose_to_search_this);
+        forgetPoses(*_cloud_pose_to_search_other);
         _idx_nearest_list.clear();
-        _pose_queue.clear();
-        _pose_revisions.clear();
-        _dirty_pcm_pairs.clear();
-        _loop_queue.clear();
-        _loop_commit_queue.clear();
-        _pcm_commitment_trackers.clear();
-        _global_map_trans.clear();
-        _global_map_trans_optimized.clear();
-        _global_map_trans_covariance.clear();
-        _global_odom_trans.clear();
-        _robot_received_list.clear();
-        _cloud_pose_to_search_this->clear();
-        _cloud_pose_to_search_other->clear();
-        _cloud_pose_to_publish->clear();
-        _cloud_loop_to_search->clear();
-        _scans.clear();
-        _scan_cache->clear();
-        _scan_requests->clear();
-        _deferred_candidates->clear();
-        _initial_loop.first = -1;
-        _have_trans_to_publish = false;
-        const auto previousAlignments = _outbound_alignments;
-        for (const auto& entry : previousAlignments)
-            publishAlignment(entry.second.alignment, false, entry.first == "local");
-        {
+
+        // Scans, requests and parked candidates for those places.
+        for (auto it = _scans.begin(); it != _scans.end();) {
+            if (superseded.covers(it->first)) {
+                _scan_cache->erase(it->first);
+                it = _scans.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        _scan_requests->eraseIf([&superseded](const liorf::comms::ScanKey& key) {
+            return superseded.covers(key);
+        });
+        _deferred_candidates->eraseIf(
+            [&](const liorf::comms::DeferredCandidate& candidate) {
+                return removed.count(candidate.query_bin) ||
+                       removed.count(candidate.candidate_bin) ||
+                       std::any_of(candidate.missing.begin(), candidate.missing.end(),
+                           [&superseded](const liorf::comms::ScanKey& key) {
+                               return superseded.covers(key);
+                           });
+            });
+        for (auto it = _pose_revisions.begin(); it != _pose_revisions.end();) {
+            if (superseded.covers(std::get<0>(it->first), std::get<1>(it->first)))
+                it = _pose_revisions.erase(it);
+            else
+                ++it;
+        }
+
+        // Pairs. Each is keyed by the peer and has this node at its other end.
+        const auto forgetPair = [&](auto& by_pair) {
+            if (self) by_pair.clear();
+            else by_pair.erase(robot_th);
+        };
+        forgetPair(_loop_queue);
+        forgetPair(_pose_queue);
+        forgetPair(_loop_commit_queue);
+        forgetPair(_pcm_commitment_trackers);
+        forgetPair(_dirty_pcm_pairs);
+        if (_initial_loop.first != -1 &&
+            (self || _initial_loop.first == robot_th || removed.count(_id_bin_last)))
+            _initial_loop.first = -1;
+        if (!self)
+            _robot_received_list.erase(
+                std::remove(_robot_received_list.begin(), _robot_received_list.end(), robot_th),
+                _robot_received_list.end());
+
+        // Map alignments, this node's own and those received from other
+        // authorities, keyed child|authority. Alignment versions are kept so
+        // a replayed stale revision cannot reinstate one.
+        const std::size_t edges = _global_map_trans.size() + _global_odom_trans.size();
+        forgetPair(_global_map_trans);
+        forgetPair(_global_map_trans_optimized);
+        forgetPair(_global_map_trans_covariance);
+        for (auto it = _global_odom_trans.begin(); it != _global_odom_trans.end();) {
+            const std::string& key = it->first;
+            const auto bar = key.find('|');
+            if (bar != std::string::npos &&
+                superseded.involves(key.substr(0, bar), key.substr(bar + 1)))
+                it = _global_odom_trans.erase(it);
+            else
+                ++it;
+        }
+        const auto outbound = _outbound_alignments;
+        for (const auto& entry : outbound) {
+            if (entry.first == "local" || !entry.second.valid ||
+                !superseded.involves(_robot_id, entry.first))
+                continue;
+            nav_msgs::msg::Odometry withdrawn;
+            withdrawn.header.frame_id = _robot_id;
+            withdrawn.child_frame_id = entry.first;
+            publishAlignment(withdrawn, false, false);
+        }
+        // The fleet alignment changes only if an edge it was solved from went.
+        if (_global_map_trans.size() + _global_odom_trans.size() != edges) {
+            gtsamFactorGraph();
+            sendMapOutputMessage();
+        }
+
+        // Queued announcements are this node's own places. A peer's restart
+        // leaves them valid; this node's own restart makes them stale.
+        if (self) {
             std::scoped_lock lock(mtx_publish_1, mtx_publish_2);
             _context_list_to_publish_1.clear();
             _context_list_to_publish_2.clear();
         }
-        RCLCPP_WARN(get_logger(), "Reset recognition after %s restarted its trajectory", robot.c_str());
-        return true;
+
+        RCLCPP_WARN(get_logger(),
+            "%s restarted its trajectory: withdrew %zu factor(s) and forgot %zu "
+            "place(s) of the earlier trajectory; kept %zu place(s)%s",
+            self ? "This robot" : superseded.robot.c_str(),
+            withdrawals.size(), removed.size(), _bin_with_id.size(),
+            self ? " of other robots" : "");
     }
 
     void laserCloudInfoHandler(const liorf::msg::CloudInfo::ConstSharedPtr& msgIn)
@@ -1249,6 +1352,10 @@ private:
             if (latency >= 0.0)
                 _scan_stats.recordLatency(latency);
         }
+        // A reply still in flight when its owner restarted would otherwise
+        // refill the cache with a scan of a trajectory that was purged.
+        if (_trajectory_epochs.superseded(key.robot_id, key.trajectory_epoch))
+            return;
 
         if (!msgIn->available) {
             // The owner cannot supply it, so nothing parked on it can ever
@@ -1705,22 +1812,21 @@ private:
         else
             _cloud_pose_to_search_other->push_back(tmp_pose);
 
-        //add the latest ringkey
-        _target_matrix.conservativeResize(_knn_feature_dim, _num_bin);
-
-        // For solid
+        //add the latest ringkey (for solid)
         Eigen::VectorXf ringkey_segment = bin.rsolid.block(0, 0, _knn_feature_dim, 1);
         float norm = ringkey_segment.norm();
         if (norm != 0) {
             ringkey_segment /= norm; // 벡터를 노름으로 나누어 정규화
         }
-        _target_matrix.block(0, _num_bin-1, _knn_feature_dim, 1) = ringkey_segment;
+        _nns.reset();
+        _descriptor_columns.append(_num_bin - 1, ringkey_segment);
 
-        _nns.reset(Nabo::NNSearchF::createKDTreeLinearHeap(_target_matrix));
+        _nns.reset(Nabo::NNSearchF::createKDTreeLinearHeap(
+            _descriptor_columns.matrix()));
     }
 
     void KNNSearch(SOLiDBin bin){
-        if (_num_nearest_matches >= _num_bin){
+        if (_num_nearest_matches >= static_cast<int>(_descriptor_columns.size())){
             return;//if not enough candidates, return
         }
 
@@ -1742,8 +1848,10 @@ private:
         //first: dist, second: idx in bin, third: rot_idx
         std::vector<std::tuple<float, int, int>> idx_list;
         for (int i = 0; i < std::min( num_neighbors, int(indices.size()) ); ++i){
-            idx_candidate = indices[i];
-            if ( idx_candidate >= _num_bin)
+            // Columns are compacted when a restarted robot's places are
+            // forgotten, so map each one back to its stable bin id.
+            idx_candidate = _descriptor_columns.bin(indices[i]);
+            if ( idx_candidate < 0)
                 continue;
 
             // if the candidate & source belong to same robot, skip
@@ -2238,7 +2346,7 @@ private:
         if (message->request || message->requester_robot_id != _robot_id ||
             message->trajectory_epoch == 0 || message->poses.size() > 100 ||
             message->poses.size() != message->keyframe_indices.size() ||
-            !_trajectory_epochs.count(message->owner_robot_id)) return;
+            !_trajectory_epochs.known(message->owner_robot_id)) return;
         for (const auto& pose : message->poses)
             if (!liorf::loop_constraint::validPoseMessage(pose)) return;
         if (!observeTrajectory(message->owner_robot_id, message->trajectory_epoch)) return;

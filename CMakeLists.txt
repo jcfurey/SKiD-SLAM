@@ -328,6 +328,10 @@ if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
   ament_add_gtest(test_skid_graph_sync test/test_skid_graph_sync.cpp)
   target_link_libraries(test_skid_graph_sync skid_distributed_graph)
+  ament_add_gtest(test_skid_trajectory_restart
+    test/test_skid_trajectory_restart.cpp)
+  target_link_libraries(test_skid_trajectory_restart
+    skid_distributed_graph skid_comms ${NABO_LIBRARIES})
   ament_add_gtest(test_observable_scan_match
     test/test_observable_scan_match.cpp)
   target_include_directories(test_observable_scan_match PRIVATE include)
